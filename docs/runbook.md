@@ -528,6 +528,9 @@ The review signal is raised when, inside the sliding window, **all** of these ho
 | Minimum decided observations (agree + disagree) | `OUTCOME_DISAGREEMENT_MIN_DECIDED` | 5 |
 | Minimum disagreements | `OUTCOME_DISAGREEMENT_MIN_DISAGREEMENTS` | 3 |
 | Minimum disagreement rate (0 to 1) | `OUTCOME_DISAGREEMENT_MIN_RATE` | 0.2 |
+| Delay before a completed match is checked (ms) | `OUTCOME_DISAGREEMENT_CHECK_DELAY_MS` | 300000 |
+| Maximum checks per match while evidence is unavailable | `OUTCOME_DISAGREEMENT_MAX_CHECK_ATTEMPTS` | 3 |
+| Set to `false` to turn the monitor off | `OUTCOME_DISAGREEMENT_MONITOR_ENABLED` | true |
 
 Invalid values fail loudly at startup. Tune these as real traffic data accumulates, and record any change in the post-incident report (section 6).
 

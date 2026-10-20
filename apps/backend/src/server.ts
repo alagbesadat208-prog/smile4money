@@ -3,11 +3,12 @@ dotenv.config();
 
 import { app } from './app.js';
 import { initializeQueue, closeQueue, startRetryWorker, startDlqEvictionTask, listDlqEntries, writeToDlq, type DlqEntry } from './queue.js';
-import { initializeMatchStore } from './store/index.js';
+import { initializeMatchStore, matchStore } from './store/index.js';
 import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/circuit-breaker.js';
 import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
 import ChessPlatformPoller from './services/game-poller.js';
 import { getCurrentLedger } from './services/stellar.js';
+import { createOutcomeDisagreementServiceFromEnv } from './services/outcome-disagreement-service.js';
 import { loadRetryConfig, submitWithIdempotence, type OracleSubmission } from './services/oracle-submit.js';
 import { createShutdownHandler } from './shutdown.js';
 import logger from './logger.js';
@@ -96,6 +97,10 @@ async function main() {
     await initializeCircuitBreaker();
     logger.info('Circuit breaker initialized');
 
+    // Review-only monitor: compares settled outcomes with independent provider evidence.
+    // It never reverses or settles funds; it only logs and raises a review signal.
+    const outcomeMonitor = createOutcomeDisagreementServiceFromEnv();
+
     // Load any pending jobs from the queue on startup
     const pendingEntries = await listDlqEntries();
     logger.info(
@@ -133,6 +138,25 @@ async function main() {
         );
         // TODO: invoke the oracle submission pipeline here
         // e.g. await submitToOracle({ matchId: job.matchId, gameId: job.gameId, result })
+        if (outcomeMonitor) {
+          try {
+            const settledMatch = await matchStore.findByGameId(job.gameId);
+            if (settledMatch?.player1Username && settledMatch?.player2Username) {
+              outcomeMonitor.scheduleCheck({
+                matchId: job.matchId,
+                gameId: job.gameId,
+                platform: job.platform,
+                player1Username: settledMatch.player1Username,
+                player2Username: settledMatch.player2Username,
+              });
+            }
+          } catch (err) {
+            logger.warn(
+              { match_id: job.matchId, error: err instanceof Error ? err.message : String(err) },
+              'outcome_disagreement_schedule_failed',
+            );
+          }
+        }
       },
       onMaxAttemptsExceeded: async (job, reason) => {
         logger.error(
