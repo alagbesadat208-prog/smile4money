@@ -14,6 +14,7 @@
 5. [Unpausing the Contract](#5-unpausing-the-contract)
 6. [Post-Incident Report Template](#6-post-incident-report-template)
 7. [Contact Escalation List](#7-contact-escalation-list)
+8. [Provider and Chain Outcome Disagreement Alert](#8-provider-and-chain-outcome-disagreement-alert)
 
 ---
 
@@ -497,6 +498,61 @@ Copy this template and fill it in for every incident, regardless of severity.
 3. Contract admin keyholder — required for pause/drain/oracle rotation
 4. All team leads — severity Critical only
 
+---
+
+## 8. Provider and Chain Outcome Disagreement Alert
+
+The outcome disagreement monitor (`apps/backend/src/services/outcome-disagreement-monitor.ts`) raises a **review signal** when settled match outcomes repeatedly disagree with independent evidence. A compromised reporter or an anomalous game provider can otherwise stay invisible until several matches have already settled wrongly.
+
+> **The alert is review-only.** It never pauses, reverses, overrides or settles anything. It only writes a structured log line and calls an optional notification callback. Every action below is a human decision.
+
+### How the signal works
+
+For each settled match the monitor compares two sources that it does not control:
+
+1. The outcome recorded **on-chain** (what the reporter actually submitted).
+2. A fresh outcome fetched **by the monitor itself** from the chess platform (Lichess or Chess.com). This is the independent evidence. It is never taken from the reporter's submission.
+
+The provider result is converted to Player 1's perspective before comparing, because Player 1 is not always the white player.
+
+Each observation is classified as `agree`, `disagree` or `unverifiable`. An observation is `unverifiable` when the game is still in progress, no chain result exists yet, the provider or RPC call failed, or the players cannot be mapped to colors. Unverifiable observations are **never** counted as disagreement.
+
+### Thresholds
+
+The review signal is raised when, inside the sliding window, **all** of these hold:
+
+| Setting | Environment variable | Default |
+|---------|----------------------|---------|
+| Window size (most recent observations) | `OUTCOME_DISAGREEMENT_WINDOW_SIZE` | 20 |
+| Maximum observation age (hours) | `OUTCOME_DISAGREEMENT_MAX_AGE_HOURS` | 24 |
+| Minimum decided observations (agree + disagree) | `OUTCOME_DISAGREEMENT_MIN_DECIDED` | 5 |
+| Minimum disagreements | `OUTCOME_DISAGREEMENT_MIN_DISAGREEMENTS` | 3 |
+| Minimum disagreement rate (0 to 1) | `OUTCOME_DISAGREEMENT_MIN_RATE` | 0.2 |
+
+Invalid values fail loudly at startup. Tune these as real traffic data accumulates, and record any change in the post-incident report (section 6).
+
+### Log events
+
+| Log message | Level | Meaning |
+|-------------|-------|---------|
+| `outcome_disagreement_review_required` | error | Sustained disagreement. Start a manual review. |
+| `outcome_disagreement_recovered` | info | The window no longer meets the thresholds. |
+| `outcome_evidence_degraded` | warn | At least half of the window could not be verified. Treat as a blind spot. |
+| `outcome_evidence_recovered` | info | Verification is working again. |
+
+The review log line includes the counts per platform and `disagreeingMatchIds`, the most recent disagreeing matches to start from.
+
+### Response procedure
+
+1. **Do not pause or override automatically.** Acknowledge the alert and open an incident.
+2. For each id in `disagreeingMatchIds`, look up the game on the chess platform yourself and compare it with the on-chain result. Use the event query in section 3.3 to read what was submitted on-chain.
+3. Check player colors. Confirm which username was Player 1 and which side they played before deciding that a result is wrong.
+4. Classify the cause:
+   - **Provider anomaly** (one platform affected, reporter otherwise consistent): check the provider status pages listed in section 7 and hold further submissions for that platform until it is understood.
+   - **Reporter compromise suspected** (disagreements across platforms, or results that match no game): treat it as an oracle key compromise and follow section 3. Pausing, key rotation and `override_result` are manual, admin-keyholder decisions made inside the dispute window.
+   - **False positive** (for example a slow provider or a mapping problem): record the cause and adjust the thresholds if needed.
+5. For `outcome_evidence_degraded`, check provider and Stellar RPC status first. A long outage can hide an attack, so review recent settlements by hand until verification recovers.
+6. Escalate using the path in section 7 and complete the report in section 6.
 ---
 
 *This runbook is a living document. Update it whenever a procedure changes or a gap is discovered
