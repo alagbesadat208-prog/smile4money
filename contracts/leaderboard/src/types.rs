@@ -10,6 +10,7 @@ use soroban_sdk::{contracterror, contracttype, Address};
 /// |  4   | InvalidResult    | Result is not a recognised variant             |
 /// |  5   | InvalidRange     | `limit` is zero or the page offset is past the end |
 /// |  6   | ContractPaused   | Result recording is paused                     |
+/// |  7   | Overflow         | An aggregate would exceed its integer range    |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -30,6 +31,9 @@ pub enum Error {
 
     /// [E006] Result recording is paused.
     ContractPaused = 6,
+
+    /// [E007] An aggregate counter or payout total would overflow its integer type.
+    Overflow = 7,
 }
 
 /// The outcome of a single match, as reported by the escrow contract.
@@ -109,6 +113,7 @@ pub struct LeaderboardEntry {
 /// | `Paused`             | Instance   | Whether recording results is blocked  |
 /// | `Stats(Address)`     | Persistent | [`PlayerStats`] for one address       |
 /// | `ResultCount`        | Instance   | Number of results recorded so far     |
+/// | `SettlementIds`      | Instance   | Settlement IDs already processed       |
 /// | `Sources(Address)`   | Instance   | Whether an address may submit results |
 /// | `Roster`             | Instance   | Every address that has a stats entry  |
 #[contracttype]
@@ -122,6 +127,8 @@ pub enum DataKey {
     Stats(Address),
     /// How many results have been recorded, used to bound the leaderboard.
     ResultCount,
+    /// Settlement identifiers already processed to prevent duplicate relayer submissions.
+    SettlementIds,
     /// Whether `Address` is authorised to submit results.
     Sources(Address),
     /// Every address that has a [`PlayerStats`] entry.

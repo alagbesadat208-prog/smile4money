@@ -291,6 +291,35 @@ fn result_count_increments_per_result() {
 }
 
 #[test]
+fn record_result_with_settlement_is_idempotent() {
+    let f = setup();
+    let settlement_id = String::from_str(&f.env, "settlement-42");
+
+    f.client.record_result_with_settlement(
+        &f.player1,
+        &f.player2,
+        &MatchOutcome::Player1Won,
+        &10,
+        &f.token,
+        &settlement_id,
+        &f.source,
+    );
+    assert_eq!(f.client.result_count(), 1);
+
+    f.client.record_result_with_settlement(
+        &f.player1,
+        &f.player2,
+        &MatchOutcome::Player1Won,
+        &10,
+        &f.token,
+        &settlement_id,
+        &f.source,
+    );
+    assert_eq!(f.client.result_count(), 1);
+    assert_eq!(f.client.get_stats(&f.player1).wins, 1);
+}
+
+#[test]
 fn get_admin_returns_the_configured_admin() {
     let f = setup();
     assert_eq!(f.client.get_admin(), f.admin);
@@ -330,10 +359,13 @@ fn leaderboard_is_sorted_by_wins_descending() {
 
     let board = f.client.get_leaderboard(&10, &0);
     assert_eq!(board.len(), 3);
-    assert_eq!(board.get(0).player, strong);
-    assert_eq!(board.get(1).player, mid);
-    assert_eq!(board.get(2).player, weak);
-    assert_eq!(board.get(0).stats.wins, 3);
+    let first = board.get(0).unwrap();
+    let second = board.get(1).unwrap();
+    let third = board.get(2).unwrap();
+    assert_eq!(first.player, strong);
+    assert_eq!(second.player, mid);
+    assert_eq!(third.player, weak);
+    assert_eq!(first.stats.wins, 3);
 }
 
 #[test]
@@ -347,8 +379,8 @@ fn leaderboard_ties_break_on_earnings() {
     f.client.record_result(&poor, &Address::generate(&f.env), &MatchOutcome::Player1Won, &5, &f.token, &f.source);
 
     let board = f.client.get_leaderboard(&10, &0);
-    assert_eq!(board.get(0).player, rich);
-    assert_eq!(board.get(1).player, poor);
+    assert_eq!(board.get(0).unwrap().player, rich);
+    assert_eq!(board.get(1).unwrap().player, poor);
 }
 
 #[test]
@@ -363,9 +395,9 @@ fn leaderboard_order_is_stable_for_identical_records() {
 
     let first = f.client.get_leaderboard(&10, &0);
     let second = f.client.get_leaderboard(&10, &0);
-    assert_eq!(first.get(0).player, second.get(0).player);
-    assert_eq!(first.get(1).player, second.get(1).player);
-    assert_ne!(first.get(0).player, first.get(1).player);
+    assert_eq!(first.get(0).unwrap().player, second.get(0).unwrap().player);
+    assert_eq!(first.get(1).unwrap().player, second.get(1).unwrap().player);
+    assert_ne!(first.get(0).unwrap().player, first.get(1).unwrap().player);
 }
 
 #[test]
@@ -394,7 +426,7 @@ fn leaderboard_paginates_without_gaps_or_duplicates() {
 
     let mut unique: Vec<Address> = Vec::new(&f.env);
     for p in seen.iter() {
-        assert!(!unique.contains(p), "player appeared twice across pages");
+        assert!(!unique.contains(&p), "player appeared twice across pages");
         unique.push_back(p.clone());
     }
 }
@@ -443,7 +475,7 @@ fn leaderboard_entry_carries_stats_and_token() {
     let f = setup();
     give_wins(&f, &f.player1, 1);
     let board = f.client.get_leaderboard(&10, &0);
-    let entry = board.get(0);
+    let entry = board.get(0).unwrap();
     assert_eq!(entry.stats.wins, 1);
     assert_eq!(entry.stats.earnings, 10);
     assert_eq!(entry.stats.token, f.token);

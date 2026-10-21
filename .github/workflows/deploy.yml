@@ -1,7 +1,7 @@
 name: Deploy to Testnet
 
 concurrency:
-  group: ${{ github.ref }}
+  group: testnet-${{ github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 on:
@@ -10,12 +10,15 @@ on:
     branches: [ master ]
     paths:
       - 'contracts/**'
+  pull_request:
+    paths:
+      - 'contracts/**'
 
 jobs:
   deploy:
     name: Deploy contracts
     runs-on: ubuntu-latest
-    environment: testnet
+    environment: ${{ github.event_name == 'pull_request' && format('testnet-pr-{0}', github.event.pull_request.number) || 'testnet' }}
     steps:
       - uses: actions/checkout@v4
 
