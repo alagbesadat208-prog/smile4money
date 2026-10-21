@@ -1,3 +1,4 @@
+import { providerMetadata } from './helpers/provider-metadata.js';
 /**
  * Unit tests for ChessPlatformPoller (#1721): the fetcher used to poll a job
  * must be selected by `job.platform`, never inferred from the gameId's
@@ -60,7 +61,8 @@ describe('ChessPlatformPoller platform selection (#1721)', () => {
     const job = makeJob({ platform: 'lichess', gameId: 'abcdefgh12345678' });
     mockFetchLichess.mockResolvedValue({
       gameId: job.gameId,
-      status: 'mate',
+      ...providerMetadata(),
+      status: 'finished',
       whitePlayer: 'alice',
       blackPlayer: 'bob',
       result: 'Player1Wins',
@@ -77,7 +79,8 @@ describe('ChessPlatformPoller platform selection (#1721)', () => {
     const job = makeJob({ platform: 'chessdotcom', gameId: '123456789', username: 'alice' });
     mockFetchChess.mockResolvedValue({
       gameId: job.gameId,
-      status: 'mate',
+      ...providerMetadata(),
+      status: 'finished',
       whitePlayer: 'alice',
       blackPlayer: 'bob',
       result: 'Player1Wins',

@@ -1,3 +1,9 @@
+import type { NormalizedGameResult } from './result.js';
+import {
+  AmbiguousEvidenceError,
+  evidenceFor,
+  normalizeResult,
+} from './result.js';
 import axios from 'axios';
 import { RateLimitError } from '../errors/RateLimitError.js';
 
@@ -7,6 +13,8 @@ export type MatchResult = 'Player1Wins' | 'Player2Wins' | 'Draw';
 export interface GameResult {
   gameId: string;
   status: string;
+  evidence?: import('./result.js').Evidence;
+  endedAt?: string | null;
   whitePlayer: string;
   blackPlayer: string;
   result: MatchResult | null; // null when game is still in progress
@@ -20,8 +28,13 @@ export class GameNotFoundError extends Error {
 }
 
 const TERMINAL_STATUSES = new Set([
-  'mate', 'resign', 'stalemate', 'timeout', 'draw', 'outoftime',
-  'cheat', 'noStart', 'unknownFinish', 'variantEnd',
+  'mate',
+  'resign',
+  'stalemate',
+  'timeout',
+  'draw',
+  'outoftime',
+  'variantEnd',
 ]);
 
 /** Used when a 429 response has no Retry-After header at all. */
@@ -75,9 +88,9 @@ function sleep(ms: number): Promise<void> {
  * - Returns result: null when the game is still in progress.
  * - Maps winner field to MatchResult (Player1 = white, Player2 = black).
  */
-export async function fetchLichessResult(gameId: string): Promise<GameResult> {
+export async function fetchLichessResult(gameId: string): Promise<NormalizedGameResult> {
   const token = process.env.LICHESS_API_TOKEN;
-  const url = `https://lichess.org/api/game/${encodeURIComponent(gameId)}`;
+  const url = `https://lichess.org/game/export/${encodeURIComponent(gameId)}`;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const response = await axios.get(url, {
@@ -110,6 +123,7 @@ export async function fetchLichessResult(gameId: string): Promise<GameResult> {
 
     const data = response.data as {
       id: string;
+      lastMoveAt?: number;
       status: string;
       winner?: 'white' | 'black';
       players: {
@@ -118,21 +132,49 @@ export async function fetchLichessResult(gameId: string): Promise<GameResult> {
       };
     };
 
+    const evidence = evidenceFor('lichess', url, data);
+    if (!data || data.id !== gameId)
+      throw new AmbiguousEvidenceError('Mismatched game identity', evidence);
     const isTerminal = TERMINAL_STATUSES.has(data.status);
+    const active = data.status === 'started' || data.status === 'created';
     let result: MatchResult | null = null;
     if (isTerminal) {
       if (data.winner === 'white') result = 'Player1Wins';
       else if (data.winner === 'black') result = 'Player2Wins';
-      else result = 'Draw';
+      else if (
+        data.winner === undefined &&
+        ['draw', 'stalemate'].includes(data.status)
+      )
+        result = 'Draw';
+      else
+        throw new AmbiguousEvidenceError(
+          'Terminal game has no valid outcome',
+          evidence,
+        );
+      if (
+        ['draw', 'stalemate'].includes(data.status) &&
+        data.winner !== undefined
+      ) {
+        throw new AmbiguousEvidenceError(
+          'Draw status conflicts with winner',
+          evidence,
+        );
+      }
+    } else if (!active || data.winner !== undefined) {
+      throw new AmbiguousEvidenceError(
+        'Unknown or conflicting Lichess status',
+        evidence,
+      );
     }
-
-    return {
-      gameId: data.id,
-      status: data.status,
-      whitePlayer: data.players.white.user?.name ?? 'unknown',
-      blackPlayer: data.players.black.user?.name ?? 'unknown',
+    return normalizeResult(
+      data.id,
+      data.players?.white?.user?.name,
+      data.players?.black?.user?.name,
       result,
-    };
+      data.lastMoveAt,
+      'milliseconds',
+      evidence,
+    );
   }
 
   // Unreachable: the loop above always returns or throws.

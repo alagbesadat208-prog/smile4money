@@ -8,6 +8,7 @@ const mockedAxios = vi.mocked(axios);
 
 const BASE_GAME = {
   id: 'abc123',
+  lastMoveAt: 1700000000000,
   status: 'mate',
   players: {
     white: { user: { name: 'alice' } },
@@ -15,7 +16,7 @@ const BASE_GAME = {
   },
 };
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => { vi.clearAllMocks(); });
 
 describe('fetchLichessResult', () => {
   it('returns Player1Wins when white wins', async () => {

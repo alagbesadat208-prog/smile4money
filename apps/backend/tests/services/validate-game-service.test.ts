@@ -1,3 +1,4 @@
+import { providerMetadata } from '../helpers/provider-metadata.js';
 /**
  * Unit tests for validate-game-service.ts
  *
@@ -35,16 +36,18 @@ const mockFetchLichess = vi.mocked(fetchLichessResult);
 const mockFetchChess = vi.mocked(fetchChessDotComResult);
 
 const LICHESS_GAME = {
+  ...providerMetadata(),
   gameId: 'abc123',
-  status: 'mate',
+  status: 'finished' as const,
   whitePlayer: 'alice',
   blackPlayer: 'bob',
   result: 'Player1Wins' as const,
 };
 
 const CHESS_GAME = {
+  ...providerMetadata('chessdotcom'),
   gameId: 'game42',
-  status: 'finished',
+  status: 'finished' as const,
   whitePlayer: 'alice',
   blackPlayer: 'bob',
   result: 'Player1Wins' as const,
@@ -112,19 +115,19 @@ describe('validateGame (lichess)', () => {
       expect(result.whitePlayer).toBe('alice');
       expect(result.blackPlayer).toBe('bob');
       expect(result.result).toBe('Player1Wins');
-      expect(result.status).toBe('mate');
+      expect(result.status).toBe('finished');
     }
   });
 
   it('returns ok:true with result null for in-progress lichess game', async () => {
-    mockFetchLichess.mockResolvedValue({ ...LICHESS_GAME, status: 'started', result: null });
+    mockFetchLichess.mockResolvedValue({ ...LICHESS_GAME, status: 'in_progress', result: null });
 
     const result = await validateGame({ gameId: 'abc123', platform: 'lichess' });
 
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.result).toBeNull();
-      expect(result.status).toBe('started');
+      expect(result.status).toBe('in_progress');
     }
   });
 

@@ -1,3 +1,6 @@
+import { verifyGameResult } from './oracle-service.js';
+import type { MatchStore } from '../store/match-store.js';
+import type { EvidenceStore } from '../store/evidence-store.js';
 /**
  * Game poller implementation — bridges chess platform APIs to the polling worker.
  *
@@ -9,7 +12,10 @@
  */
 
 import { fetchLichessResult, GameNotFoundError } from '../fetchers/lichess.js';
-import { fetchChessDotComResult, RateLimitError } from '../fetchers/chessdotcom.js';
+import {
+  fetchChessDotComResult,
+  RateLimitError,
+} from '../fetchers/chessdotcom.js';
 import type { GamePoller, PollJob, PollJobStatus } from './polling.js';
 import logger from '../logger.js';
 
@@ -23,6 +29,10 @@ import logger from '../logger.js';
  * - Game completed (result !== null) → 'completed' status with result
  */
 export class ChessPlatformPoller implements GamePoller {
+  constructor(
+    private matches?: Pick<MatchStore, 'findByGameId' | 'count'>,
+    private evidence?: EvidenceStore,
+  ) {}
   /**
    * Poll a single game and return its status.
    *
@@ -30,6 +40,33 @@ export class ChessPlatformPoller implements GamePoller {
    */
   async poll(job: PollJob): Promise<PollJobStatus> {
     try {
+      if (this.matches && this.evidence) {
+        const verified = await verifyGameResult(
+          this.matches,
+          {
+            matchId: job.matchId,
+            gameId: job.gameId,
+            platform: job.platform,
+            username: job.username,
+          },
+          this.evidence,
+        );
+        if (!verified.ok)
+          return {
+            status:
+              verified.status === 409 || verified.status === 400
+                ? 'review_required'
+                : 'failed',
+            reason: verified.error,
+          };
+        return verified.result === null
+          ? { status: 'in_progress' }
+          : {
+              status: 'completed',
+              result: verified.result,
+              decisionId: verified.decisionId,
+            };
+      }
       let result;
 
       if (job.platform === 'lichess') {

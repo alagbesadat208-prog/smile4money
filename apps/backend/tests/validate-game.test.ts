@@ -17,6 +17,7 @@ const createApp = () => {
 const BASE_LICHESS_GAME = {
   id: 'abc123',
   status: 'mate',
+  lastMoveAt: 1700000000000,
   winner: 'white',
   players: {
     white: { user: { name: 'alice' } },
@@ -115,7 +116,7 @@ describe('POST /api/validate-game', () => {
       expect(response.body.valid).toBe(true);
       expect(response.body.platform).toBe('lichess');
       expect(response.body.gameId).toBe('abc123');
-      expect(response.body.status).toBe('mate');
+      expect(response.body.status).toBe('finished');
       expect(response.body.whitePlayer).toBe('alice');
       expect(response.body.blackPlayer).toBe('bob');
       expect(response.body.result).toBe('Player1Wins');

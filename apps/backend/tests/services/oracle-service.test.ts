@@ -1,3 +1,4 @@
+import { providerMetadata } from '../helpers/provider-metadata.js';
 /**
  * Unit tests for oracle-service.ts
  *
@@ -46,8 +47,9 @@ const mockFetchLichess = vi.mocked(fetchLichessResult);
 const mockFetchChess = vi.mocked(fetchChessDotComResult);
 
 const LICHESS_GAME = {
+  ...providerMetadata(),
   gameId: 'lichess-game-abc',
-  status: 'mate',
+  status: 'finished' as const,
   whitePlayer: 'alice',
   blackPlayer: 'bob',
   result: 'Player1Wins' as const,

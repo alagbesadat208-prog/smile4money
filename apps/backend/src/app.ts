@@ -3,6 +3,7 @@ import cors from 'cors';
 import healthRouter from './routes/health.js';
 import matchRouter from './routes/matches.js';
 import validateGameRouter from './routes/validate-game.js';
+import reviewRouter from './routes/oracle-review.js';
 import oracleRouter from './routes/oracle.js';
 import { errorToHttpStatus } from './errors/errorToHttpStatus.js';
 import { requestLogging } from './middleware/request-logging.js';
@@ -49,6 +50,7 @@ app.use(requestLogging());
 app.use('/health', healthRouter);
 app.use('/api/matches', matchRouter);
 app.use('/api/validate-game', validateGameRouter);
+app.use('/api/oracle/reviews', reviewRouter);
 app.use('/api/oracle', oracleRouter);
 
 // Fallback for any error a route handler doesn't catch itself, so every

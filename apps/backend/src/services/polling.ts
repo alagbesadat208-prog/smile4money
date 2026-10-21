@@ -80,7 +80,8 @@ export interface PollJob {
 }
 
 export interface PollJobStatus {
-  status: 'pending' | 'completed' | 'failed' | 'in_progress';
+  status: 'pending' | 'completed' | 'failed' | 'in_progress' | 'review_required';
+  decisionId?: number;
   result?: MatchResult;
   reason?: string;
 }
@@ -119,7 +120,7 @@ export interface PollingConfig {
    * @param job    - The polling job that completed
    * @param result - The game outcome reported by the chess platform
    */
-  onGameCompleted: (job: PollJob, result: MatchResult) => Promise<void>;
+  onGameCompleted: (job: PollJob, result: MatchResult, decisionId?: number) => Promise<void>;
 
   /**
    * Called when a polling job exceeds maxPollingAttempts.
@@ -543,6 +544,11 @@ export class PollingWorker {
 
     const status = await this.poller.poll(job);
 
+    if (status.status === 'review_required') {
+      this.store.removeJob(job.id);
+      logger.warn({ match_id: job.matchId, game_id: job.gameId }, 'polling_job_quarantined');
+      return;
+    }
     if (status.status === 'in_progress') {
       // Game still in progress — re-enqueue with backoff
       const nextDelay = calculateNextPollDelay(
@@ -597,7 +603,8 @@ export class PollingWorker {
       this.store.completeJob(job.id);
 
       try {
-        await this.config.onGameCompleted(job, status.result);
+        if (status.decisionId === undefined) await this.config.onGameCompleted(job, status.result);
+        else await this.config.onGameCompleted(job, status.result, status.decisionId);
       } catch (callbackErr) {
         logger.error(
           {

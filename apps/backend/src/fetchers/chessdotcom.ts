@@ -1,3 +1,9 @@
+import type { NormalizedGameResult } from './result.js';
+import {
+  AmbiguousEvidenceError,
+  evidenceFor,
+  normalizeResult,
+} from './result.js';
 import axios from 'axios';
 import { getChessDotComLimiterSingleton } from '../services/bottleneck-limiters.js';
 import logger from '../logger.js';
@@ -17,8 +23,24 @@ interface ChessDotComGame {
   black: { username: string; result: string };
 }
 
-const WIN_RESULTS = new Set(['win']);
-const DRAW_RESULTS = new Set(['agreed', 'stalemate', 'repetition', 'insufficient', 'timevsinsufficient', '50move']);
+const LOSS_RESULTS = new Set([
+  'checkmated',
+  'resigned',
+  'timeout',
+  'abandoned',
+  'lose',
+  'kingofthehill',
+  'threecheck',
+  'bughousepartnerlose',
+]);
+const DRAW_RESULTS = new Set([
+  'agreed',
+  'stalemate',
+  'repetition',
+  'insufficient',
+  'timevsinsufficient',
+  '50move',
+]);
 const IN_PROGRESS = new Set(['in_progress', 'timeout_started']);
 
 /** Extracts the game ID from a Chess.com game URL. */
@@ -26,15 +48,34 @@ function extractGameId(url: string): string {
   return url.split('/').pop() ?? url;
 }
 
-function mapResult(white: string, black: string): MatchResult | null {
-  if (IN_PROGRESS.has(white) || IN_PROGRESS.has(black)) return null;
-  if (WIN_RESULTS.has(white)) return 'Player1Wins';
-  if (WIN_RESULTS.has(black)) return 'Player2Wins';
-  if (DRAW_RESULTS.has(white) || DRAW_RESULTS.has(black)) return 'Draw';
-  return 'Draw'; // resigned, timeout, abandoned → treat remaining as draw
+function mapResult(
+  white: string,
+  black: string,
+): MatchResult | null | undefined {
+  if (IN_PROGRESS.has(white) && IN_PROGRESS.has(black)) return null;
+  if (white === 'win' && LOSS_RESULTS.has(black)) return 'Player1Wins';
+  if (black === 'win' && LOSS_RESULTS.has(white)) return 'Player2Wins';
+  if (DRAW_RESULTS.has(white) && DRAW_RESULTS.has(black)) return 'Draw';
+  return undefined;
 }
 
-async function fetchArchive(username: string, year: number, month: number): Promise<ChessDotComGame[]> {
+export function parseArchiveMonths(
+  raw = process.env.CHESSDOTCOM_ARCHIVE_MONTHS,
+): number {
+  const months = raw === undefined ? 120 : Number(raw);
+  if (!Number.isInteger(months) || months < 1 || months > 600) {
+    throw new Error(
+      'CHESSDOTCOM_ARCHIVE_MONTHS must be an integer between 1 and 600',
+    );
+  }
+  return months;
+}
+
+async function fetchArchive(
+  username: string,
+  year: number,
+  month: number,
+): Promise<ChessDotComGame[]> {
   const mm = String(month).padStart(2, '0');
   const url = `https://api.chess.com/pub/player/${encodeURIComponent(username)}/games/${year}/${mm}`;
   const limiter = getChessDotComLimiterSingleton();
@@ -58,12 +99,21 @@ async function fetchArchive(username: string, year: number, month: number): Prom
         throw new Error(`Chess.com API error: ${response.status}`);
       }
 
-      return (response.data as { games: ChessDotComGame[] }).games ?? [];
+      if (
+        !Array.isArray(response.data?.games) ||
+        !response.data.games.every((g: any) => g && typeof g.url === 'string')
+      ) {
+        throw new AmbiguousEvidenceError(
+          'Invalid archive payload',
+          evidenceFor('chessdotcom', url, response.data),
+        );
+      }
+      return response.data.games;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
       logger.error(
         { username, year, month, url, error: message },
-        'Chess.com API archive fetch failed'
+        'Chess.com API archive fetch failed',
       );
       throw error;
     }
@@ -73,32 +123,56 @@ async function fetchArchive(username: string, year: number, month: number): Prom
 /**
  * Fetches a Chess.com game result by username + gameId.
  *
- * Searches the current month's archive first, then walks backwards up to 12 months.
+ * Searches UTC monthly archives backwards, bounded by CHESSDOTCOM_ARCHIVE_MONTHS (default 120, maximum 600).
  * Throws GameNotFoundError if the game is not found in any checked archive.
  * Returns result: null when the game is still in progress.
  * Player1 = white, Player2 = black.
  */
-export async function fetchChessDotComResult(username: string, gameId: string): Promise<GameResult> {
+export async function fetchChessDotComResult(
+  username: string,
+  gameId: string,
+): Promise<NormalizedGameResult> {
   const { GameNotFoundError } = await import('./lichess.js');
 
   const now = new Date();
-  for (let i = 0; i < 12; i++) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    const year = d.getFullYear();
-    const month = d.getMonth() + 1;
+  const months = parseArchiveMonths();
+  for (let i = 0; i < months; i++) {
+    const d = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1),
+    );
+    const year = d.getUTCFullYear();
+    const month = d.getUTCMonth() + 1;
 
     const games = await fetchArchive(username, year, month);
-    const game = games.find((g) => extractGameId(g.url) === gameId);
+    const matches = games.filter((g) => extractGameId(g.url) === gameId);
+    if (matches.length > 1)
+      throw new AmbiguousEvidenceError(
+        'Duplicate game evidence',
+        evidenceFor('chessdotcom', `game:${gameId}`, matches),
+      );
+    const game = matches[0];
 
     if (game) {
-      const result = mapResult(game.white.result, game.black.result);
-      return {
+      const evidence = evidenceFor(
+        'chessdotcom',
+        `https://www.chess.com/game/live/${encodeURIComponent(gameId)}`,
+        game,
+      );
+      const result = mapResult(game.white?.result, game.black?.result);
+      if (result === undefined)
+        throw new AmbiguousEvidenceError(
+          'Conflicting or unknown Chess.com outcomes',
+          evidence,
+        );
+      return normalizeResult(
         gameId,
-        status: result === null ? 'in_progress' : 'finished',
-        whitePlayer: game.white.username,
-        blackPlayer: game.black.username,
+        game.white?.username,
+        game.black?.username,
         result,
-      };
+        game.end_time,
+        'seconds',
+        evidence,
+      );
     }
   }
 

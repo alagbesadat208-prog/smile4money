@@ -3,7 +3,7 @@ dotenv.config();
 
 import { app } from './app.js';
 import { initializeQueue, closeQueue, startRetryWorker, startDlqEvictionTask, listDlqEntries, writeToDlq, type DlqEntry } from './queue.js';
-import { initializeMatchStore } from './store/index.js';
+import { initializeMatchStore, matchStore, evidenceStore } from './store/index.js';
 import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/circuit-breaker.js';
 import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
 import ChessPlatformPoller from './services/game-poller.js';
@@ -111,7 +111,7 @@ async function main() {
 
     // Set up the polling worker with DLQ wiring for max-attempts exceeded
     const pollingStore = new PollingJobStore();
-    const gamePoller = new ChessPlatformPoller();
+    const gamePoller = new ChessPlatformPoller(matchStore, evidenceStore);
     const pollingWorker = new PollingWorker(pollingStore, gamePoller, {
       pollingIntervalMs: parsePollingIntervalMs(process.env.POLLING_INTERVAL_MS),
       maxPollingAttempts: Number(process.env.MAX_POLLING_ATTEMPTS ?? 1440),
@@ -120,13 +120,14 @@ async function main() {
       // contract's on-chain timeout_ledgers window and move it to DLQ
       // instead of polling a match no payout can still reach.
       getCurrentLedger,
-      onGameCompleted: async (job, result) => {
+      onGameCompleted: async (job, result, decisionId) => {
         logger.info(
           {
             match_id: job.matchId,
             game_id: job.gameId,
             platform: job.platform,
             result,
+            decisionId,
             attempts: job.pollingAttempt,
           },
           'polling_job_game_completed_submitting_to_oracle',
@@ -169,7 +170,9 @@ async function main() {
       stopPollingWorker,
       stopRetryWorker,
       stopDlqEviction,
-      closeQueue,
+      closeQueue: async () => {
+        await Promise.all([closeQueue(), evidenceStore.close()]);
+      },
       closeCircuitBreakerStore,
       logger,
       shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000),

@@ -14,7 +14,7 @@ const makeGame = (gameId: string, whiteResult: string, blackResult: string) => (
   black: { username: 'bob', result: blackResult },
 });
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => { vi.clearAllMocks(); vi.stubEnv('CHESSDOTCOM_ARCHIVE_MONTHS', '13'); });
 
 describe('fetchChessDotComResult', () => {
   it('returns Player1Wins when white wins', async () => {

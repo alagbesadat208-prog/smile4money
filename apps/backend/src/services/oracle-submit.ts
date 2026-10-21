@@ -29,6 +29,8 @@ export interface RetryConfig {
 
 /** Submission details sent to the retry handler. */
 export interface OracleSubmission {
+  /** Durable verification evidence reference, retained unchanged across retries/DLQ. */
+  decisionId?: number;
   /** Escrow match ID. */
   matchId: number;
   /** Chess platform game ID. */
@@ -129,7 +131,7 @@ export async function submitWithRetry(
   }
 
   // All retries exhausted — write to DLQ
-  const dlqEntry = writeToDlq(submission, lastError?.message ?? 'Unknown error');
+  const dlqEntry = await writeToDlq(submission, lastError?.message ?? 'Unknown error');
   logger.error(
     {
       matchId: submission.matchId,

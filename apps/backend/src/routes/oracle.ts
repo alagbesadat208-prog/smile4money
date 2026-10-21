@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { matchStore } from '../store/index.js';
+import { matchStore, evidenceStore } from '../store/index.js';
 import { authenticate } from '../middleware/auth.js';
 import { validateSubmitResultInput, verifyGameResult } from '../services/oracle-service.js';
 import { errorToHttpStatus } from '../errors/errorToHttpStatus.js';
@@ -52,7 +52,7 @@ router.post('/submit-result', async (req, res) => {
       gameId: payload.gameId,
       platform: payload.platform,
       username: typeof payload.username === 'string' ? payload.username : undefined,
-    });
+    }, evidenceStore);
 
     if (!result.ok) {
       const message = result.details ? `${result.error}: ${result.details}` : result.error;
@@ -61,6 +61,7 @@ router.post('/submit-result', async (req, res) => {
     }
 
     return res.status(200).json({
+      decisionId: result.decisionId,
       verified: result.verified,
       matchId: result.matchId,
       gameId: result.gameId,

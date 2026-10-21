@@ -1,3 +1,9 @@
+import { AmbiguousEvidenceError } from '../fetchers/result.js';
+import {
+  MemoryEvidenceStore,
+  withGameLock,
+  type EvidenceStore,
+} from '../store/evidence-store.js';
 /**
  * Oracle Service
  *
@@ -8,11 +14,18 @@
 
 import { fetchLichessResult, GameNotFoundError } from '../fetchers/lichess.js';
 import { fetchChessDotComResult } from '../fetchers/chessdotcom.js';
-import { verifyPlayerIdentities, verifyIdentityHash } from './player-identity.js';
+import {
+  verifyPlayerIdentities,
+  verifyIdentityHash,
+} from './player-identity.js';
 import type { PlayerIdentityMap } from './player-identity.js';
 import type { MatchStore } from '../store/match-store.js';
 import logger from '../logger.js';
-import { errorToHttpStatus, ValidationError, NotFoundError } from '../errors/errorToHttpStatus.js';
+import {
+  errorToHttpStatus,
+  ValidationError,
+  NotFoundError,
+} from '../errors/errorToHttpStatus.js';
 
 export interface SubmitResultInput {
   matchId: number;
@@ -22,11 +35,12 @@ export interface SubmitResultInput {
 }
 
 export interface SubmitResultSuccess {
+  decisionId: number;
   ok: true;
   verified: true;
   matchId: number;
   gameId: string;
-  result: string | null;
+  result: import('../fetchers/lichess.js').MatchResult | null;
   whitePlayer: string;
   blackPlayer: string;
   status: string;
@@ -48,7 +62,9 @@ export type SubmitResultOutcome = SubmitResultSuccess | SubmitResultFailure;
  *
  * Returns an error string if validation fails, or null if valid.
  */
-export function validateSubmitResultInput(input: Partial<SubmitResultInput>): string | null {
+export function validateSubmitResultInput(
+  input: Partial<SubmitResultInput>,
+): string | null {
   const { matchId, gameId, platform, username } = input;
 
   // #1717 — matchId is forwarded to the Stellar transaction builder, which
@@ -56,7 +72,11 @@ export function validateSubmitResultInput(input: Partial<SubmitResultInput>): st
   // value, a float, zero, or a negative number must be rejected here, at the
   // route layer, rather than surfacing as a runtime error deep in the
   // transaction-building call stack.
-  if (typeof matchId !== 'number' || !Number.isInteger(matchId) || matchId <= 0) {
+  if (
+    typeof matchId !== 'number' ||
+    !Number.isInteger(matchId) ||
+    matchId <= 0
+  ) {
     return 'matchId must be a positive integer';
   }
   if (!gameId || typeof gameId !== 'string' || gameId.length === 0) {
@@ -65,7 +85,10 @@ export function validateSubmitResultInput(input: Partial<SubmitResultInput>): st
   if (!platform || (platform !== 'lichess' && platform !== 'chessdotcom')) {
     return 'platform must be lichess or chessdotcom';
   }
-  if (platform === 'chessdotcom' && (!username || typeof username !== 'string')) {
+  if (
+    platform === 'chessdotcom' &&
+    (!username || typeof username !== 'string')
+  ) {
     return 'username is required for chessdotcom';
   }
   return null;
@@ -81,11 +104,28 @@ export function validateSubmitResultInput(input: Partial<SubmitResultInput>): st
  * Returns a discriminated union so the route handler only needs to map the
  * result to an HTTP response.
  */
+const defaultEvidence = new WeakMap<object, EvidenceStore>();
 export async function verifyGameResult(
-  store: MatchStore,
+  store: Pick<MatchStore, 'findByGameId' | 'count'>,
   input: SubmitResultInput,
+  evidenceStore?: EvidenceStore,
 ): Promise<SubmitResultOutcome> {
-  const { matchId, gameId, platform, username } = input;
+  let ledger = evidenceStore ?? defaultEvidence.get(store);
+  if (!ledger) {
+    ledger = new MemoryEvidenceStore();
+    defaultEvidence.set(store, ledger);
+  }
+  return withGameLock(input.gameId, () =>
+    verifyUnlocked(store, input, ledger!),
+  );
+}
+
+async function verifyUnlocked(
+  store: Pick<MatchStore, 'findByGameId' | 'count'>,
+  input: SubmitResultInput,
+  ledger: EvidenceStore,
+): Promise<SubmitResultOutcome> {
+  const { matchId, gameId, platform } = input;
 
   // Fetch the match record
   const match = await store.findByGameId(gameId);
@@ -118,13 +158,35 @@ export async function verifyGameResult(
     };
   }
 
+  const history = await ledger.history(gameId);
+  if (history[history.length - 1]?.state === 'review_required') {
+    return { ok: false, status: 409, error: 'Operator review required' };
+  }
+  const record = async (
+    state: 'review_required' | 'verified' | 'in_progress',
+    reason: string,
+    evidence?: import('../fetchers/result.js').Evidence,
+  ) =>
+    ledger.append({
+      matchId: match.matchId,
+      gameId,
+      state,
+      reason,
+      evidence,
+      recordedAt: new Date().toISOString(),
+    });
+
   // Ensure player identities were captured at match creation
   if (!match.player1Username || !match.player2Username) {
+    await record('review_required', 'Player identities not recorded');
     return {
       ok: false,
-      status: errorToHttpStatus(new ValidationError('Player identities not recorded')),
+      status: errorToHttpStatus(
+        new ValidationError('Player identities not recorded'),
+      ),
       error: 'Player identities not recorded',
-      details: 'Match was created without capturing player identities from the API',
+      details:
+        'Match was created without capturing player identities from the API',
     };
   }
 
@@ -154,7 +216,7 @@ export async function verifyGameResult(
     if (match.platform === 'lichess') {
       apiResult = await fetchLichessResult(gameId);
     } else if (match.platform === 'chessdotcom') {
-      apiResult = await fetchChessDotComResult(username as string, gameId);
+      apiResult = await fetchChessDotComResult(match.player1Username, gameId);
     } else {
       return {
         ok: false,
@@ -164,6 +226,15 @@ export async function verifyGameResult(
       };
     }
   } catch (error) {
+    if (error instanceof AmbiguousEvidenceError) {
+      await record('review_required', error.message, error.evidence);
+      return {
+        ok: false,
+        status: 409,
+        error: 'Operator review required',
+        details: error.message,
+      };
+    }
     if (error instanceof GameNotFoundError) {
       return {
         ok: false,
@@ -175,6 +246,14 @@ export async function verifyGameResult(
     throw error;
   }
 
+  if (apiResult.gameId !== gameId) {
+    await record(
+      'review_required',
+      'Provider game identity mismatch',
+      apiResult.evidence,
+    );
+    return { ok: false, status: 409, error: 'Operator review required' };
+  }
   // Build the identity map from the match record
   const identityMap: PlayerIdentityMap = {
     player1Address: match.player1,
@@ -187,9 +266,16 @@ export async function verifyGameResult(
   // Verify that the API players match the registered players
   const verification = verifyPlayerIdentities(match, apiResult, identityMap);
   if (!verification.valid) {
+    await record(
+      'review_required',
+      'Player identity verification failed',
+      apiResult.evidence,
+    );
     return {
       ok: false,
-      status: errorToHttpStatus(new ValidationError('Player identity verification failed')),
+      status: errorToHttpStatus(
+        new ValidationError('Player identity verification failed'),
+      ),
       error: 'Player identity verification failed',
       details: verification.error,
     };
@@ -202,15 +288,44 @@ export async function verifyGameResult(
   // been swapped after creation.
   const identityHashCheck = verifyIdentityHash(match);
   if (!identityHashCheck.valid) {
+    await record(
+      'review_required',
+      'Identity hash verification failed',
+      apiResult.evidence,
+    );
     return {
       ok: false,
-      status: errorToHttpStatus(new ValidationError('Identity hash verification failed')),
+      status: errorToHttpStatus(
+        new ValidationError('Identity hash verification failed'),
+      ),
       error: 'Identity hash verification failed',
       details: identityHashCheck.error,
     };
   }
 
+  if (!apiResult.evidence) {
+    await record('review_required', 'Provider provenance missing');
+    return { ok: false, status: 409, error: 'Operator review required' };
+  }
+  const previous = [...history].reverse().find((d) => d.state === 'verified');
+  if (
+    previous?.evidence?.outcome &&
+    previous.evidence.outcome !== apiResult.result
+  ) {
+    await record(
+      'review_required',
+      'Provider outcome changed after verification',
+      apiResult.evidence,
+    );
+    return { ok: false, status: 409, error: 'Operator review required' };
+  }
+  const decisionId = await record(
+    apiResult.result === null ? 'in_progress' : 'verified',
+    'Provider result verified',
+    apiResult.evidence,
+  );
   return {
+    decisionId,
     ok: true,
     verified: true,
     matchId: match.matchId,
