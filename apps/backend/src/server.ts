@@ -8,6 +8,13 @@ import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/c
 import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
 import ChessPlatformPoller from './services/game-poller.js';
 import { getCurrentLedger } from './services/stellar.js';
+import {
+  createSettlementAgeMonitorFromEnv,
+  getSettlementAgeMonitor,
+  getSettlementPublishIntervalMs,
+  trackExistence,
+  trackSubmission,
+} from './services/settlement-age-monitor.js';
 import { loadRetryConfig, submitWithIdempotence, type OracleSubmission } from './services/oracle-submit.js';
 import { createShutdownHandler } from './shutdown.js';
 import logger from './logger.js';
@@ -66,8 +73,8 @@ async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
     // If submission fails, the error is thrown and propagates to the caller
     await submitWithIdempotence(
       submission,
-      submitOracleResultToContract,
-      checkResultExistsOnChain,
+      trackSubmission(getSettlementAgeMonitor(), submitOracleResultToContract),
+      trackExistence(getSettlementAgeMonitor(), checkResultExistsOnChain),
       config
     );
   } catch (err) {
@@ -96,6 +103,10 @@ async function main() {
     await initializeCircuitBreaker();
     logger.info('Circuit breaker initialized');
 
+    // Settlement age monitor (#1968): stage timestamps, age percentiles and threshold alerts.
+    // It only records timestamps and publishes metrics; it never changes what is submitted or settled.
+    const settlementMonitor = createSettlementAgeMonitorFromEnv();
+
     // Load any pending jobs from the queue on startup
     const pendingEntries = await listDlqEntries();
     logger.info(
@@ -111,6 +122,10 @@ async function main() {
 
     // Set up the polling worker with DLQ wiring for max-attempts exceeded
     const pollingStore = new PollingJobStore();
+    settlementMonitor?.startPublisher({
+      intervalMs: getSettlementPublishIntervalMs(),
+      listActiveJobs: () => pollingStore.listPendingJobs(),
+    });
     const gamePoller = new ChessPlatformPoller();
     const pollingWorker = new PollingWorker(pollingStore, gamePoller, {
       pollingIntervalMs: parsePollingIntervalMs(process.env.POLLING_INTERVAL_MS),
@@ -133,6 +148,9 @@ async function main() {
         );
         // TODO: invoke the oracle submission pipeline here
         // e.g. await submitToOracle({ matchId: job.matchId, gameId: job.gameId, result })
+        // Settlement age: the game result is in, so the chain submission clock starts next.
+        settlementMonitor?.recordStage(job.matchId, 'activated', job.createdAt);
+        settlementMonitor?.recordStage(job.matchId, 'provider_result');
       },
       onMaxAttemptsExceeded: async (job, reason) => {
         logger.error(
@@ -145,6 +163,7 @@ async function main() {
           },
           'polling_job_max_attempts_exceeded_writing_to_dlq',
         );
+        settlementMonitor?.abandon(job.matchId, reason ?? 'max_polling_attempts_exceeded');
         await writeToDlq(
           { job },
           reason ?? 'max polling attempts exceeded',

@@ -11,6 +11,7 @@ router.get('/', async (req, res) => {
   const result = await runHealthCheck({
     deepCheck: process.env.DEEP_HEALTH === 'true',
     includeLimiters: process.env.HEALTH_INCLUDE_LIMITERS === 'true',
+    includeSettlement: process.env.HEALTH_INCLUDE_SETTLEMENT === 'true',
     uptimeSeconds,
     version,
   });

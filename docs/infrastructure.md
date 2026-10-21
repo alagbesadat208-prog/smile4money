@@ -190,13 +190,78 @@ All secrets are managed through GitHub Actions Secrets. No secret values are eve
 
 ## 8. Observability
 
-No monitoring or alerting is currently configured. This is acceptable for testnet but must be addressed before mainnet launch.
+Settlement age monitoring is available (see 8.1). Contract event indexing and Oracle uptime monitoring are not yet configured; this is acceptable for testnet but must be addressed before mainnet launch.
 
 ### Planned work (pre-mainnet)
 
 - **Contract event indexing:** Set up a Stellar Horizon or custom event listener to index `match.created`, `match.completed`, `match.cancelled`, and `oracle.result` events. These events are already emitted by the contracts.
 - **Oracle health check:** The Oracle service should expose a `/health` endpoint. A simple uptime monitor (e.g., GitHub Actions scheduled ping, or an external service) should alert if the Oracle goes down.
 - **Deployment verification:** After each deploy, run a smoke test that calls `get_match` on a known match ID (or creates a test match) to confirm the deployed contract is responsive.
+
+### 8.1 Settlement age monitoring
+
+A process can be healthy while active matches silently wait too long for a game result or for the chain. The settlement age monitor (`apps/backend/src/services/settlement-age-monitor.ts`) records when each match reaches each stage and publishes age percentiles and threshold alerts. It is **observability only**: it records timestamps, logs metrics and raises alerts. It never changes what is submitted and never reverses or settles anything.
+
+**Stages** (the first timestamp recorded for a match wins):
+
+| Stage | Recorded when |
+|-------|---------------|
+| `activated` | The backend starts tracking the match (its polling job was created). Synced from the polling store on every publish tick. |
+| `provider_result` | The chess platform reported a final result (`onGameCompleted`). |
+| `submission_started` | The first attempt to put the result on-chain begins. |
+| `chain_confirmed` | The result is confirmed on-chain (the submission handler succeeded, or the result already existed). |
+
+**Segments.** Each segment is measured and alerted on separately, so a slow chess platform is never confused with a slow chain submission:
+
+| Segment | From | To | Default threshold |
+|---------|------|----|-------------------|
+| `provider_wait` | `activated` | `provider_result` | 24 hours |
+| `submission_lag` | `provider_result` | `submission_started` | 10 minutes |
+| `chain_delay` | `submission_started` | `chain_confirmed` | 15 minutes |
+| `total` | `activated` | `chain_confirmed` | 48 hours |
+
+`chain_delay` includes retry back-off, because it runs from the first submission attempt until confirmation.
+
+**Published metrics.** Every publish interval (default 60 seconds) one structured log line is written: message `settlement_age_metrics`, field `metric: "settlement_age"`. It contains:
+
+- `completed.<segment>`: count, p50, p90, p95, p99 and max (ms) over the most recent completed matches (default window 200).
+- `open.<segment>`: the same percentiles for matches still waiting, measured from when they entered the segment they are currently in, plus `overThreshold` and `stuckMatchIds`.
+- `openMatches`, `completedInWindow`, `abandoned`, `evicted`, `alerts` and the active `thresholds`.
+
+Set `HEALTH_INCLUDE_SETTLEMENT=true` to also return the same snapshot as `settlement` from the `/health` endpoint.
+
+**Alerts.**
+
+| Alert id | Raised when |
+|----------|-------------|
+| `<segment>_stuck` | At least one waiting match is older than the segment threshold. Carries the count, the oldest age and up to 5 match ids. |
+| `<segment>_slow_p95` | The p95 of recently completed matches is above the threshold (needs at least `SETTLEMENT_AGE_MIN_SAMPLES` samples). |
+
+Each alert is logged once when raised (`settlement_age_alert_raised`, level error) and once when it clears (`settlement_age_alert_cleared`, level info), not once per tick.
+
+**Reading the alerts.**
+
+- `provider_wait_*`: the game is not finished or the chess platform is not answering. Check the platform status pages in the contact list (section 7 of the runbook) and the polling logs.
+- `submission_lag_*`: the game finished but the backend has not started submitting. Check that the submission pipeline and retry worker are running.
+- `chain_delay_*`: a submission was started but is not confirmed. Check Stellar RPC health, the circuit breaker state and `oracle_dlq_depth`.
+- `total_*`: a match is old overall. Use the other alerts to find which segment it is stuck in.
+
+**Configuration** (invalid values stop the server at startup):
+
+| Environment variable | Default |
+|----------------------|---------|
+| `SETTLEMENT_AGE_MONITOR_ENABLED` | `true` |
+| `SETTLEMENT_AGE_PUBLISH_INTERVAL_MS` | 60000 |
+| `SETTLEMENT_AGE_PROVIDER_WAIT_MS` | 86400000 |
+| `SETTLEMENT_AGE_SUBMISSION_LAG_MS` | 600000 |
+| `SETTLEMENT_AGE_CHAIN_DELAY_MS` | 900000 |
+| `SETTLEMENT_AGE_TOTAL_MS` | 172800000 |
+| `SETTLEMENT_AGE_COMPLETED_WINDOW` | 200 |
+| `SETTLEMENT_AGE_MIN_SAMPLES` | 5 |
+| `SETTLEMENT_AGE_MAX_TRACKED` | 10000 |
+| `HEALTH_INCLUDE_SETTLEMENT` | `false` |
+
+Matches that time out or are moved to the dead-letter queue are dropped from tracking and counted in `abandoned`, so they stop aging.
 
 ---
 
