@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import type { WalletStatus } from '../types';
 import {
   DEFAULT_HISTORY_CACHE_TTL_MS,
@@ -6,13 +6,15 @@ import {
   setHistoryCacheEntry,
 } from './history-cache';
 
-const HORIZON_URL = 'https://horizon-testnet.stellar.org';
 const PAGE_SIZE = 20;
 
 interface HistoryProps {
   walletState: WalletStatus;
   publicKey?: string | null;
   cacheTtlMs?: number;
+  network?: string;
+  contractId?: string;
+  horizonUrl?: string;
 }
 
 interface HorizonTransaction {
@@ -77,7 +79,20 @@ export function History({
   walletState,
   publicKey,
   cacheTtlMs = DEFAULT_HISTORY_CACHE_TTL_MS,
+  network = import.meta.env.VITE_STELLAR_NETWORK ?? 'testnet',
+  contractId = import.meta.env.VITE_ESCROW_CONTRACT_ID ?? '',
+  horizonUrl = network === 'mainnet'
+    ? 'https://horizon.stellar.org'
+    : 'https://horizon-testnet.stellar.org',
 }: HistoryProps) {
+  const scopeKey = JSON.stringify([publicKey, network, contractId, horizonUrl, walletState]);
+  const currentScope = useRef<string | null>(scopeKey);
+  useEffect(() => {
+    currentScope.current = scopeKey;
+    return () => {
+      currentScope.current = null;
+    };
+  }, [scopeKey]);
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -100,7 +115,7 @@ export function History({
       }
       setError(null);
 
-      const url = new URL(`${HORIZON_URL}/accounts/${publicKey}/transactions`);
+      const url = new URL(`${horizonUrl}/accounts/${publicKey}/transactions`);
       url.searchParams.set('limit', String(PAGE_SIZE));
       url.searchParams.set('order', 'desc');
       if (cursor) url.searchParams.set('cursor', cursor);
@@ -111,6 +126,7 @@ export function History({
           throw new Error('Unable to load transaction history');
         }
         const data = (await response.json()) as HorizonResponse;
+        if (currentScope.current !== scopeKey) return;
         const records: HorizonTransaction[] = data._embedded?.records ?? [];
 
         const rows = records.map((r) => mapRecord(r, publicKey));
@@ -124,26 +140,33 @@ export function History({
         const derived = nextHref ? parseCursor(nextHref) : null;
         setNextCursor(records.length < PAGE_SIZE ? null : derived);
         if (!append) {
-          setHistoryCacheEntry(publicKey, {
-            history: rows,
-            nextCursor: records.length < PAGE_SIZE ? null : derived,
-            fetchedAt: Date.now(),
-          });
+          setHistoryCacheEntry(
+            publicKey,
+            { network, contractId },
+            {
+              history: rows,
+              nextCursor: records.length < PAGE_SIZE ? null : derived,
+              fetchedAt: Date.now(),
+            },
+          );
         }
       } catch (err) {
+        if (currentScope.current !== scopeKey) return;
         setError(err instanceof Error ? err.message : 'Failed to load history');
       } finally {
-        if (append) {
-          setLoadingMore(false);
-        } else {
-          setLoading(false);
+        if (currentScope.current === scopeKey) {
+          if (append) {
+            setLoadingMore(false);
+          } else {
+            setLoading(false);
+          }
         }
       }
     },
-    [publicKey],
+    [publicKey, network, contractId, horizonUrl, scopeKey],
   );
 
-  // Reset and reload whenever the connected wallet changes.
+  // Reset and reload whenever the wallet or deployment changes.
   useEffect(() => {
     if (walletState !== 'connected' || !publicKey) {
       setHistory([]);
@@ -153,20 +176,22 @@ export function History({
       return;
     }
 
-    const cached = getHistoryCacheEntry(publicKey);
+    setLoadingMore(false);
+    setLoading(false);
+    setError(null);
+    const cached = getHistoryCacheEntry(publicKey, { network, contractId });
     const hasFreshCache = cached && Date.now() - cached.fetchedAt < cacheTtlMs;
     if (cached) {
       setHistory(cached.history);
       setNextCursor(cached.nextCursor);
     } else {
+      setHistory([]);
       setNextCursor(null);
     }
     if (!cached || !hasFreshCache) {
       void fetchPage(null, false, Boolean(cached));
     }
-    // fetchPage is stable (memoised on publicKey); re-run when publicKey or
-    // walletState changes.
-  }, [publicKey, walletState, cacheTtlMs, fetchPage]);
+  }, [publicKey, walletState, cacheTtlMs, fetchPage, network, contractId]);
 
   function handleLoadMore() {
     if (nextCursor && !loadingMore) {

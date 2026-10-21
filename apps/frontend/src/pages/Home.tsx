@@ -45,7 +45,7 @@ export function Home() {
           />
         </div>
         <div>
-          <History walletState={walletState} publicKey={address} />
+          <History walletState={walletState} publicKey={address} network={network} />
         </div>
       </div>
     </main>

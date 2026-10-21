@@ -15,6 +15,7 @@ declare global {
   interface ImportMeta {
     env: {
       VITE_STELLAR_NETWORK?: string;
+      VITE_ESCROW_CONTRACT_ID?: string;
     };
   }
 }

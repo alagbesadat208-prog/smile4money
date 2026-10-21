@@ -1,8 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Networks, rpc } from '@stellar/stellar-sdk';
+import type { MatchState } from '../types';
 import { DISPUTE_WINDOW_LEDGERS, SECONDS_PER_LEDGER } from '../constants';
-
-type MatchState = 'Pending' | 'Active' | 'PendingResult' | 'Completed' | 'Cancelled';
 
 /** Reason a match entered the Cancelled terminal state. */
 type CancellationReason = 'cancelled_by_player' | 'timed_out';
@@ -39,10 +37,8 @@ interface MatchData {
 
 interface MatchStatusProps {
   matchId: string;
-  contractId?: string;
-  rpcUrl?: string;
-  networkPassphrase?: string;
-  onFetchMatch?: (matchId: string) => Promise<MatchData | null>;
+  /** Required reader; configure its network and contract deployment at the call site. */
+  onFetchMatch: (matchId: string) => Promise<MatchData | null>;
 }
 
 type FetchStatus = 'idle' | 'loading' | 'error';
@@ -80,18 +76,7 @@ function formatDuration(totalSeconds: number): string {
   return parts.join(' ');
 }
 
-const NETWORK_PASSPHRASES: Record<string, string> = {
-  testnet: Networks.TESTNET,
-  mainnet: Networks.PUBLIC,
-};
-
-export function MatchStatus({
-  matchId,
-  contractId,
-  rpcUrl = 'https://soroban-testnet.stellar.org',
-  networkPassphrase = Networks.TESTNET,
-  onFetchMatch,
-}: MatchStatusProps) {
+export function MatchStatus({ matchId, onFetchMatch }: MatchStatusProps) {
   const [matchData, setMatchData] = useState<MatchData | null>(null);
   const [fetchStatus, setFetchStatus] = useState<FetchStatus>('loading');
   const [errorMessage, setErrorMessage] = useState('');
@@ -106,12 +91,19 @@ export function MatchStatus({
     if (!matchId) return;
 
     try {
-      const data = await onFetchMatch?.(matchId);
+      if (typeof onFetchMatch !== 'function') {
+        throw new Error(
+          'MatchStatus requires an onFetchMatch reader configured for the network and contract.',
+        );
+      }
+      const data = await onFetchMatch(matchId);
       if (data) {
         setMatchData(data);
         // Reset the elapsed-seconds counter whenever we get fresh data so the
         // countdown stays in sync with the on-chain ledger estimate.
         setElapsedSecs(0);
+      } else {
+        setMatchData(null);
       }
       setFetchStatus('idle');
     } catch (err) {
@@ -200,7 +192,7 @@ export function MatchStatus({
         <button
           type="button"
           className="btn btn-retry"
-          onClick={() => setFetchStatus('loading')}
+          onClick={fetchMatch}
           data-testid="retry-match-btn"
         >
           Retry

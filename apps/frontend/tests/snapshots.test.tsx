@@ -45,12 +45,14 @@ const VALID_ADDRESS = 'GAUXUJLYWYXK7UE22KXN5WJTP2MNOWVL4ZRDBJQ43WZB5HJP22JSYTRR'
 
 describe('MatchStatus — snapshots', () => {
   it('matches snapshot: no match ID (empty prompt)', () => {
-    const { container } = render(<MatchStatus matchId="" />);
+    const { container } = render(<MatchStatus matchId="" onFetchMatch={async () => null} />);
     expect(container).toMatchSnapshot();
   });
 
   it('matches snapshot: loading state (match ID provided, no fetch override)', () => {
-    const { container } = render(<MatchStatus matchId="123" />);
+    const { container } = render(
+      <MatchStatus matchId="123" onFetchMatch={() => new Promise(() => {})} />,
+    );
     expect(container).toMatchSnapshot();
   });
 

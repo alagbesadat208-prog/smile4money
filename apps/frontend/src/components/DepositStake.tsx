@@ -10,6 +10,7 @@ import {
   scValToNative,
 } from '@stellar/stellar-sdk';
 import type { xdr } from '@stellar/stellar-sdk';
+import { parseMatchState, type MatchDetails } from '../types';
 import { TransactionStatus } from './TransactionStatus';
 
 type DepositStatus = 'idle' | 'loading' | 'pending' | 'success' | 'error' | 'approving';
@@ -50,18 +51,6 @@ function formatDuration(totalSeconds: number): string {
   if (m > 0 || h > 0) parts.push(`${m}m`);
   parts.push(`${s}s`);
   return parts.join(' ');
-}
-
-interface MatchDetails {
-  stakeAmount: string;
-  token: string;
-  player1: string;
-  player2: string;
-  player1Deposited: boolean;
-  player2Deposited: boolean;
-  createdLedger: number;
-  timeoutLedgers: number;
-  currentLedger: number;
 }
 
 /**
@@ -130,11 +119,14 @@ async function deserializeMatch(
   if (
     (typeof raw.stake_amount !== 'bigint' && typeof raw.stake_amount !== 'number') ||
     typeof raw.player1 !== 'string' ||
-    typeof raw.player2 !== 'string'
+    typeof raw.player2 !== 'string' ||
+    typeof raw.player1_deposited !== 'boolean' ||
+    typeof raw.player2_deposited !== 'boolean'
   ) {
     throw new Error('Unexpected response from EscrowContract.get_match');
   }
 
+  const state = parseMatchState(raw.state);
   const tokenAddress = typeof raw.token === 'string' ? raw.token : '';
   // The contract stores the native XLM asset as its Soroban contract address;
   // map it back to the symbol the UI already understands.
@@ -152,16 +144,17 @@ async function deserializeMatch(
 
   // Fetch current ledger height from RPC
   const server = new rpc.Server(rpcUrl);
-  const ledgerResponse = await server.getLedgers().order('desc').limit(1).call();
-  const currentLedger = parseInt(ledgerResponse.records[0].sequence, 10);
+  const ledgerResponse = await server.getLatestLedger();
+  const currentLedger = ledgerResponse.sequence;
 
   return {
+    state,
     stakeAmount: String(raw.stake_amount),
     token: tokenAddress === nativeTokenAddress ? 'xlm' : tokenAddress,
     player1: raw.player1,
     player2: raw.player2,
-    player1Deposited: Boolean(raw.player1_deposited),
-    player2Deposited: Boolean(raw.player2_deposited),
+    player1Deposited: raw.player1_deposited,
+    player2Deposited: raw.player2_deposited,
     createdLedger,
     timeoutLedgers,
     currentLedger,
@@ -345,8 +338,19 @@ export function DepositStake({
   // player already deposited, allowance is still being checked, allowance is
   // insufficient, or timeout has expired. The isPending guard is the critical one — without it the user
   // can click twice and submit duplicate transactions.
+  const stateReason =
+    matchDetails && matchDetails.state !== 'Pending'
+      ? `Deposits are unavailable: contract state is ${matchDetails.state}.`
+      : null;
   const isDisabled =
-    isLoading || isPending || hasDeposited(matchDetails) || isCheckingAllowance || needsApproval || isExpired;
+    !matchDetails ||
+    Boolean(stateReason) ||
+    isLoading ||
+    isPending ||
+    hasDeposited(matchDetails) ||
+    isCheckingAllowance ||
+    needsApproval ||
+    isExpired;
 
   // Loading state
   if (isLoading && !matchDetails) {
@@ -438,7 +442,7 @@ export function DepositStake({
       )}
 
       {/* Approve button — shown when the escrow contract lacks spending permission */}
-      {needsApproval && !hasDeposited(matchDetails) && (
+      {needsApproval && !stateReason && !hasDeposited(matchDetails) && (
         <>
           <p
             className="feedback warning"
@@ -460,6 +464,12 @@ export function DepositStake({
             {isApproving ? 'Approving…' : 'Approve Token'}
           </button>
         </>
+      )}
+
+      {stateReason && (
+        <p role="status" data-testid="deposit-state-reason">
+          {stateReason}
+        </p>
       )}
 
       {/* Match timeout expired */}
