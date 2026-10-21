@@ -186,6 +186,20 @@ All secrets are managed through GitHub Actions Secrets. No secret values are eve
 - `Cargo.lock` is committed and kept up to date. Do not add `Cargo.lock` to `.gitignore`.
 - When updating a dependency, run the full CI suite locally before pushing.
 
+### GitHub Actions pinning
+
+Every third-party action in `.github/workflows/` must use a full 40-character
+commit SHA rather than a mutable tag or branch. The `action-pins` job in
+`.github/workflows/ci.yml` runs `scripts/check-github-action-pins.sh` on every
+push and pull request and rejects any unpinned reference. Local actions are
+allowed to use a relative path.
+
+Dependabot checks GitHub Actions weekly and opens update pull requests. Review
+the referenced commit and its release notes before merging; update the version
+comment beside the SHA when the action release changes. If an urgent security
+update is needed, update the SHA in a dedicated pull request and run the full
+CI suite before merging.
+
 ---
 
 ## 8. Observability
