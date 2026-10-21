@@ -19,6 +19,8 @@ NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 IDENTITY="deployer"
 WASM_DIR="target/wasm32-unknown-unknown/release"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Fail before friendbot, account preparation, or contract deployment.
+bash "$SCRIPT_DIR/check_stellar_compat.sh" --network "$NETWORK"
 
 # Verify stellar CLI is available
 if ! command -v stellar &>/dev/null; then
@@ -55,6 +57,7 @@ if [[ ! -f "$ORACLE_WASM" ]]; then
   exit 1
 fi
 
+bash "$SCRIPT_DIR/check_stellar_compat.sh" "$ESCROW_WASM" "$ORACLE_WASM"
 # Deploy escrow contract
 echo "Deploying escrow contract..."
 CONTRACT_ESCROW=$(stellar contract deploy \

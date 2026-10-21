@@ -1,0 +1,45 @@
+name: Approve production token/oracle trust change
+
+on:
+  workflow_dispatch:
+    inputs:
+      token_address:
+        description: Reviewed production token contract/account (Stellar G/C address)
+        required: true
+        type: string
+      oracle_address:
+        description: Reviewed oracle contract/account (Stellar G/C address)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+jobs:
+  approval:
+    name: Independent production review and release evidence
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout reviewed source revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate independent approval and bind reviewed addresses to release evidence
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PRODUCTION_TOKEN_ADDRESS: ${{ inputs.token_address }}
+          PRODUCTION_ORACLE_ADDRESS: ${{ inputs.oracle_address }}
+          PRODUCTION_APPROVAL_EVIDENCE: ${{ runner.temp }}/production-trust-evidence.json
+        run: |
+          python3 scripts/verify_production_approval.py
+          cp "$PRODUCTION_APPROVAL_EVIDENCE" production-trust-evidence.json
+      - name: Archive release approval evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-trust-approval-${{ github.run_id }}
+          path: production-trust-evidence.json
+          if-no-files-found: error
+          retention-days: 90
