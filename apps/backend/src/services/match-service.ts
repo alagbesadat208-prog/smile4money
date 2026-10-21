@@ -31,7 +31,6 @@ export interface PlayerIdentityResult {
 }
 
 export interface CreateMatchInput {
-  player1: string;
   player2: string;
   stakeAmount: number;
   token: string;

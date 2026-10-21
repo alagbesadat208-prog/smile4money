@@ -28,7 +28,7 @@ router.post('/challenge', (req, res) => {
   }
 });
 
-router.post('/confirm', (req, res) => {
+router.post('/confirm', async (req, res) => {
   const { nonce, signature } = req.body ?? {};
   if (typeof nonce !== 'string' || typeof signature !== 'string') {
     return res.status(400).json({ error: 'nonce and signature are required' });
@@ -37,7 +37,7 @@ router.post('/confirm', (req, res) => {
     return res
       .status(401)
       .json({ error: 'Authenticated wallet address is required' });
-  if (!confirmIdentityLink(nonce, req.address, signature)) {
+  if (!(await confirmIdentityLink(nonce, req.address, signature))) {
     return res.status(400).json({
       error: 'Invalid, expired, replayed, or wrong-wallet identity proof',
     });

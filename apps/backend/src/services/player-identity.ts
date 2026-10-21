@@ -41,6 +41,7 @@
 import { createHash } from 'node:crypto';
 import { randomBytes } from 'node:crypto';
 import { Keypair } from '@stellar/stellar-sdk';
+import axios from 'axios';
 import type { GameResult } from '../fetchers/lichess.js';
 import type { MatchRecord } from '../store/match-store.js';
 
@@ -49,7 +50,7 @@ const pendingLinks = new Map<string, { address: string; platform: string; userna
 const verifiedLinks = new Map<string, { address: string; platform: string; username: string; linkedAt: string }>();
 const MAX_PENDING_LINKS = 4096;
 
-export interface IdentityLinkChallenge { nonce: string; message: string; expiresAt: string }
+export interface IdentityLinkChallenge { nonce: string; message: string; profileProof: string; expiresAt: string }
 
 export function createIdentityLinkChallenge(address: string, platform: string, username: string): IdentityLinkChallenge {
   if (!/^G[A-Z2-7]{55}$/.test(address) || !['lichess', 'chessdotcom'].includes(platform) || !username.trim()) {
@@ -66,10 +67,32 @@ export function createIdentityLinkChallenge(address: string, platform: string, u
   const expiresAt = Date.now() + LINK_NONCE_TTL_MS;
   pendingLinks.set(nonce, { address, platform, username: username.trim(), expiresAt });
   const message = `smile4money identity link\nwallet:${address}\nplatform:${platform}\nusername:${username.trim()}\nnonce:${nonce}`;
-  return { nonce, message, expiresAt: new Date(expiresAt).toISOString() };
+  return {
+    nonce,
+    message,
+    profileProof: `smile4money:${nonce}`,
+    expiresAt: new Date(expiresAt).toISOString(),
+  };
 }
 
-export function confirmIdentityLink(nonce: string, address: string, signatureHex: string): boolean {
+async function verifyChessProfile(platform: string, username: string, profileProof: string): Promise<boolean> {
+  const url = platform === 'lichess'
+    ? `https://lichess.org/api/user/${encodeURIComponent(username)}`
+    : `https://api.chess.com/pub/player/${encodeURIComponent(username)}`;
+  const response = await axios.get(url, { timeout: 10_000, headers: { Accept: 'application/json' } });
+  const account = response.data as { username?: string; id?: string; profile?: { bio?: string }; location?: string };
+  const returnedUsername = account.username ?? account.id;
+  if (!returnedUsername || returnedUsername.toLowerCase() !== username.toLowerCase()) return false;
+  const profileText = platform === 'lichess' ? account.profile?.bio : account.location;
+  return typeof profileText === 'string' && profileText.includes(profileProof);
+}
+
+export async function confirmIdentityLink(
+  nonce: string,
+  address: string,
+  signatureHex: string,
+  verifyProfile: typeof verifyChessProfile = verifyChessProfile,
+): Promise<boolean> {
   const pending = pendingLinks.get(nonce);
   if (!pending || pending.expiresAt <= Date.now() || pending.address !== address || !/^[0-9a-f]{128}$/i.test(signatureHex)) {
     if (pending && pending.expiresAt <= Date.now()) pendingLinks.delete(nonce);
@@ -80,6 +103,9 @@ export function confirmIdentityLink(nonce: string, address: string, signatureHex
   let valid = false;
   try { valid = Keypair.fromPublicKey(address).verify(digest, Buffer.from(signatureHex, 'hex')); } catch { valid = false; }
   if (!valid) return false;
+  let profileVerified = false;
+  try { profileVerified = await verifyProfile(pending.platform, pending.username, `smile4money:${nonce}`); } catch { return false; }
+  if (!profileVerified) return false;
   pendingLinks.delete(nonce);
   verifiedLinks.set(`${pending.platform}:${pending.username.toLowerCase()}`, { address, platform: pending.platform, username: pending.username, linkedAt: new Date().toISOString() });
   return true;

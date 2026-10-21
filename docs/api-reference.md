@@ -1589,7 +1589,9 @@ the same 30-day deletion period to database backups.
 An authenticated wallet can request a challenge with
 `POST /api/player-identity/challenge` and `{ "platform": "lichess",
 "username": "alice" }`. The response includes a message bound to that wallet,
-platform, username, and a random nonce. Sign the SHA-256 digest of the exact
-UTF-8 message with the wallet's Ed25519 key, then send `{ "nonce": "…",
+platform, username, and a random nonce. Publish the returned `profileProof` in
+the chess account's public profile bio (Lichess) or location field (Chess.com).
+Sign the SHA-256 digest of the exact UTF-8 message with the wallet's Ed25519
+key, then send `{ "nonce": "…",
 "signature": "<128 hex characters>" }` to `POST /api/player-identity/confirm`.
 Challenges expire after five minutes and a valid proof can be consumed once.
