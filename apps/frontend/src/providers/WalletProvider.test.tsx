@@ -1,3 +1,4 @@
+import { Networks } from '@stellar/stellar-sdk';
 import React from 'react';
 import { render, screen, renderHook, act, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -24,8 +25,7 @@ const accountResponse = {
 };
 
 function installFreighter(networkName: 'testnet' | 'mainnet') {
-  const networkPassphrase =
-    networkName === 'testnet' ? 'testnet network passphrase' : 'pubnet network passphrase';
+  const networkPassphrase = networkName === 'testnet' ? Networks.TESTNET : Networks.PUBLIC;
   (window as { freighterApi?: unknown }).freighterApi = {
     isConnected: async () => ({ isConnected: true }),
     getPublicKey: async () => 'GBTEST123',
@@ -95,6 +95,20 @@ describe('WalletProvider', () => {
       expect(screen.getByTestId('wallet-context-state')).toHaveTextContent('wrongNetwork'),
     );
     expect(screen.getByTestId('wallet-context-address')).toHaveTextContent('GBTEST123');
+  });
+
+  it('blocks a connected wallet with no verifiable network', async () => {
+    installFreighter('testnet');
+    delete window.freighterApi!.getNetwork;
+    render(
+      <WalletProvider>
+        <WalletConsumer />
+      </WalletProvider>,
+    );
+    fireEvent.click(screen.getByTestId('wallet-connect-btn'));
+    await waitFor(() =>
+      expect(screen.getByTestId('wallet-context-state')).toHaveTextContent('wrongNetwork'),
+    );
   });
 
   it('exposes connect and disconnect actions', async () => {

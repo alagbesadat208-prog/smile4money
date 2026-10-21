@@ -1,3 +1,4 @@
+import { Networks } from '@stellar/stellar-sdk';
 import { useState, useCallback, useEffect, useRef } from 'react';
 import type { WalletStatus, Network } from '../types';
 
@@ -45,8 +46,8 @@ interface StellarWallet {
 
 function detectNetwork(networkPassphrase?: string): Network {
   if (!networkPassphrase) return 'unknown';
-  if (networkPassphrase.includes('testnet')) return 'testnet';
-  if (networkPassphrase.includes('pubnet')) return 'mainnet';
+  if (networkPassphrase === Networks.TESTNET) return 'testnet';
+  if (networkPassphrase === Networks.PUBLIC) return 'mainnet';
   return 'unknown';
 }
 

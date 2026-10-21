@@ -1,3 +1,5 @@
+import { WagerHistory } from './WagerHistory';
+import { deployment } from '../deployment';
 import { useEffect, useState, useCallback } from 'react';
 import type { WalletStatus } from '../types';
 import {
@@ -6,7 +8,7 @@ import {
   setHistoryCacheEntry,
 } from './history-cache';
 
-const HORIZON_URL = 'https://horizon-testnet.stellar.org';
+const HORIZON_URL = deployment.horizonUrl;
 const PAGE_SIZE = 20;
 
 interface HistoryProps {
@@ -37,11 +39,10 @@ interface HorizonResponse {
 
 export interface HistoryRow {
   id: string;
-  matchId: string;
-  opponent: string;
-  stake: string;
-  result: string;
-  payout: string;
+  hash: string;
+  source: string;
+  fee: string;
+  status: string;
   date: string;
 }
 
@@ -54,21 +55,13 @@ function parseCursor(href: string): string | null {
   }
 }
 
-function mapRecord(record: HorizonTransaction, publicKey: string): HistoryRow {
-  const matchId =
-    record.memo && !Number.isNaN(Number(record.memo)) ? record.memo : '—';
-  const opponent =
-    record.source_account === publicKey ? 'Unknown' : record.source_account;
-  const stake = record.fee_charged ? `${record.fee_charged} stroops` : '—';
-  const result = record.successful ? 'Success' : 'Failed';
-  const payout = record.successful ? 'Confirmed' : 'Failed';
+function mapRecord(record: HorizonTransaction): HistoryRow {
   return {
     id: record.hash,
-    matchId,
-    opponent,
-    stake,
-    result,
-    payout,
+    hash: record.hash,
+    source: record.source_account,
+    fee: `${record.fee_charged} stroops`,
+    status: record.successful ? 'Success' : 'Failed',
     date: new Date(record.created_at).toLocaleString(),
   };
 }
@@ -113,7 +106,7 @@ export function History({
         const data = (await response.json()) as HorizonResponse;
         const records: HorizonTransaction[] = data._embedded?.records ?? [];
 
-        const rows = records.map((r) => mapRecord(r, publicKey));
+        const rows = records.map((r) => mapRecord(r));
 
         setHistory((prev) => (append ? [...prev, ...rows] : rows));
 
@@ -178,14 +171,16 @@ export function History({
     return (
       <section className="history-page" data-testid="history-page">
         <h2>Transaction History</h2>
-        <p>Please connect your wallet to view match history.</p>
+        <p>Please connect your wallet to view history.</p>
       </section>
     );
   }
 
   return (
     <section className="history-page" data-testid="history-page">
-      <h2>Match History</h2>
+      {publicKey && <WagerHistory key={publicKey} wallet={publicKey} />}
+      <h2>Network Transaction Details</h2>
+      <p>Network fees and transaction status do not establish wager outcomes.</p>
 
       {loading && <p data-testid="history-loading">Loading history…</p>}
 
@@ -196,7 +191,7 @@ export function History({
       )}
 
       {!loading && !error && history.length === 0 && (
-        <p data-testid="history-empty">No matches found for this wallet.</p>
+        <p data-testid="history-empty">No network transactions found for this wallet.</p>
       )}
 
       {!loading && history.length > 0 && (
@@ -205,22 +200,20 @@ export function History({
             <table className="history-table" data-testid="history-table">
               <thead>
                 <tr>
-                  <th>Match ID</th>
-                  <th>Opponent</th>
-                  <th>Stake</th>
-                  <th>Result</th>
-                  <th>Payout</th>
+                  <th>Transaction hash</th>
+                  <th>Source account</th>
+                  <th>Network fee</th>
+                  <th>Transaction status</th>
                   <th>Date</th>
                 </tr>
               </thead>
               <tbody>
                 {history.map((row) => (
                   <tr key={row.id} data-testid="history-row">
-                    <td>{row.matchId}</td>
-                    <td>{row.opponent}</td>
-                    <td>{row.stake}</td>
-                    <td>{row.result}</td>
-                    <td>{row.payout}</td>
+                    <td>{row.hash}</td>
+                    <td>{row.source}</td>
+                    <td>{row.fee}</td>
+                    <td>{row.status}</td>
                     <td>{row.date}</td>
                   </tr>
                 ))}
@@ -246,7 +239,7 @@ export function History({
 
           {loadingMore && (
             <p data-testid="history-loading-more" aria-live="polite">
-              Loading more matches…
+              Loading more transactions…
             </p>
           )}
         </>

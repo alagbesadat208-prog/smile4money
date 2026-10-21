@@ -1,3 +1,4 @@
+import { Asset, Networks } from '@stellar/stellar-sdk';
 import React from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -5,19 +6,28 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Leaderboard, decodeEntries } from '../src/pages/Leaderboard';
 import type { LeaderboardEntry } from '../src/pages/Leaderboard';
 
-vi.mock('@stellar/stellar-sdk', () => ({
+// jsdom's Uint8Array belongs to a different realm from Node's SDK Buffer.
+vi.hoisted(() => vi.stubGlobal('Uint8Array', new globalThis.TextEncoder().encode('').constructor));
+
+vi.mock('@stellar/stellar-sdk', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@stellar/stellar-sdk')>()),
   Account: class {
     constructor(
       public _address: string,
       public _sequence: string,
     ) {}
   },
-  Networks: { TESTNET: 'Test SDF Network ; September 2015' },
   Operation: { invokeContractFunction: vi.fn() },
   TransactionBuilder: class {
-    addOperation() { return this; }
-    setTimeout() { return this; }
-    build() { return {}; }
+    addOperation() {
+      return this;
+    }
+    setTimeout() {
+      return this;
+    }
+    build() {
+      return {};
+    }
   },
   nativeToScVal: vi.fn(),
   rpc: { Server: vi.fn() },
@@ -64,8 +74,15 @@ describe('Leaderboard â€” rendering', () => {
     await screen.findByTestId('leaderboard-table');
     expect(screen.getAllByTestId('leaderboard-row')).toHaveLength(1);
     expect(screen.getByText('5')).toBeInTheDocument();
-    // 2500 is formatted with a thousands separator.
-    expect(screen.getByText(/2,500/)).toBeInTheDocument();
+    // Unknown assets retain their raw, explicitly named denomination.
+    expect(screen.getByText('2500 smallest units (CTOKENADDRESS)')).toBeInTheDocument();
+  });
+
+  it('displays verified native earnings in XLM with exact decimals', async () => {
+    const row = entry('GAAA', 1, '15000001');
+    row.stats.token = Asset.native().contractId(Networks.TESTNET);
+    render(<Leaderboard contractId={CONTRACT} fetchPage={vi.fn().mockResolvedValue([row])} />);
+    expect(await screen.findByText('1.5000001 XLM')).toBeInTheDocument();
   });
 
   it('shows an empty state when nobody has played', async () => {
@@ -130,10 +147,7 @@ describe('Leaderboard — pagination', () => {
 
   it('requests the next page with an offset', async () => {
     // A full page first, then a short one, so Next stays enabled after page 1.
-    const fetchPage = vi
-      .fn()
-      .mockResolvedValueOnce(rows(PAGE_SIZE))
-      .mockResolvedValueOnce(rows(3));
+    const fetchPage = vi.fn().mockResolvedValueOnce(rows(PAGE_SIZE)).mockResolvedValueOnce(rows(3));
     render(<Leaderboard contractId={CONTRACT} fetchPage={fetchPage} />);
     await screen.findByTestId('leaderboard-table');
 
@@ -146,10 +160,7 @@ describe('Leaderboard — pagination', () => {
   });
 
   it('numbers rows continuously across pages', async () => {
-    const fetchPage = vi
-      .fn()
-      .mockResolvedValueOnce(rows(PAGE_SIZE))
-      .mockResolvedValueOnce(rows(2))
+    const fetchPage = vi.fn().mockResolvedValueOnce(rows(PAGE_SIZE)).mockResolvedValueOnce(rows(2));
     render(<Leaderboard contractId={CONTRACT} fetchPage={fetchPage} />);
     await screen.findByTestId('leaderboard-table');
 
@@ -177,9 +188,7 @@ describe('Leaderboard — pagination', () => {
     await waitFor(() => expect(fetchPage).toHaveBeenCalledTimes(3));
     // Paging back re-requests offset 0 rather than reusing cached rows.
     expect(fetchPage.mock.calls[2]).toEqual([PAGE_SIZE, 0]);
-    await waitFor(() =>
-      expect(screen.getAllByTestId('leaderboard-row')).toHaveLength(PAGE_SIZE),
-    );
+    await waitFor(() => expect(screen.getAllByTestId('leaderboard-row')).toHaveLength(PAGE_SIZE));
   });
 
   it('keeps the rows the contract returned, in the order it returned them', async () => {

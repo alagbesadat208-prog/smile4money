@@ -1,5 +1,14 @@
+import { formatTokenAmount } from '../token-amount';
+import { deployment } from '../deployment';
 import { useEffect, useState } from 'react';
-import { Account, Networks, Operation, TransactionBuilder, nativeToScVal, rpc, scValToNative } from '@stellar/stellar-sdk';
+import {
+  Account,
+  Operation,
+  TransactionBuilder,
+  nativeToScVal,
+  rpc,
+  scValToNative,
+} from '@stellar/stellar-sdk';
 
 /**
  * Leaderboard page â€” issue #124 / #1803.
@@ -126,19 +135,10 @@ function shortAddress(address: string): string {
   return address.length > 12 ? `${address.slice(0, 4)}â€¦${address.slice(-4)}` : address;
 }
 
-/** Format a raw smallest-unit amount with thousands separators. */
-function formatAmount(value: string): string {
-  try {
-    return BigInt(value).toLocaleString();
-  } catch {
-    return value;
-  }
-}
-
 export function Leaderboard({
   contractId,
-  rpcUrl = DEFAULT_RPC_URL,
-  networkPassphrase = Networks.TESTNET,
+  rpcUrl = deployment.rpcUrl || DEFAULT_RPC_URL,
+  networkPassphrase = deployment.networkPassphrase,
   fetchPage,
 }: LeaderboardProps) {
   const [page, setPage] = useState(0);
@@ -253,12 +253,10 @@ export function Leaderboard({
                     <td>{entry.stats.losses}</td>
                     <td>{entry.stats.draws}</td>
                     <td>
-                      {formatAmount(entry.stats.earnings)}
-                      {entry.stats.token && (
-                        <span className="address-small">
-                          {' '}
-                          {shortAddress(entry.stats.token)}
-                        </span>
+                      {formatTokenAmount(
+                        entry.stats.earnings,
+                        entry.stats.token,
+                        networkPassphrase,
                       )}
                     </td>
                   </tr>

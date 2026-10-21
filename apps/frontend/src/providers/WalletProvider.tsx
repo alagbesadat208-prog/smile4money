@@ -1,3 +1,4 @@
+import { deployment } from '../deployment';
 import { createContext, useContext, type ReactNode, type JSX } from 'react';
 import { useStellarWallet } from '../hooks/useStellarWallet';
 import type { Network, WalletStatus } from '../types';
@@ -27,8 +28,7 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
 
   const walletState: WalletStatus =
     wallet.status === 'connected' &&
-    wallet.network !== 'unknown' &&
-    wallet.network !== 'testnet'
+    (wallet.network === 'unknown' || wallet.network !== deployment.network)
       ? 'wrongNetwork'
       : wallet.status;
 

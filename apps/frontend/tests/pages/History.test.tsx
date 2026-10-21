@@ -34,9 +34,11 @@ describe('History cache', () => {
   });
 
   it('does not call the API again on a second navigation within the TTL', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new globalThis.Response(JSON.stringify(historyResponse()), { status: 200 }),
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(
+        new globalThis.Response(JSON.stringify(historyResponse()), { status: 200 }),
+      );
 
     const first = render(
       <History walletState="connected" publicKey={wallet} cacheTtlMs={60_000} />,
@@ -49,5 +51,16 @@ describe('History cache', () => {
 
     expect(screen.getByTestId('history-row')).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  it('keeps unrelated successful transactions out of wager results', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new globalThis.Response(JSON.stringify(historyResponse()), { status: 200 }),
+    );
+    render(<History walletState="connected" publicKey={wallet} />);
+    await screen.findByTestId('history-row');
+    expect(screen.getByText('Network Transaction Details')).toBeInTheDocument();
+    expect(screen.getByText('10 stroops')).toBeInTheDocument();
+    expect(screen.queryByText('Win')).not.toBeInTheDocument();
+    expect(screen.queryByText('42')).not.toBeInTheDocument();
   });
 });
