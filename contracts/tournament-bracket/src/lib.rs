@@ -268,20 +268,15 @@ impl TournamentBracket {
 
         let id = Self::tournament_count(&env);
         let next_id = id.checked_add(1).ok_or(Error::Overflow)?;
-        let t = Tournament {
-            id,
-            admin,
-            token: token_addr,
-            entry_fee,
-            player_count: n,
-            // `n` is a power of two, so this is exactly log2(n).
-            rounds: n.trailing_zeros(),
-            funded_count: 0,
-            state: TournamentState::Registration,
-            champion: None,
-            created_ledger: env.ledger().sequence(),
-            completed_ledger: None,
-        };
+       let t = Tournament {
+    id,
+    admin,
+    token: token_addr,
+    entry_fee,
+    player_count: n,
+    minimum_entrants: n as u32,
+    rounds: n.trailing_zeros(),
+    funded_count: 0,
         Self::save_tournament(&env, &t);
 
         // Publish the new ID before writing the nodes: `load_node` refuses to
