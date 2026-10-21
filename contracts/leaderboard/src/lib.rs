@@ -46,7 +46,10 @@ mod types;
 
 pub use types::*;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol, Vec};
+
+const INSTANCE_LIFETIME_THRESHOLD: u32 = STATS_TTL_LEDGERS;
+const INSTANCE_BUMP_AMOUNT: u32 = STATS_TTL_LEDGERS;
 
 #[contract]
 pub struct LeaderboardContract;
@@ -69,7 +72,16 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::ResultCount, &0u32);
-        env.storage().instance().set(&DataKey::Sources(source.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::Sources(source.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::Roster, &Vec::<Address>::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey::RankedRoster, &Vec::<Address>::new(&env));
+        Self::bump_instance_ttl(&env);
 
         env.events().publish(
             (Symbol::new(&env, "admin"), symbol_short!("init")),
@@ -89,6 +101,7 @@ impl LeaderboardContract {
         env.storage()
             .instance()
             .set(&DataKey::Sources(source.clone()), &true);
+        Self::bump_instance_ttl(&env);
         env.events().publish(
             (Symbol::new(&env, "admin"), symbol_short!("src_add")),
             (source, caller),
@@ -102,13 +115,18 @@ impl LeaderboardContract {
     pub fn remove_source(env: Env, source: Address, caller: Address) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
 
-        if !env.storage().instance().has(&DataKey::Sources(source.clone())) {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Sources(source.clone()))
+        {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().remove(&DataKey::Sources(source));
+        Self::bump_instance_ttl(&env);
         env.events().publish(
             (Symbol::new(&env, "admin"), symbol_short!("src_del")),
-            (caller),
+            caller,
         );
         Ok(())
     }
@@ -127,6 +145,7 @@ impl LeaderboardContract {
     pub fn set_paused(env: Env, paused: bool, caller: Address) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Paused, &paused);
+        Self::bump_instance_ttl(&env);
         env.events().publish(
             (Symbol::new(&env, "admin"), symbol_short!("pause_set")),
             (paused, caller),
@@ -136,7 +155,10 @@ impl LeaderboardContract {
 
     /// Return whether result recording is paused.
     pub fn is_paused(env: Env) -> bool {
-        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Record the outcome of one completed match.
@@ -164,10 +186,14 @@ impl LeaderboardContract {
         token: Address,
         caller: Address,
     ) -> Result<(), Error> {
-        if !env.storage().instance().has(&DataKey::Sources(caller.clone())) {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Sources(caller.clone()))
+        {
             return Err(Error::Unauthorized);
         }
-        if Self::is_paused(&env) {
+        if Self::is_paused(env.clone()) {
             return Err(Error::ContractPaused);
         }
         // A self-match would credit a player a win and a loss at once, and
@@ -178,7 +204,15 @@ impl LeaderboardContract {
         if payout < 0 {
             return Err(Error::InvalidResult);
         }
+        // A successful decimals call verifies that this is a deployed
+        // contract implementing the Soroban token interface.
+        let asset = token::Client::new(&env, &token);
+        if !matches!(asset.try_decimals(), Ok(Ok(_))) {
+            return Err(Error::InvalidAsset);
+        }
         caller.require_auth();
+
+        Self::ensure_population_capacity(&env, &player1, &player2)?;
 
         // `MatchOutcome` is not `Copy`, so the outcome is matched once to decide
         // which side is credited, rather than compared and matched separately.
@@ -193,22 +227,30 @@ impl LeaderboardContract {
             (Some(w), Some(l)) => {
                 let mut w_stats = Self::load_stats(&env, w);
                 w_stats.wins += 1;
-                w_stats.earnings += payout;
+                if w_stats.token == token {
+                    w_stats.earnings += payout;
+                } else {
+                    w_stats.earnings = payout;
+                }
                 w_stats.token = token.clone();
                 Self::store_stats(&env, w, &w_stats);
+                Self::update_asset_stats(&env, w, &token, true, false, payout);
 
                 let mut l_stats = Self::load_stats(&env, l);
                 l_stats.losses += 1;
                 Self::store_stats(&env, l, &l_stats);
+                Self::update_asset_stats(&env, l, &token, false, false, 0);
             }
             _ => {
                 let mut p1 = Self::load_stats(&env, &player1);
                 p1.draws += 1;
                 Self::store_stats(&env, &player1, &p1);
+                Self::update_asset_stats(&env, &player1, &token, false, true, 0);
 
                 let mut p2 = Self::load_stats(&env, &player2);
                 p2.draws += 1;
                 Self::store_stats(&env, &player2, &p2);
+                Self::update_asset_stats(&env, &player2, &token, false, true, 0);
             }
         }
 
@@ -216,11 +258,18 @@ impl LeaderboardContract {
         // loses or draws needs a roster entry to be ranked.
         Self::add_to_roster(&env, &player1);
         Self::add_to_roster(&env, &player2);
+        Self::refresh_global_rank(&env, &player1);
+        Self::refresh_global_rank(&env, &player2);
 
-        let count: u32 = env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ResultCount)
+            .unwrap_or(0);
         env.storage()
             .instance()
             .set(&DataKey::ResultCount, &count.saturating_add(1));
+        Self::bump_instance_ttl(&env);
 
         env.events().publish(
             (Symbol::new(&env, "result"), symbol_short!("recorded")),
@@ -236,7 +285,10 @@ impl LeaderboardContract {
 
     /// Return how many results have been recorded.
     pub fn result_count(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::ResultCount)
+            .unwrap_or(0)
     }
 
     /// Read the admin address — used by off-chain tooling to build a
@@ -248,7 +300,7 @@ impl LeaderboardContract {
             .ok_or(Error::NotInitialized)
     }
 
-    /// Return a page of the leaderboard, ranked by wins then earnings.
+    /// Return a page of the global leaderboard, ranked by wins.
     ///
     /// Paging is `offset`-based. `limit` is capped at [`MAX_PAGE_SIZE`], so a
     /// caller asking for more gets one full page rather than a response too
@@ -256,17 +308,15 @@ impl LeaderboardContract {
     ///
     /// ## Ranking and its limits
     ///
-    /// Rows are ordered by **wins** descending, then `earnings` descending,
-    /// then address ascending as a tie-break. The final tie-break matters: two
-    /// players with identical records must come back in a stable order, or
-    /// paging would show duplicates on one page and skip rows on the next.
+    /// Rows are ordered by wins descending, then address ascending. Earnings
+    /// are excluded because records may use different assets.
     ///
-    /// The earnings tie-break is only meaningful **within a single token** —
-    /// a raw stroop count of USDC and one of XLM are not comparable numbers.
-    /// The `token` field is returned on every row so a caller can group or
-    /// label by currency rather than silently adding unlike units together.
+    /// Use [`get_asset_leaderboard`](Self::get_asset_leaderboard) to rank
+    /// earnings within one asset.
     ///
-    /// Only players with at least one completed match appear. A caller paging
+    /// The sorted index is updated on writes and capped at [`MAX_PLAYERS`].
+    /// Reads fetch stats only for the requested page. Only players with at
+    /// least one completed match appear. A caller paging
     /// to the end gets a short page rather than an error, which is the normal
     /// "no more results" signal for a paginated read.
     ///
@@ -288,62 +338,53 @@ impl LeaderboardContract {
             limit
         };
 
-        // A player is "on the board" once they have completed a match, so an
-        // address that has never played cannot occupy a slot.
-        //
-        // The roster is an instance-tier `Vec<Address>` of everyone who has
-        // been recorded, and is the only thing that has to be enumerated here —
-        // iterating persistent storage is not possible, so without a roster
-        // there would be no way to discover who exists.
-        let roster: Vec<Address> = env
+        let ranked: Vec<Address> = env
             .storage()
             .instance()
-            .get(&DataKey::Roster)
+            .get(&DataKey::RankedRoster)
             .unwrap_or_else(|| Vec::new(&env));
-
-        let mut ranked: Vec<(Address, PlayerStats)> = Vec::new(&env);
-        let roster_len = roster.len();
-        let mut idx = 0u32;
-        while idx < roster_len {
-            let player = roster.get(idx);
-            let stats = Self::load_stats(&env, &player);
-            if stats.matches_played() > 0 {
-                ranked.push_back((player, stats));
-            }
-            idx += 1;
-        }
-
-        // Insertion sort, descending by (wins, earnings) with an ascending
-        // address tie-break.
-        //
-        // Why not sort in Rust and worry about cost? Because `Vec::sort` is
-        // unavailable in `no_std` for Soroban's ordered collections, and
-        // because the board is expected to be small — a page of 50 out of the
-        // players who have actually wagered. Insertion sort is O(n^2) in the
-        // worst case, which is the wrong shape for a large board; the honest
-        // framing is that this is correct and adequate at current scale, and
-        // the thing to revisit first if the board grows.
-        let len = ranked.len();
-        for i in 1..len {
-            let mut j = i;
-            while j > 0 && Self::ranks_after(&ranked.get(j - 1), &ranked.get(j)) {
-                let prev = ranked.get(j - 1);
-                let cur = ranked.get(j);
-                ranked.set(j, prev);
-                ranked.set(j - 1, cur);
-                j -= 1;
-            }
-        }
-
-        if offset > 0 && offset as u64 >= ranked.len() as u64 {
+        if offset > 0 && offset >= ranked.len() {
             return Err(Error::InvalidRange);
         }
 
-        let end = core::cmp::min(ranked.len(), offset.saturating_add(limit) as usize);
+        let end = core::cmp::min(ranked.len(), offset.saturating_add(limit));
         let mut out: Vec<LeaderboardEntry> = Vec::new(&env);
-        let mut i = offset as usize;
+        let mut i = offset;
         while i < end {
-            let (player, stats) = ranked.get(i);
+            let player = ranked.get(i).unwrap();
+            let stats = Self::load_stats(&env, &player);
+            out.push_back(LeaderboardEntry { player, stats });
+            i += 1;
+        }
+        Ok(out)
+    }
+
+    /// Return an independently ranked page for one token. Earnings are
+    /// compared only with earnings in this same token, in its smallest unit.
+    pub fn get_asset_leaderboard(
+        env: Env,
+        asset: Address,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<LeaderboardEntry>, Error> {
+        if limit == 0 {
+            return Err(Error::InvalidRange);
+        }
+        let limit = core::cmp::min(limit, MAX_PAGE_SIZE);
+        let ranked: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetRoster(asset.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if offset > 0 && offset >= ranked.len() {
+            return Err(Error::InvalidRange);
+        }
+        let end = core::cmp::min(ranked.len(), offset.saturating_add(limit));
+        let mut out = Vec::new(&env);
+        let mut i = offset;
+        while i < end {
+            let player = ranked.get(i).unwrap();
+            let stats = Self::load_asset_stats(&env, &player, &asset);
             out.push_back(LeaderboardEntry { player, stats });
             i += 1;
         }
@@ -384,6 +425,130 @@ impl LeaderboardContract {
         );
     }
 
+    fn load_asset_stats(env: &Env, player: &Address, asset: &Address) -> PlayerStats {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetStats(player.clone(), asset.clone()))
+            .unwrap_or_else(|| PlayerStats::empty(asset))
+    }
+
+    fn update_asset_stats(
+        env: &Env,
+        player: &Address,
+        asset: &Address,
+        win: bool,
+        draw: bool,
+        payout: i128,
+    ) {
+        let key = DataKey::AssetStats(player.clone(), asset.clone());
+        let mut stats = Self::load_asset_stats(env, player, asset);
+        if win {
+            stats.wins += 1;
+            stats.earnings += payout;
+        } else if draw {
+            stats.draws += 1;
+        } else {
+            stats.losses += 1;
+        }
+        env.storage().persistent().set(&key, &stats);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, STATS_TTL_LEDGERS, STATS_TTL_LEDGERS);
+        let roster_key = DataKey::AssetRoster(asset.clone());
+        let mut ranked: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&roster_key)
+            .unwrap_or_else(|| Vec::new(env));
+        for idx in 0..ranked.len() {
+            if ranked.get(idx).unwrap() == *player {
+                let _ = ranked.remove(idx);
+                break;
+            }
+        }
+        let mut rank = 0;
+        while rank < ranked.len()
+            && !Self::asset_ranks_after(env, &ranked.get(rank).unwrap(), player, asset)
+        {
+            rank += 1;
+        }
+        ranked.insert(rank, player.clone());
+        env.storage().persistent().set(&roster_key, &ranked);
+        env.storage()
+            .persistent()
+            .extend_ttl(&roster_key, STATS_TTL_LEDGERS, STATS_TTL_LEDGERS);
+    }
+
+    fn asset_ranks_after(env: &Env, a: &Address, b: &Address, asset: &Address) -> bool {
+        let a_stats = Self::load_asset_stats(env, a, asset);
+        let b_stats = Self::load_asset_stats(env, b, asset);
+        if a_stats.wins != b_stats.wins {
+            return a_stats.wins < b_stats.wins;
+        }
+        if a_stats.earnings != b_stats.earnings {
+            return a_stats.earnings < b_stats.earnings;
+        }
+        a > b
+    }
+
+    fn ensure_population_capacity(
+        env: &Env,
+        player1: &Address,
+        player2: &Address,
+    ) -> Result<(), Error> {
+        let roster: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Roster)
+            .unwrap_or_else(|| Vec::new(env));
+        let has1 = roster.contains(player1);
+        let has2 = roster.contains(player2);
+        let additions = ((!has1) as u32) + ((!has2 && player1 != player2) as u32);
+        if roster.len().saturating_add(additions) > MAX_PLAYERS {
+            return Err(Error::TooManyPlayers);
+        }
+        Ok(())
+    }
+
+    fn refresh_global_rank(env: &Env, player: &Address) {
+        let mut ranked: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RankedRoster)
+            .unwrap_or_else(|| Vec::new(env));
+        for idx in 0..ranked.len() {
+            if ranked.get(idx).unwrap() == *player {
+                let _ = ranked.remove(idx);
+                break;
+            }
+        }
+        let mut rank = 0;
+        while rank < ranked.len()
+            && !Self::global_ranks_after(env, &ranked.get(rank).unwrap(), player)
+        {
+            rank += 1;
+        }
+        ranked.insert(rank, player.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::RankedRoster, &ranked);
+    }
+
+    fn global_ranks_after(env: &Env, a: &Address, b: &Address) -> bool {
+        let a_stats = Self::load_stats(env, a);
+        let b_stats = Self::load_stats(env, b);
+        if a_stats.wins != b_stats.wins {
+            return a_stats.wins < b_stats.wins;
+        }
+        a > b
+    }
+
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
     /// Add `player` to the roster if they are not on it yet.
     ///
     /// The roster is a `Vec`, so membership is a linear scan. That is fine
@@ -400,7 +565,7 @@ impl LeaderboardContract {
         let len = roster.len();
         let mut i = 0u32;
         while i < len {
-            if roster.get(i) == *player {
+            if roster.get(i).unwrap() == *player {
                 return;
             }
             i += 1;
@@ -408,26 +573,6 @@ impl LeaderboardContract {
 
         roster.push_back(player.clone());
         env.storage().instance().set(&DataKey::Roster, &roster);
-    }
-
-    /// Whether `a` should sort after `b` — i.e. `a` ranks lower.
-    ///
-    /// Ordering is wins descending, then earnings descending, then address
-    /// ascending. The address tie-break is not cosmetic: without it, two
-    /// players with identical records have no defined relative order, and
-    /// `get_leaderboard` paging would show the same row twice across page
-    /// boundaries and silently skip another.
-    fn ranks_after(
-        a: &(Address, PlayerStats),
-        b: &(Address, PlayerStats),
-    ) -> bool {
-        if a.1.wins != b.1.wins {
-            return a.1.wins < b.1.wins;
-        }
-        if a.1.earnings != b.1.earnings {
-            return a.1.earnings < b.1.earnings;
-        }
-        a.0 > b.0
     }
 }
 
