@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt, { JsonWebTokenError, TokenExpiredError } from 'jsonwebtoken';
 import { ErrorCode, errorEnvelope } from '../errors/errorResponse.js';
+import { privateEnv } from '../config/private-env.js';
 
 /**
  * JWT_SECRET is used to sign and verify authentication tokens.
@@ -9,7 +10,7 @@ import { ErrorCode, errorEnvelope } from '../errors/errorResponse.js';
  * NEVER use default in production.
  */
 const DEFAULT_SECRET = 'test-secret';
-const SECRET = process.env.JWT_SECRET || DEFAULT_SECRET;
+const SECRET = privateEnv.jwtSecret || DEFAULT_SECRET;
 
 // Hard fail at startup in production: a missing or default JWT_SECRET lets
 // anyone forge tokens with the well-known default, so refusing to start is

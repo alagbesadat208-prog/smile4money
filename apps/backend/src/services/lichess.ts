@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { privateEnv } from '../config/private-env.js';
 import { getLichessLimiterSingleton } from './bottleneck-limiters.js';
 import logger from '../logger.js';
 
@@ -17,7 +18,7 @@ export interface LichessGame {
 }
 
 export async function fetchLichessGame(gameId: string): Promise<LichessGame> {
-  const token = process.env.LICHESS_API_TOKEN;
+  const token = privateEnv.lichessApiToken;
   const url = `https://lichess.org/api/game/${encodeURIComponent(gameId)}`;
   const limiter = getLichessLimiterSingleton();
 

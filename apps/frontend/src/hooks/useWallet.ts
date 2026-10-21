@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { publicEnv } from '../config/public-env';
 
 export type WalletState =
   'checking' | 'notInstalled' | 'disconnected' | 'connecting' | 'connected' | 'wrongNetwork';
@@ -12,14 +13,9 @@ declare global {
       setAllowed: () => Promise<{ error?: { code: number; message: string } }>;
     };
   }
-  interface ImportMeta {
-    env: {
-      VITE_STELLAR_NETWORK?: string;
-    };
-  }
 }
 
-const EXPECTED_NETWORK = (import.meta.env.VITE_STELLAR_NETWORK as string | undefined) || 'testnet';
+const EXPECTED_NETWORK = publicEnv.stellarNetwork;
 
 /** localStorage key used to persist the user's connection preference. */
 const WALLET_CONNECTED_KEY = 'wallet_connected';

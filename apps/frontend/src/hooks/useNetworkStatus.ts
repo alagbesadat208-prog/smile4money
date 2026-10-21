@@ -7,7 +7,9 @@
  * be made here.
  */
 
-const EXPECTED_NETWORK = import.meta.env.VITE_STELLAR_NETWORK ?? 'testnet';
+import { publicEnv } from '../config/public-env';
+
+const EXPECTED_NETWORK = publicEnv.stellarNetwork;
 
 export const NETWORK_LABELS: Record<string, string> = {
   mainnet: 'Mainnet',
