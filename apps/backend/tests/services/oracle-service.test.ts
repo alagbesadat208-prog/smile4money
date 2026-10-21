@@ -159,6 +159,15 @@ describe('verifyGameResult', () => {
       expect(result.whitePlayer).toBe('alice');
       expect(result.blackPlayer).toBe('bob');
       expect(result.message).toContain('verified');
+      await expect(store.getSettlementEvidence(0)).resolves.toMatchObject({
+        parserVersion: 'chess-result-v1',
+        gameId: 'lichess-game-abc',
+        platform: 'lichess',
+        whitePlayer: 'alice',
+        blackPlayer: 'bob',
+        result: 'Player1Wins',
+        decision: 'verified',
+      });
     }
   });
 

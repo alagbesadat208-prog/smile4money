@@ -11,8 +11,13 @@
 import { fetchLichessResult, GameNotFoundError } from '../fetchers/lichess.js';
 import { fetchChessDotComResult } from '../fetchers/chessdotcom.js';
 import type { MatchRecord } from '../store/match-store.js';
-import type { MatchStore } from '../store/match-store.js';
+import type { MatchStorePort } from '../store/match-store.js';
 import { errorToHttpStatus, ValidationError, ConflictError } from '../errors/errorToHttpStatus.js';
+
+// Mirrors contracts/escrow/src/constants.rs and contracts/smile4money-common.
+export const MIN_STAKE = 1;
+export const MAX_STAKE = 10_000_000_000_000;
+export const MAX_GAME_ID_LEN = 64;
 
 export interface GameValidationResult {
   valid: boolean;
@@ -58,10 +63,10 @@ export function validateCreateMatchInput(
     !Number.isFinite(stakeAmount) ||
     !Number.isInteger(stakeAmount)
   ) {
-    return 'stakeAmount must be a whole number of stroops';
+    return 'stakeAmount must be a whole number of token base units';
   }
-  if (stakeAmount <= 0 || stakeAmount > Number.MAX_SAFE_INTEGER) {
-    return 'stakeAmount must be a valid, positive amount';
+  if (stakeAmount < MIN_STAKE || stakeAmount > MAX_STAKE) {
+    return `stakeAmount must be between ${MIN_STAKE} and ${MAX_STAKE} token units`;
   }
   if (!token || typeof token !== 'string') {
     return 'token is required';
@@ -69,8 +74,8 @@ export function validateCreateMatchInput(
   if (!gameId || typeof gameId !== 'string' || gameId.length === 0) {
     return 'gameId is required';
   }
-  if (gameId.length >= 512) {
-    return 'gameId is too long';
+  if (Buffer.byteLength(gameId, 'utf8') > MAX_GAME_ID_LEN || !/^[A-Za-z0-9_-]+$/.test(gameId)) {
+    return 'gameId must be 1-64 ASCII characters containing only letters, numbers, _ or -';
   }
   if (!platform || (platform !== 'lichess' && platform !== 'chessdotcom')) {
     return 'platform must be lichess or chessdotcom';
@@ -156,7 +161,7 @@ export async function getGameResultWithPlayerIdentities(
  * result to an HTTP response.
  */
 export async function createMatchForPlayer(
-  store: MatchStore,
+  store: MatchStorePort,
   player1: string,
   input: CreateMatchInput,
 ): Promise<CreateMatchResult> {

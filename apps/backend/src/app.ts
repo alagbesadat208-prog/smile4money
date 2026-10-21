@@ -4,6 +4,7 @@ import healthRouter from './routes/health.js';
 import matchRouter from './routes/matches.js';
 import validateGameRouter from './routes/validate-game.js';
 import oracleRouter from './routes/oracle.js';
+import playerIdentityRouter from './routes/player-identity.js';
 import { errorToHttpStatus } from './errors/errorToHttpStatus.js';
 import { requestLogging } from './middleware/request-logging.js';
 
@@ -50,6 +51,7 @@ app.use('/health', healthRouter);
 app.use('/api/matches', matchRouter);
 app.use('/api/validate-game', validateGameRouter);
 app.use('/api/oracle', oracleRouter);
+app.use('/api/player-identity', playerIdentityRouter);
 
 // Fallback for any error a route handler doesn't catch itself, so every
 // route ends up with the same JSON error shape and the same centralized

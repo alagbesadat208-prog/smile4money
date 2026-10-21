@@ -10,7 +10,7 @@ import { fetchLichessResult, GameNotFoundError } from '../fetchers/lichess.js';
 import { fetchChessDotComResult } from '../fetchers/chessdotcom.js';
 import { verifyPlayerIdentities, verifyIdentityHash } from './player-identity.js';
 import type { PlayerIdentityMap } from './player-identity.js';
-import type { MatchStore } from '../store/match-store.js';
+import type { MatchStorePort } from '../store/match-store.js';
 import logger from '../logger.js';
 import { errorToHttpStatus, ValidationError, NotFoundError } from '../errors/errorToHttpStatus.js';
 
@@ -82,7 +82,7 @@ export function validateSubmitResultInput(input: Partial<SubmitResultInput>): st
  * result to an HTTP response.
  */
 export async function verifyGameResult(
-  store: MatchStore,
+  store: MatchStorePort,
   input: SubmitResultInput,
 ): Promise<SubmitResultOutcome> {
   const { matchId, gameId, platform, username } = input;
@@ -175,6 +175,21 @@ export async function verifyGameResult(
     throw error;
   }
 
+  // Retain only normalized fields used for the decision; raw provider data is
+  // discarded. Append once the decision is known so every evaluation stays
+  // reproducible, including rejected results.
+  const evidence = {
+    parserVersion: 'chess-result-v1',
+    evaluatedAt: new Date().toISOString(),
+    matchId: match.matchId,
+    gameId: apiResult.gameId,
+    platform: match.platform,
+    whitePlayer: apiResult.whitePlayer.trim().toLowerCase(),
+    blackPlayer: apiResult.blackPlayer.trim().toLowerCase(),
+    result: apiResult.result,
+    status: apiResult.status,
+  };
+
   // Build the identity map from the match record
   const identityMap: PlayerIdentityMap = {
     player1Address: match.player1,
@@ -187,6 +202,7 @@ export async function verifyGameResult(
   // Verify that the API players match the registered players
   const verification = verifyPlayerIdentities(match, apiResult, identityMap);
   if (!verification.valid) {
+    await store.saveSettlementEvidence({ ...evidence, decision: 'player_identity_mismatch' });
     return {
       ok: false,
       status: errorToHttpStatus(new ValidationError('Player identity verification failed')),
@@ -202,6 +218,7 @@ export async function verifyGameResult(
   // been swapped after creation.
   const identityHashCheck = verifyIdentityHash(match);
   if (!identityHashCheck.valid) {
+    await store.saveSettlementEvidence({ ...evidence, decision: 'identity_hash_mismatch' });
     return {
       ok: false,
       status: errorToHttpStatus(new ValidationError('Identity hash verification failed')),
@@ -209,6 +226,8 @@ export async function verifyGameResult(
       details: identityHashCheck.error,
     };
   }
+
+  await store.saveSettlementEvidence({ ...evidence, decision: 'verified' });
 
   return {
     ok: true,

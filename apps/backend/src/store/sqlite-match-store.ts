@@ -9,7 +9,7 @@ import sqlite3 from 'sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import type { MatchRecord } from './match-store.js';
+import type { CanonicalSettlementEvidence, MatchRecord } from './match-store.js';
 import { computeIdentityHash } from '../services/player-identity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -30,6 +30,7 @@ export class SqliteMatchStore {
   private dbPath: string;
   private nextId = 0;
   private initialized = false;
+  private evidenceCleanupTimer?: NodeJS.Timeout;
 
   constructor(dbPath?: string) {
     this.dbPath = dbPath || path.join(__dirname, '../../data/match-store.db');
@@ -56,6 +57,8 @@ export class SqliteMatchStore {
           return;
         }
 
+        try { fs.chmodSync(this.dbPath, 0o600); } catch { /* POSIX file modes may be unavailable. */ }
+
         this.db!.run(
           `
           CREATE TABLE IF NOT EXISTS matches (
@@ -78,8 +81,16 @@ export class SqliteMatchStore {
               return;
             }
 
-            // Load nextId from the max existing matchId
-            this.db!.get(
+            this.db!.run(`CREATE TABLE IF NOT EXISTS settlement_evidence (
+              evidenceId INTEGER PRIMARY KEY AUTOINCREMENT, matchId INTEGER NOT NULL, parserVersion TEXT NOT NULL, evaluatedAt TEXT NOT NULL,
+              gameId TEXT NOT NULL, platform TEXT NOT NULL, whitePlayer TEXT NOT NULL,
+              blackPlayer TEXT NOT NULL, result TEXT, status TEXT NOT NULL, decision TEXT NOT NULL
+            )`, (evidenceErr: Error | null) => {
+              if (evidenceErr) { reject(evidenceErr); return; }
+              this.db!.run("DELETE FROM settlement_evidence WHERE evaluatedAt < datetime('now', '-30 days')", (retentionErr: Error | null) => {
+                if (retentionErr) { reject(retentionErr); return; }
+                // Load nextId from the max existing matchId
+                this.db!.get(
               'SELECT COALESCE(MAX(matchId), -1) + 1 AS nextId FROM matches',
               (err: Error | null, row: any) => {
                 if (err) {
@@ -88,9 +99,15 @@ export class SqliteMatchStore {
                 }
                 this.nextId = row?.nextId ?? 0;
                 this.initialized = true;
+                this.evidenceCleanupTimer = setInterval(() => {
+                  this.db?.run("DELETE FROM settlement_evidence WHERE evaluatedAt < datetime('now', '-30 days')");
+                }, 24 * 60 * 60 * 1000);
+                this.evidenceCleanupTimer.unref();
                 resolve();
               },
-            );
+                );
+              });
+            });
           },
         );
       });
@@ -184,6 +201,39 @@ export class SqliteMatchStore {
     });
   }
 
+  async saveSettlementEvidence(evidence: CanonicalSettlementEvidence): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      this.getDb().run(`INSERT INTO settlement_evidence
+        (matchId, parserVersion, evaluatedAt, gameId, platform, whitePlayer, blackPlayer, result, status, decision)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [evidence.matchId, evidence.parserVersion, evidence.evaluatedAt, evidence.gameId, evidence.platform,
+        evidence.whitePlayer, evidence.blackPlayer, evidence.result, evidence.status, evidence.decision],
+      (err: Error | null) => err ? reject(err) : resolve());
+    });
+  }
+
+  async getSettlementEvidence(matchId: number): Promise<CanonicalSettlementEvidence | null> {
+    return new Promise((resolve, reject) => this.getDb().get(
+      'SELECT * FROM settlement_evidence WHERE matchId = ? ORDER BY evidenceId DESC LIMIT 1', [matchId], (err: Error | null, row: any) => {
+        if (err) { reject(err); return; }
+        if (!row) { resolve(null); return; }
+        resolve({ parserVersion: row.parserVersion, evaluatedAt: row.evaluatedAt, matchId,
+          gameId: row.gameId, platform: row.platform, whitePlayer: row.whitePlayer,
+          blackPlayer: row.blackPlayer, result: row.result ?? null, status: row.status, decision: row.decision });
+      }));
+  }
+
+  async getSettlementEvidenceHistory(matchId: number): Promise<CanonicalSettlementEvidence[]> {
+    return new Promise((resolve, reject) => this.getDb().all(
+      'SELECT * FROM settlement_evidence WHERE matchId = ? ORDER BY evidenceId ASC', [matchId],
+      (err: Error | null, rows: any[]) => {
+        if (err) { reject(err); return; }
+        resolve(rows.map((row) => ({ parserVersion: row.parserVersion, evaluatedAt: row.evaluatedAt,
+          matchId, gameId: row.gameId, platform: row.platform, whitePlayer: row.whitePlayer,
+          blackPlayer: row.blackPlayer, result: row.result ?? null, status: row.status, decision: row.decision })));
+      }));
+  }
+
   async count(): Promise<number> {
     return new Promise((resolve, reject) => {
       this.getDb().get(
@@ -202,6 +252,10 @@ export class SqliteMatchStore {
   }
 
   async close(): Promise<void> {
+    if (this.evidenceCleanupTimer) {
+      clearInterval(this.evidenceCleanupTimer);
+      this.evidenceCleanupTimer = undefined;
+    }
     return new Promise((resolve, reject) => {
       if (this.db) {
         this.db.close((err: Error | null) => {

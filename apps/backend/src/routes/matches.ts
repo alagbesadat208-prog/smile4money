@@ -16,6 +16,10 @@ router.post('/', async (req, res) => {
     return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'Request body must be JSON'));
   }
 
+  if (!req.address) {
+    return res.status(401).json(errorEnvelope(ErrorCode.UNAUTHORIZED, 'Authenticated wallet address is required'));
+  }
+
   // Validate input fields before calling the service
   const validationError = validateCreateMatchInput(req.address, payload);
   if (validationError) {

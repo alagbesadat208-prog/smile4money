@@ -1568,3 +1568,28 @@ curl -s -X POST http://localhost:4000/api/matches \
   }
 }
 ```
+
+# Settlement evidence retention
+
+The backend stores a sanitized canonical record for every fetched game record
+evaluated by the oracle in the private `settlement_evidence` SQLite table. It contains the
+match and game identifiers, platform, normalized player names, normalized
+outcome/status, parser version, evaluation timestamp, and decision (verified,
+player identity mismatch, or identity hash mismatch). Each evaluation is appended
+so a later retry cannot overwrite an earlier decision. Provider response
+bodies, PGNs, IP addresses, and unrelated account data are not retained. The
+backend deletes evidence older than 30 days at startup and every 24 hours; this matches the
+repository's 30-day match retention policy. The database file is owner-readable
+only on POSIX systems, and no HTTP route exposes evidence records. Operators
+must restrict host and backup access to the backend service account and apply
+the same 30-day deletion period to database backups.
+
+## Wallet identity link proof
+
+An authenticated wallet can request a challenge with
+`POST /api/player-identity/challenge` and `{ "platform": "lichess",
+"username": "alice" }`. The response includes a message bound to that wallet,
+platform, username, and a random nonce. Sign the SHA-256 digest of the exact
+UTF-8 message with the wallet's Ed25519 key, then send `{ "nonce": "…",
+"signature": "<128 hex characters>" }` to `POST /api/player-identity/confirm`.
+Challenges expire after five minutes and a valid proof can be consumed once.
