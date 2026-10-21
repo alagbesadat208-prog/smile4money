@@ -291,6 +291,35 @@ fn result_count_increments_per_result() {
 }
 
 #[test]
+fn record_result_with_settlement_is_idempotent() {
+    let f = setup();
+    let settlement_id = String::from_str(&f.env, "settlement-42");
+
+    f.client.record_result_with_settlement(
+        &f.player1,
+        &f.player2,
+        &MatchOutcome::Player1Won,
+        &10,
+        &f.token,
+        &settlement_id,
+        &f.source,
+    );
+    assert_eq!(f.client.result_count(), 1);
+
+    f.client.record_result_with_settlement(
+        &f.player1,
+        &f.player2,
+        &MatchOutcome::Player1Won,
+        &10,
+        &f.token,
+        &settlement_id,
+        &f.source,
+    );
+    assert_eq!(f.client.result_count(), 1);
+    assert_eq!(f.client.get_stats(&f.player1).wins, 1);
+}
+
+#[test]
 fn get_admin_returns_the_configured_admin() {
     let f = setup();
     assert_eq!(f.client.get_admin(), f.admin);

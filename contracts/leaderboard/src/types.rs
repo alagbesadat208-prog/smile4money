@@ -122,6 +122,8 @@ pub enum DataKey {
     Stats(Address),
     /// How many results have been recorded, used to bound the leaderboard.
     ResultCount,
+    /// Settlement identifiers already processed to prevent duplicate relayer submissions.
+    SettlementIds,
     /// Whether `Address` is authorised to submit results.
     Sources(Address),
     /// Every address that has a [`PlayerStats`] entry.
