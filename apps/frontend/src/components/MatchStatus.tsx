@@ -7,7 +7,7 @@ type MatchState = 'Pending' | 'Active' | 'PendingResult' | 'Completed' | 'Cancel
 /** Reason a match entered the Cancelled terminal state. */
 type CancellationReason = 'cancelled_by_player' | 'timed_out';
 
-interface MatchData {
+export interface MatchData {
   id: string;
   state: MatchState;
   player1: string;

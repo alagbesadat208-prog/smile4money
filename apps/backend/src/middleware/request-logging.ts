@@ -37,6 +37,7 @@ const SENSITIVE_FIELDS = new Set([
   'secret',
   'apikey',
   'privatekey',
+  'signedtxxdr',
 ]);
 
 const REDACTED = '[REDACTED]';

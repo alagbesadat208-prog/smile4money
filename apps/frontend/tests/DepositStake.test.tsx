@@ -44,15 +44,8 @@ vi.mock('@stellar/stellar-sdk', () => ({
   rpc: {
     Server: vi.fn().mockImplementation(() => ({
       simulateTransaction: vi.fn().mockImplementation(async () => getSimulateResponse()),
-      getLedgers: vi.fn().mockImplementation(() => ({
-        order: () => ({
-          limit: () => ({
-            call: async () => ({
-              records: [{ sequence: '50000' }],
-            }),
-          }),
-        }),
-      })),
+      getAccount: vi.fn(async () => ({})),
+      getLatestLedger: vi.fn(async () => ({ sequence: 50000 })),
     })),
   },
   Account: class Account {
@@ -146,11 +139,7 @@ describe('DepositStake — match info display', () => {
 
     const player1Address = defaultMatch.player1;
     render(
-      <DepositStake
-        matchId="123"
-        playerAddress={player1Address}
-        contractId="test-contract"
-      />,
+      <DepositStake matchId="123" playerAddress={player1Address} contractId="test-contract" />,
     );
 
     await screen.findByTestId('match-info');

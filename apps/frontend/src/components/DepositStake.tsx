@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Account,
   Asset,
   Networks,
   Operation,
@@ -70,26 +69,28 @@ interface MatchDetails {
  *
  * `get_match` is a read-only view, so we simulate the invocation — no wallet
  * signature or transaction submission is required. The simulation source only
- * needs to exist as an account on the ledger; the deployed contract address is
- * used so this works even before the user connects a wallet.
+ * needs to exist as an account on the ledger; use the connected player account.
  */
 async function fetchMatchFromEscrow({
   matchId,
   contractId,
   rpcUrl,
   networkPassphrase,
+  playerAddress,
 }: {
   matchId: string;
   contractId: string;
   rpcUrl: string;
   networkPassphrase: string;
+  playerAddress: string | null;
 }): Promise<MatchDetails> {
   if (!/^\d+$/.test(matchId)) {
     throw new Error('Invalid match ID');
   }
 
   const server = new rpc.Server(rpcUrl);
-  const source = new Account(contractId, '0');
+  if (!playerAddress) throw new Error('Connect wallet to load deposit details');
+  const source = await server.getAccount(playerAddress);
 
   const tx = new TransactionBuilder(source, {
     fee: '100',
@@ -152,8 +153,7 @@ async function deserializeMatch(
 
   // Fetch current ledger height from RPC
   const server = new rpc.Server(rpcUrl);
-  const ledgerResponse = await server.getLedgers().order('desc').limit(1).call();
-  const currentLedger = parseInt(ledgerResponse.records[0].sequence, 10);
+  const currentLedger = (await server.getLatestLedger()).sequence;
 
   return {
     stakeAmount: String(raw.stake_amount),
@@ -230,6 +230,7 @@ export function DepositStake({
         contractId,
         rpcUrl,
         networkPassphrase,
+        playerAddress,
       });
       setMatchDetails(details);
       // Reset the elapsed-seconds counter whenever we get fresh data so the
@@ -240,7 +241,7 @@ export function DepositStake({
       setStatus('error');
       setErrorMsg(err instanceof Error ? err.message : 'Failed to fetch match details');
     }
-  }, [matchId, contractId, rpcUrl, networkPassphrase]);
+  }, [matchId, contractId, rpcUrl, networkPassphrase, playerAddress]);
 
   useEffect(() => {
     fetchMatchDetails();

@@ -10,6 +10,9 @@ import { fetchLichessResult, GameNotFoundError } from '../fetchers/lichess.js';
 import { fetchChessDotComResult } from '../fetchers/chessdotcom.js';
 import { verifyPlayerIdentities, verifyIdentityHash } from './player-identity.js';
 import type { PlayerIdentityMap } from './player-identity.js';
+import type { GameResult } from '../fetchers/lichess.js';
+import type { MatchRecord } from '../store/match-store.js';
+import { persistEvidence } from './settlement-evidence.js';
 import type { MatchStore } from '../store/match-store.js';
 import logger from '../logger.js';
 import { errorToHttpStatus, ValidationError, NotFoundError } from '../errors/errorToHttpStatus.js';
@@ -175,12 +178,28 @@ export async function verifyGameResult(
     throw error;
   }
 
+  // Persist before deciding: failed identity decisions remain reproducible.
+  const evidenceId = await persistEvidence({ version: 1, input, match, game: apiResult });
+  logger.info({ evidence_id: evidenceId, match_id: match.matchId }, 'settlement_evidence_persisted');
+  return evaluateStoredResult(match, input, apiResult);
+}
+
+/** Pure decision shared by live verification and offline replay. */
+export function evaluateStoredResult(
+  match: MatchRecord,
+  input: SubmitResultInput,
+  apiResult: GameResult,
+): SubmitResultOutcome {
+  const { gameId, platform } = input;
+  if (match.gameId !== gameId || apiResult.gameId !== gameId || match.platform !== platform) {
+    return { ok: false, status: 400, error: 'Evidence binding mismatch' };
+  }
   // Build the identity map from the match record
   const identityMap: PlayerIdentityMap = {
     player1Address: match.player1,
-    player1Username: match.player1Username,
+    player1Username: match.player1Username ?? '',
     player2Address: match.player2,
-    player2Username: match.player2Username,
+    player2Username: match.player2Username ?? '',
     platform,
   };
 
