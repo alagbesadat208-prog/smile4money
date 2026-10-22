@@ -7,7 +7,7 @@ pub enum Error {
     NotFound = 1,
     /// initialize was called more than once.
     AlreadyInitialized = 2,
-    /// The caller is not the bracket admin.
+    /// The caller is not the bracket admin or authorized reviewer.
     Unauthorized = 3,
     /// The bracket size is not a power of two inside the allowed range.
     InvalidSize = 4,
@@ -29,9 +29,9 @@ pub enum Error {
     NotPlayable = 12,
     /// The winner is not a participant of the node.
     InvalidWinner = 13,
-    /// The node already carries a result.
+    /// The node already carries a reported or finalized result.
     AlreadyResolved = 14,
-    /// The bracket counter would overflow.
+    /// The bracket counter or deadline calculation would overflow.
     Overflow = 15,
     /// Emergency mode is active: tournament progression is paused.
     ContractPaused = 16,
@@ -43,4 +43,12 @@ pub enum Error {
     AlreadyCompleted = 19,
     /// The entry fee amount is invalid.
     InvalidAmount = 20,
+    /// The node does not currently have a result under review.
+    NotUnderReview = 21,
+    /// The review window has not expired yet; the result cannot be finalized.
+    ReviewWindowOpen = 22,
+    /// The review window has already expired; the result can no longer be amended.
+    ReviewWindowExpired = 23,
+    /// The configured review window duration is invalid (must be > 0).
+    InvalidReviewWindow = 24,
 }

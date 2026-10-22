@@ -13,6 +13,11 @@ const BRACKET_TTL_LEDGERS: u32 = 518_400;
 /// Largest supported bracket: 256 first round sides, 8 rounds.
 const MAX_BRACKET_SIZE: u32 = 256;
 
+/// Default review window in ledgers (~10 minutes at 5s/ledger) during which a
+/// reported match result remains in [`NodeState::UnderReview`] and can be
+/// amended by the bracket's authorized reviewer before becoming final.
+pub const DEFAULT_REVIEW_WINDOW_LEDGERS: u32 = 120;
+
 /// A tournament bracket.
 ///
 /// The bracket is a fixed size elimination tree: round `0` holds `size / 2`
@@ -36,6 +41,27 @@ const MAX_BRACKET_SIZE: u32 = 256;
 /// every operation on it fails with [`Error::MalformedNode`] instead of
 /// guessing what the state was meant to be.
 ///
+/// ## Result Review Window
+///
+/// Reporting a match outcome via [`BracketContract::submit_result`] does not
+/// immediately advance the player. Instead, the node enters
+/// [`NodeState::UnderReview`] with a deadline of
+/// `env.ledger().sequence() + bracket.review_window_ledgers` (defaulting to
+/// [`DEFAULT_REVIEW_WINDOW_LEDGERS`] and configurable via
+/// [`BracketContract::set_review_config`]):
+///
+/// * While `env.ledger().sequence() < review_deadline`:
+///   - Only `bracket.reviewer` can call [`BracketContract::amend_result`] to
+///     correct a contested provisional winner.
+///   - Advancement to the parent round is blocked and
+///     [`BracketContract::finalize_result`] fails with
+///     [`Error::ReviewWindowOpen`].
+/// * Once `env.ledger().sequence() >= review_deadline`:
+///   - [`BracketContract::amend_result`] is rejected with
+///     [`Error::ReviewWindowExpired`].
+///   - [`BracketContract::finalize_result`] transitions the node to
+///     [`NodeState::Resolved`] and advances the winner into the next round.
+///
 /// ## Emergency Mode
 ///
 /// The contract admin can place the contract into emergency mode via
@@ -44,9 +70,12 @@ const MAX_BRACKET_SIZE: u32 = 256;
 /// * **Blocked while paused** ([`Error::ContractPaused`]):
 ///   - [`BracketContract::create_bracket`]
 ///   - [`BracketContract::create_paid_bracket`]
+///   - [`BracketContract::set_review_config`]
 ///   - [`BracketContract::register`]
 ///   - [`BracketContract::lock_registration`]
 ///   - [`BracketContract::submit_result`]
+///   - [`BracketContract::amend_result`]
+///   - [`BracketContract::finalize_result`]
 ///   - [`BracketContract::advance_bye`]
 /// * **Allowed while paused** (participant exits, cancellation, recovery, and reads):
 ///   - [`BracketContract::withdraw`] — registered participants can exit any
@@ -78,10 +107,8 @@ impl BracketContract {
 
     /// Activate emergency mode — admin only.
     ///
-    /// Blocks all tournament creation and progression (`create_bracket`,
-    /// `create_paid_bracket`, `register`, `lock_registration`, `submit_result`,
-    /// `advance_bye`) while keeping `cancel_bracket`, `withdraw`, `unpause`,
-    /// and all read queries available.
+    /// Blocks all tournament creation and progression while keeping
+    /// `cancel_bracket`, `withdraw`, `unpause`, and all read queries available.
     pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
         let admin = Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -108,7 +135,8 @@ impl BracketContract {
         Self::paused(&env)
     }
 
-    /// Create a free bracket with `size` first round sides.
+    /// Create a free bracket with `size` first round sides and the default
+    /// review window ([`DEFAULT_REVIEW_WINDOW_LEDGERS`]).
     ///
     /// `size` must be a power of two: every round halves the number of nodes
     /// and the last round holds the final.
@@ -130,6 +158,49 @@ impl BracketContract {
             return Err(Error::InvalidAmount);
         }
         Self::create_bracket_internal(&env, size, Some(token), entry_fee)
+    }
+
+    /// Configure the authorized `reviewer` and `review_window_ledgers` for a
+    /// bracket — bracket admin only.
+    ///
+    /// `review_window_ledgers` must be greater than zero so that reported
+    /// results always pass through a reviewable window before finalization.
+    pub fn set_review_config(
+        env: Env,
+        bracket_id: u64,
+        reviewer: Address,
+        review_window_ledgers: u32,
+        caller: Address,
+    ) -> Result<(), Error> {
+        if Self::paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        if review_window_ledgers == 0 {
+            return Err(Error::InvalidReviewWindow);
+        }
+
+        let mut bracket = Self::load_bracket(&env, bracket_id)?;
+        if caller != bracket.admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        if bracket.cancelled {
+            return Err(Error::BracketCancelled);
+        }
+        if bracket.champion.is_some() {
+            return Err(Error::AlreadyCompleted);
+        }
+
+        bracket.reviewer = reviewer.clone();
+        bracket.review_window_ledgers = review_window_ledgers;
+        Self::save_bracket(&env, &bracket);
+
+        env.events().publish(
+            (Symbol::new(&env, "bracket"), symbol_short!("review")),
+            (bracket_id, reviewer, review_window_ledgers),
+        );
+
+        Ok(())
     }
 
     /// Register `participant` in the next free side of the first round.
@@ -243,7 +314,12 @@ impl BracketContract {
         Ok(())
     }
 
-    /// Record the winner of a match and advance them in the bracket.
+    /// Report the provisional winner of a match and start its review window.
+    ///
+    /// The node enters [`NodeState::UnderReview`] until
+    /// `env.ledger().sequence() + bracket.review_window_ledgers`. Advancement
+    /// into the next round is blocked until the review window expires and
+    /// [`BracketContract::finalize_result`] is called.
     pub fn submit_result(
         env: Env,
         bracket_id: u64,
@@ -255,7 +331,7 @@ impl BracketContract {
             return Err(Error::ContractPaused);
         }
 
-        let mut bracket = Self::load_bracket(&env, bracket_id)?;
+        let bracket = Self::load_bracket(&env, bracket_id)?;
         if caller != bracket.admin {
             return Err(Error::Unauthorized);
         }
@@ -270,7 +346,9 @@ impl BracketContract {
             NodeState::AwaitingParticipants => return Err(Error::SlotVacant),
             // A bye or a void node is never played.
             NodeState::ByeAdvance(_) | NodeState::Void => return Err(Error::NotPlayable),
-            NodeState::Resolved(_) => return Err(Error::AlreadyResolved),
+            NodeState::UnderReview(_, _) | NodeState::Resolved(_) => {
+                return Err(Error::AlreadyResolved)
+            }
             NodeState::Ready => {}
         }
 
@@ -280,11 +358,106 @@ impl BracketContract {
             return Err(Error::InvalidWinner);
         }
 
+        let deadline = env
+            .ledger()
+            .sequence()
+            .checked_add(bracket.review_window_ledgers)
+            .ok_or(Error::Overflow)?;
+
+        node.pending_winner = Some(winner.clone());
+        node.review_deadline = Some(deadline);
+        Self::save_node(&env, &node);
+
+        env.events().publish(
+            (Symbol::new(&env, "bracket"), symbol_short!("reported")),
+            (bracket_id, node_id, winner, deadline),
+        );
+
+        Ok(())
+    }
+
+    /// Amend a provisional match result while its review window is still open.
+    ///
+    /// Only the bracket's authorized `reviewer` may call this function, and
+    /// only strictly before `review_deadline` (`env.ledger().sequence() < deadline`).
+    pub fn amend_result(
+        env: Env,
+        bracket_id: u64,
+        node_id: u64,
+        new_winner: Address,
+        caller: Address,
+    ) -> Result<(), Error> {
+        if Self::paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+
+        let bracket = Self::load_bracket(&env, bracket_id)?;
+        if caller != bracket.reviewer {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        if bracket.cancelled {
+            return Err(Error::BracketCancelled);
+        }
+
+        let mut node = Self::load_node(&env, bracket_id, node_id)?;
+        match Self::node_state(&node, &bracket)? {
+            NodeState::UnderReview(_, deadline) => {
+                if env.ledger().sequence() >= deadline {
+                    return Err(Error::ReviewWindowExpired);
+                }
+            }
+            NodeState::Resolved(_) => return Err(Error::AlreadyResolved),
+            _ => return Err(Error::NotUnderReview),
+        }
+
+        let is_participant = matches!(&node.slot1, Slot::Filled(a) if *a == new_winner)
+            || matches!(&node.slot2, Slot::Filled(a) if *a == new_winner);
+        if !is_participant {
+            return Err(Error::InvalidWinner);
+        }
+
+        node.pending_winner = Some(new_winner.clone());
+        Self::save_node(&env, &node);
+
+        env.events().publish(
+            (Symbol::new(&env, "bracket"), symbol_short!("amended")),
+            (bracket_id, node_id, new_winner),
+        );
+
+        Ok(())
+    }
+
+    /// Finalize a reviewed match result once its review deadline has passed and
+    /// advance the winner in the bracket.
+    pub fn finalize_result(env: Env, bracket_id: u64, node_id: u64) -> Result<(), Error> {
+        if Self::paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+
+        let mut bracket = Self::load_bracket(&env, bracket_id)?;
+        if bracket.cancelled {
+            return Err(Error::BracketCancelled);
+        }
+
+        let mut node = Self::load_node(&env, bracket_id, node_id)?;
+        let winner = match Self::node_state(&node, &bracket)? {
+            NodeState::UnderReview(provisional_winner, deadline) => {
+                if env.ledger().sequence() < deadline {
+                    return Err(Error::ReviewWindowOpen);
+                }
+                provisional_winner
+            }
+            NodeState::Resolved(_) => return Err(Error::AlreadyResolved),
+            _ => return Err(Error::NotUnderReview),
+        };
+
+        node.pending_winner = None;
+        node.review_deadline = None;
         node.winner = Some(winner.clone());
         Self::save_node(&env, &node);
 
-        // The winner advances into the next round, a bye on the way may hand
-        // them the round as well.
+        // Now that the result is final, advance the winner into the next round.
         Self::settle_from(&env, &mut bracket, node_id)?;
 
         env.events().publish(
@@ -298,7 +471,7 @@ impl BracketContract {
     /// Advance the participant of a bye node into the next round.
     ///
     /// Byes advance automatically when the bracket is sealed and when a result
-    /// is submitted. This entry point only makes the rule explicit, it is
+    /// is finalized. This entry point only makes the rule explicit, it is
     /// idempotent and it rejects a node that is not a bye.
     pub fn advance_bye(env: Env, bracket_id: u64, node_id: u64) -> Result<(), Error> {
         if Self::paused(&env) {
@@ -315,9 +488,10 @@ impl BracketContract {
             NodeState::ByeAdvance(_) => {}
             // Not decided yet: an unfilled node is not a bye.
             NodeState::AwaitingParticipants => return Err(Error::SlotVacant),
-            NodeState::Void | NodeState::Ready | NodeState::Resolved(_) => {
-                return Err(Error::NotABye)
-            }
+            NodeState::Void
+            | NodeState::Ready
+            | NodeState::UnderReview(_, _)
+            | NodeState::Resolved(_) => return Err(Error::NotABye),
         }
 
         Self::settle_from(&env, &mut bracket, node_id)?;
@@ -501,7 +675,9 @@ impl BracketContract {
         let rounds = size.trailing_zeros();
         let bracket = Bracket {
             id,
-            admin,
+            admin: admin.clone(),
+            reviewer: admin,
+            review_window_ledgers: DEFAULT_REVIEW_WINDOW_LEDGERS,
             size,
             rounds,
             registered: 0,
@@ -522,6 +698,8 @@ impl BracketContract {
                     index,
                     slot1: Slot::Vacant,
                     slot2: Slot::Vacant,
+                    pending_winner: None,
+                    review_deadline: None,
                     winner: None,
                 };
                 Self::save_node(env, &node);
@@ -542,7 +720,7 @@ impl BracketContract {
         Ok(id)
     }
 
-    /// Derive the state of a node from its sides.
+    /// Derive the state of a node from its sides and result fields.
     ///
     /// This is the only place where the bracket rules are decided. Anything
     /// that cannot be read as one of the states below is reported as
@@ -555,7 +733,10 @@ impl BracketContract {
                 if bracket.locked && node.round == 0 {
                     return Err(Error::MalformedNode);
                 }
-                if node.winner.is_some() {
+                if node.winner.is_some()
+                    || node.pending_winner.is_some()
+                    || node.review_deadline.is_some()
+                {
                     return Err(Error::MalformedNode);
                 }
                 Ok(NodeState::AwaitingParticipants)
@@ -565,15 +746,23 @@ impl BracketContract {
                     // Nobody plays against themselves.
                     return Err(Error::MalformedNode);
                 }
-                match &node.winner {
-                    Some(w) if w == p1 || w == p2 => Ok(NodeState::Resolved(w.clone())),
-                    Some(_) => Err(Error::MalformedNode),
-                    None => Ok(NodeState::Ready),
+                match (&node.winner, &node.pending_winner, node.review_deadline) {
+                    (Some(w), None, None) if w == p1 || w == p2 => {
+                        Ok(NodeState::Resolved(w.clone()))
+                    }
+                    (None, Some(pw), Some(deadline)) if pw == p1 || pw == p2 => {
+                        Ok(NodeState::UnderReview(pw.clone(), deadline))
+                    }
+                    (None, None, None) => Ok(NodeState::Ready),
+                    _ => Err(Error::MalformedNode),
                 }
             }
             // One side is a bye: the participant advances without playing.
             (Slot::Filled(p), Slot::Bye) | (Slot::Bye, Slot::Filled(p)) => {
-                if node.winner.is_some() {
+                if node.winner.is_some()
+                    || node.pending_winner.is_some()
+                    || node.review_deadline.is_some()
+                {
                     // A bye node is never played, so it cannot carry a winner.
                     return Err(Error::MalformedNode);
                 }
@@ -581,7 +770,10 @@ impl BracketContract {
             }
             // Both sides are byes: nobody advances out of this node.
             (Slot::Bye, Slot::Bye) => {
-                if node.winner.is_some() {
+                if node.winner.is_some()
+                    || node.pending_winner.is_some()
+                    || node.review_deadline.is_some()
+                {
                     return Err(Error::MalformedNode);
                 }
                 Ok(NodeState::Void)
@@ -594,7 +786,7 @@ impl BracketContract {
     /// A bye node hands its participant to the next round, a void node hands
     /// an explicit bye to the next round and a resolved node hands its winner
     /// over. The cascade stops as soon as a node is still waiting for
-    /// participants or is ready to be played.
+    /// participants, is ready to be played, or is still under review.
     fn settle_from(env: &Env, bracket: &mut Bracket, node_id: u64) -> Result<(), Error> {
         let size = bracket.size;
         let rounds = bracket.rounds;
@@ -605,7 +797,9 @@ impl BracketContract {
             let state = Self::node_state(&node, bracket)?;
 
             let contribution = match state {
-                NodeState::AwaitingParticipants | NodeState::Ready => return Ok(()),
+                NodeState::AwaitingParticipants
+                | NodeState::Ready
+                | NodeState::UnderReview(_, _) => return Ok(()),
                 NodeState::ByeAdvance(participant) => Slot::Filled(participant),
                 NodeState::Void => Slot::Bye,
                 NodeState::Resolved(winner) => Slot::Filled(winner),

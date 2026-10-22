@@ -1,6 +1,6 @@
 use super::*;
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env,
 };
@@ -15,6 +15,12 @@ fn setup() -> (Env, Address, BracketContractClient<'static>, Address) {
     client.initialize(&admin);
 
     (env, contract_id, client, admin)
+}
+
+fn advance_ledger(env: &Env, delta: u32) {
+    env.ledger().with_mut(|li| {
+        li.sequence_number += delta;
+    });
 }
 
 #[test]
@@ -104,10 +110,15 @@ fn test_lock_converts_vacant_to_explicit_bye_and_advances() {
         Err(Ok(Error::NotABye))
     );
 
-    // Resolve node 0 and final.
+    // Report and finalize node 0 and final after their review windows.
     client.submit_result(&bracket_id, &0, &p1, &admin);
+    advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
+    client.finalize_result(&bracket_id, &0);
     assert_eq!(client.get_node_state(&bracket_id, &2), NodeState::Ready);
+
     client.submit_result(&bracket_id, &2, &p3, &admin);
+    advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
+    client.finalize_result(&bracket_id, &2);
     assert_eq!(client.get_champion(&bracket_id), p3);
 }
 
@@ -130,8 +141,11 @@ fn test_double_bye_void_node_propagates_bye_to_next_round() {
     assert_eq!(final_node.slot1, Slot::Vacant);
     assert_eq!(final_node.slot2, Slot::Bye);
 
-    // When p1 wins node 0, p1 advances into final slot1 and automatically wins via bye!
+    // When p1 wins node 0 and the review window is finalized, p1 advances into
+    // final slot1 and automatically wins via bye!
     client.submit_result(&bracket_id, &0, &p1, &admin);
+    advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
+    client.finalize_result(&bracket_id, &0);
     assert_eq!(
         client.get_node_state(&bracket_id, &2),
         NodeState::ByeAdvance(p1.clone())
@@ -206,6 +220,115 @@ fn test_malformed_nodes_detected_and_rejected() {
 }
 
 #[test]
+fn test_review_window_blocks_advancement_and_allows_authorized_amendment() {
+    let (env, _contract_id, client, admin) = setup();
+    let reviewer = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+    let p4 = Address::generate(&env);
+
+    let bracket_id = client.create_bracket(&4);
+
+    // Configure a custom 50-ledger review window and dedicated reviewer.
+    assert_eq!(
+        client.try_set_review_config(&bracket_id, &reviewer, &0, &admin),
+        Err(Ok(Error::InvalidReviewWindow))
+    );
+    assert_eq!(
+        client.try_set_review_config(&bracket_id, &reviewer, &50, &stranger),
+        Err(Ok(Error::Unauthorized))
+    );
+    client.set_review_config(&bracket_id, &reviewer, &50, &admin);
+
+    client.register(&bracket_id, &p1);
+    client.register(&bracket_id, &p2);
+    client.register(&bracket_id, &p3);
+    client.register(&bracket_id, &p4);
+    client.lock_registration(&bracket_id, &admin);
+
+    let start_ledger = env.ledger().sequence();
+    let expected_deadline = start_ledger + 50;
+
+    // Report p1 as provisional winner of node 0.
+    client.submit_result(&bracket_id, &0, &p1, &admin);
+    assert_eq!(
+        client.get_node_state(&bracket_id, &0),
+        NodeState::UnderReview(p1.clone(), expected_deadline)
+    );
+
+    // Advancement is blocked while under review: parent (final node 2) slot1 is still Vacant.
+    let final_node = client.get_node(&bracket_id, &2);
+    assert_eq!(final_node.slot1, Slot::Vacant);
+    assert_eq!(
+        client.get_node_state(&bracket_id, &2),
+        NodeState::AwaitingParticipants
+    );
+
+    // Finalizing before the deadline is rejected.
+    advance_ledger(&env, 25);
+    assert_eq!(
+        client.try_finalize_result(&bracket_id, &0),
+        Err(Ok(Error::ReviewWindowOpen))
+    );
+
+    // Non-reviewer (including admin if reviewer was rotated) cannot amend the result.
+    assert_eq!(
+        client.try_amend_result(&bracket_id, &0, &p2, &stranger),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_amend_result(&bracket_id, &0, &p2, &admin),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Reviewer cannot amend to a non-participant of node 0.
+    assert_eq!(
+        client.try_amend_result(&bracket_id, &0, &p3, &reviewer),
+        Err(Ok(Error::InvalidWinner))
+    );
+
+    // Authorized reviewer amends the contested result from p1 to p2 within the window.
+    client.amend_result(&bracket_id, &0, &p2, &reviewer);
+    assert_eq!(
+        client.get_node_state(&bracket_id, &0),
+        NodeState::UnderReview(p2.clone(), expected_deadline)
+    );
+    assert_eq!(client.get_node(&bracket_id, &2).slot1, Slot::Vacant);
+
+    // Advance ledger to reach the review deadline.
+    advance_ledger(&env, 25);
+
+    // Amending after the deadline has expired is rejected.
+    assert_eq!(
+        client.try_amend_result(&bracket_id, &0, &p1, &reviewer),
+        Err(Ok(Error::ReviewWindowExpired))
+    );
+
+    // Finalize the result: node 0 becomes Resolved(p2) and p2 advances to final node 2 slot1.
+    client.finalize_result(&bracket_id, &0);
+    assert_eq!(
+        client.get_node_state(&bracket_id, &0),
+        NodeState::Resolved(p2.clone())
+    );
+    assert_eq!(
+        client.get_node(&bracket_id, &2).slot1,
+        Slot::Filled(p2.clone())
+    );
+
+    // Finalizing or amending an already finalized node is rejected.
+    assert_eq!(
+        client.try_finalize_result(&bracket_id, &0),
+        Err(Ok(Error::AlreadyResolved))
+    );
+    assert_eq!(
+        client.try_amend_result(&bracket_id, &0, &p1, &reviewer),
+        Err(Ok(Error::AlreadyResolved))
+    );
+}
+
+#[test]
 fn test_emergency_pause_authorization_and_blocked_progression() {
     let (env, _contract_id, client, admin) = setup();
     let stranger = Address::generate(&env);
@@ -246,6 +369,14 @@ fn test_emergency_pause_authorization_and_blocked_progression() {
     );
     assert_eq!(
         client.try_submit_result(&locked_bracket, &0, &p1, &admin),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        client.try_amend_result(&locked_bracket, &0, &p2, &admin),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        client.try_finalize_result(&locked_bracket, &0),
         Err(Ok(Error::ContractPaused))
     );
     assert_eq!(
