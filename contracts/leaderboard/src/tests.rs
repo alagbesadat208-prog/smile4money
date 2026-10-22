@@ -349,6 +349,25 @@ fn record_result_is_idempotent_by_settlement_id() {
 }
 
 #[test]
+fn rejects_empty_settlement_id() {
+    let f = setup();
+    let settlement_id = String::from_str(&f.env, "");
+
+    assert_eq!(
+        f.client.try_record_result(
+            &f.player1,
+            &f.player2,
+            &MatchOutcome::Player1Won,
+            &10,
+            &f.token,
+            &settlement_id,
+            &f.source,
+        ),
+        Err(Ok(Error::InvalidResult))
+    );
+}
+
+#[test]
 fn get_admin_returns_the_configured_admin() {
     let f = setup();
     assert_eq!(f.client.get_admin(), f.admin);

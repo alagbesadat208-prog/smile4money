@@ -206,6 +206,9 @@ impl LeaderboardContract {
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
         }
+        if settlement_id.len() == 0 {
+            return Err(Error::InvalidResult);
+        }
         if Self::has_settlement_id(&env, &settlement_id) {
             return Ok(());
         }
