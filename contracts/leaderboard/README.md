@@ -67,6 +67,7 @@ pub fn record_result(
     outcome: MatchOutcome,
     payout: i128,
     token: Address,
+    settlement_id: String,
     caller: Address,
 ) -> Result<(), Error>
 ```
@@ -85,6 +86,10 @@ adding unlike units.
 Emits `("result", "recorded")`.
 
 **Authorization:** only a registered data source (`caller`).
+
+`settlement_id` is required and acts as an idempotency key. A retry with the
+same ID is a no-op. Use the escrow settlement identifier consistently across
+retries; settlement IDs are retained for the same ledger TTL as player stats.
 
 **Errors:**
 - `Unauthorized` — caller is not a registered source

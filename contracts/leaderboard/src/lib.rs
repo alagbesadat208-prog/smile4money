@@ -71,9 +71,6 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::ResultCount, &0u32);
         env.storage()
             .instance()
-            .set(&DataKey::SettlementIds, &Vec::<String>::new(&env));
-        env.storage()
-            .instance()
             .set(&DataKey::Sources(source.clone()), &true);
 
         env.events().publish(
@@ -174,20 +171,6 @@ impl LeaderboardContract {
         outcome: MatchOutcome,
         payout: i128,
         token: Address,
-        caller: Address,
-    ) -> Result<(), Error> {
-        Self::record_result_inner(env, player1, player2, outcome, payout, token, None, caller)
-    }
-
-    /// Record the outcome of one completed match, but treat the supplied
-    /// settlement identifier as idempotency key.
-    pub fn record_result_with_settlement(
-        env: Env,
-        player1: Address,
-        player2: Address,
-        outcome: MatchOutcome,
-        payout: i128,
-        token: Address,
         settlement_id: String,
         caller: Address,
     ) -> Result<(), Error> {
@@ -198,7 +181,7 @@ impl LeaderboardContract {
             outcome,
             payout,
             token,
-            Some(settlement_id),
+            settlement_id,
             caller,
         )
     }
@@ -210,7 +193,7 @@ impl LeaderboardContract {
         outcome: MatchOutcome,
         payout: i128,
         token: Address,
-        settlement_id: Option<String>,
+        settlement_id: String,
         caller: Address,
     ) -> Result<(), Error> {
         if !env
@@ -223,10 +206,8 @@ impl LeaderboardContract {
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
         }
-        if let Some(settlement_id) = &settlement_id {
-            if Self::has_settlement_id(&env, settlement_id) {
-                return Ok(());
-            }
+        if Self::has_settlement_id(&env, &settlement_id) {
+            return Ok(());
         }
         // A self-match would credit a player a win and a loss at once, and
         // inflate `matches_played` for both slots.
@@ -279,9 +260,7 @@ impl LeaderboardContract {
             .instance()
             .set(&DataKey::ResultCount, &count.saturating_add(1));
 
-        if let Some(settlement_id) = &settlement_id {
-            Self::remember_settlement_id(&env, settlement_id);
-        }
+        Self::remember_settlement_id(&env, &settlement_id);
 
         env.events().publish(
             (Symbol::new(&env, "result"), symbol_short!("recorded")),
@@ -479,31 +458,18 @@ impl LeaderboardContract {
 
     /// Return whether the settlement ID has already been processed.
     fn has_settlement_id(env: &Env, settlement_id: &String) -> bool {
-        let ids: Vec<String> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SettlementIds)
-            .unwrap_or_else(|| Vec::new(env));
-        let len = ids.len();
-        let mut i = 0u32;
-        while i < len {
-            if ids.get(i).unwrap() == *settlement_id {
-                return true;
-            }
-            i += 1;
-        }
-        false
+        env.storage()
+            .persistent()
+            .has(&DataKey::SettlementId(settlement_id.clone()))
     }
 
     /// Remember a settlement ID so repeated relayer deliveries are ignored.
     fn remember_settlement_id(env: &Env, settlement_id: &String) {
-        let mut ids: Vec<String> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SettlementIds)
-            .unwrap_or_else(|| Vec::new(env));
-        ids.push_back(settlement_id.clone());
-        env.storage().instance().set(&DataKey::SettlementIds, &ids);
+        let key = DataKey::SettlementId(settlement_id.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, STATS_TTL_LEDGERS, STATS_TTL_LEDGERS);
     }
 
     /// Whether `a` should sort after `b` — i.e. `a` ranks lower.

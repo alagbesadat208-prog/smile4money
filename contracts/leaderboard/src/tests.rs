@@ -43,9 +43,21 @@ fn setup() -> Fixture {
     }
 }
 
+fn next_settlement_id(f: &Fixture) -> String {
+    String::from_bytes(&f.env, &f.client.result_count().to_be_bytes())
+}
+
 fn record(f: &Fixture, outcome: MatchOutcome, payout: i128, p1: &Address, p2: &Address) {
-    f.client
-        .record_result(p1, p2, &outcome, &payout, &f.token, &f.source);
+    let settlement_id = next_settlement_id(f);
+    f.client.record_result(
+        p1,
+        p2,
+        &outcome,
+        &payout,
+        &f.token,
+        &settlement_id,
+        &f.source,
+    );
 }
 
 #[test]
@@ -127,6 +139,7 @@ fn earnings_are_recorded_in_the_match_token() {
         &MatchOutcome::Player1Won,
         &1_000_000,
         &usdc,
+        &next_settlement_id(&f),
         &f.source,
     );
     // A caller rendering earnings must be able to say which currency the
@@ -157,6 +170,7 @@ fn rejects_unauthorized_caller() {
             &MatchOutcome::Player1Won,
             &100,
             &f.token,
+            &next_settlement_id(&f),
             &stranger,
         ),
         Err(Ok(Error::Unauthorized))
@@ -174,6 +188,7 @@ fn rejects_self_match() {
             &MatchOutcome::Player1Won,
             &100,
             &f.token,
+            &next_settlement_id(&f),
             &f.source,
         ),
         Err(Ok(Error::InvalidResult))
@@ -190,6 +205,7 @@ fn rejects_negative_payout() {
             &MatchOutcome::Player1Won,
             &-1,
             &f.token,
+            &next_settlement_id(&f),
             &f.source,
         ),
         Err(Ok(Error::InvalidResult))
@@ -208,6 +224,7 @@ fn paused_contract_rejects_results() {
             &MatchOutcome::Player1Won,
             &100,
             &f.token,
+            &next_settlement_id(&f),
             &f.source,
         ),
         Err(Ok(Error::ContractPaused))
@@ -241,6 +258,7 @@ fn additional_source_can_be_added_and_removed() {
         &MatchOutcome::Player1Won,
         &50,
         &f.token,
+        &next_settlement_id(&f),
         &backup,
     );
     assert_eq!(f.client.get_stats(&f.player1).wins, 1);
@@ -254,6 +272,7 @@ fn additional_source_can_be_added_and_removed() {
             &MatchOutcome::Player1Won,
             &50,
             &f.token,
+            &next_settlement_id(&f),
             &backup,
         ),
         Err(Ok(Error::Unauthorized))
@@ -271,6 +290,7 @@ fn removing_a_source_keeps_its_earlier_results() {
         &MatchOutcome::Player1Won,
         &70,
         &f.token,
+        &next_settlement_id(&f),
         &backup,
     );
     f.client.remove_source(&backup, &f.admin);
@@ -300,11 +320,11 @@ fn result_count_increments_per_result() {
 }
 
 #[test]
-fn record_result_with_settlement_is_idempotent() {
+fn record_result_is_idempotent_by_settlement_id() {
     let f = setup();
     let settlement_id = String::from_str(&f.env, "settlement-42");
 
-    f.client.record_result_with_settlement(
+    f.client.record_result(
         &f.player1,
         &f.player2,
         &MatchOutcome::Player1Won,
@@ -315,7 +335,7 @@ fn record_result_with_settlement_is_idempotent() {
     );
     assert_eq!(f.client.result_count(), 1);
 
-    f.client.record_result_with_settlement(
+    f.client.record_result(
         &f.player1,
         &f.player2,
         &MatchOutcome::Player1Won,
@@ -345,6 +365,7 @@ fn give_wins(f: &Fixture, player: &Address, wins: u32) {
             &MatchOutcome::Player1Won,
             &10,
             &f.token,
+            &next_settlement_id(f),
             &f.source,
         );
     }
@@ -389,6 +410,7 @@ fn leaderboard_ties_break_on_earnings() {
         &MatchOutcome::Player1Won,
         &500,
         &f.token,
+        &next_settlement_id(&f),
         &f.source,
     );
     f.client.record_result(
@@ -397,6 +419,7 @@ fn leaderboard_ties_break_on_earnings() {
         &MatchOutcome::Player1Won,
         &5,
         &f.token,
+        &next_settlement_id(&f),
         &f.source,
     );
 
@@ -418,6 +441,7 @@ fn leaderboard_order_is_stable_for_identical_records() {
         &MatchOutcome::Player1Won,
         &42,
         &f.token,
+        &next_settlement_id(&f),
         &f.source,
     );
     f.client.record_result(
@@ -426,6 +450,7 @@ fn leaderboard_order_is_stable_for_identical_records() {
         &MatchOutcome::Player1Won,
         &42,
         &f.token,
+        &next_settlement_id(&f),
         &f.source,
     );
 
@@ -532,6 +557,7 @@ fn loss_only_players_are_still_ranked() {
         &MatchOutcome::Player1Won,
         &10,
         &f.token,
+        &next_settlement_id(&f),
         &f.source,
     );
     let board = f.client.get_leaderboard(&10, &0);
