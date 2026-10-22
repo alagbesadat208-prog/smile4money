@@ -685,6 +685,92 @@ exports[`CreateMatch — snapshots > matches snapshot: Chess.com platform select
         Create Match
       </button>
     </form>
+    <section
+      aria-label="Responsible play"
+      class="responsible-play"
+      data-testid="responsible-play"
+    >
+      <h3>
+        Responsible play
+      </h3>
+      <p
+        class="field-hint"
+      >
+        These controls apply to this app in this browser only. They are not enforced by the contract.
+      </p>
+      <div
+        class="form-group"
+      >
+        <p
+          class="field-hint"
+        >
+          Take a break from wagering:
+        </p>
+        <div
+          aria-label="Self-exclusion period"
+          class="self-exclusion-periods"
+          role="group"
+        >
+          <button
+            class="btn"
+            data-testid="self-exclusion-24h"
+            type="button"
+          >
+            24 hours
+          </button>
+          <button
+            class="btn"
+            data-testid="self-exclusion-7d"
+            type="button"
+          >
+            7 days
+          </button>
+          <button
+            class="btn"
+            data-testid="self-exclusion-30d"
+            type="button"
+          >
+            30 days
+          </button>
+          <button
+            class="btn"
+            data-testid="self-exclusion-6m"
+            type="button"
+          >
+            6 months
+          </button>
+        </div>
+      </div>
+      <div
+        class="form-group"
+      >
+        <label
+          for="stake-limit"
+        >
+          Maximum stake per match
+        </label>
+        <p
+          class="field-hint"
+          data-testid="stake-limit-current"
+        >
+          No limit set.
+        </p>
+        <input
+          data-testid="stake-limit-input"
+          id="stake-limit"
+          inputmode="decimal"
+          type="text"
+          value=""
+        />
+        <button
+          class="btn"
+          data-testid="stake-limit-save"
+          type="button"
+        >
+          Set limit
+        </button>
+      </div>
+    </section>
   </div>
 </div>
 `;
@@ -823,6 +909,92 @@ exports[`CreateMatch — snapshots > matches snapshot: USDC token selected 1`] =
         Create Match
       </button>
     </form>
+    <section
+      aria-label="Responsible play"
+      class="responsible-play"
+      data-testid="responsible-play"
+    >
+      <h3>
+        Responsible play
+      </h3>
+      <p
+        class="field-hint"
+      >
+        These controls apply to this app in this browser only. They are not enforced by the contract.
+      </p>
+      <div
+        class="form-group"
+      >
+        <p
+          class="field-hint"
+        >
+          Take a break from wagering:
+        </p>
+        <div
+          aria-label="Self-exclusion period"
+          class="self-exclusion-periods"
+          role="group"
+        >
+          <button
+            class="btn"
+            data-testid="self-exclusion-24h"
+            type="button"
+          >
+            24 hours
+          </button>
+          <button
+            class="btn"
+            data-testid="self-exclusion-7d"
+            type="button"
+          >
+            7 days
+          </button>
+          <button
+            class="btn"
+            data-testid="self-exclusion-30d"
+            type="button"
+          >
+            30 days
+          </button>
+          <button
+            class="btn"
+            data-testid="self-exclusion-6m"
+            type="button"
+          >
+            6 months
+          </button>
+        </div>
+      </div>
+      <div
+        class="form-group"
+      >
+        <label
+          for="stake-limit"
+        >
+          Maximum stake per match
+        </label>
+        <p
+          class="field-hint"
+          data-testid="stake-limit-current"
+        >
+          No limit set.
+        </p>
+        <input
+          data-testid="stake-limit-input"
+          id="stake-limit"
+          inputmode="decimal"
+          type="text"
+          value=""
+        />
+        <button
+          class="btn"
+          data-testid="stake-limit-save"
+          type="button"
+        >
+          Set limit
+        </button>
+      </div>
+    </section>
   </div>
 </div>
 `;
@@ -961,6 +1133,92 @@ exports[`CreateMatch — snapshots > matches snapshot: default state (XLM / Lich
         Create Match
       </button>
     </form>
+    <section
+      aria-label="Responsible play"
+      class="responsible-play"
+      data-testid="responsible-play"
+    >
+      <h3>
+        Responsible play
+      </h3>
+      <p
+        class="field-hint"
+      >
+        These controls apply to this app in this browser only. They are not enforced by the contract.
+      </p>
+      <div
+        class="form-group"
+      >
+        <p
+          class="field-hint"
+        >
+          Take a break from wagering:
+        </p>
+        <div
+          aria-label="Self-exclusion period"
+          class="self-exclusion-periods"
+          role="group"
+        >
+          <button
+            class="btn"
+            data-testid="self-exclusion-24h"
+            type="button"
+          >
+            24 hours
+          </button>
+          <button
+            class="btn"
+            data-testid="self-exclusion-7d"
+            type="button"
+          >
+            7 days
+          </button>
+          <button
+            class="btn"
+            data-testid="self-exclusion-30d"
+            type="button"
+          >
+            30 days
+          </button>
+          <button
+            class="btn"
+            data-testid="self-exclusion-6m"
+            type="button"
+          >
+            6 months
+          </button>
+        </div>
+      </div>
+      <div
+        class="form-group"
+      >
+        <label
+          for="stake-limit"
+        >
+          Maximum stake per match
+        </label>
+        <p
+          class="field-hint"
+          data-testid="stake-limit-current"
+        >
+          No limit set.
+        </p>
+        <input
+          data-testid="stake-limit-input"
+          id="stake-limit"
+          inputmode="decimal"
+          type="text"
+          value=""
+        />
+        <button
+          class="btn"
+          data-testid="stake-limit-save"
+          type="button"
+        >
+          Set limit
+        </button>
+      </div>
+    </section>
   </div>
 </div>
 `;

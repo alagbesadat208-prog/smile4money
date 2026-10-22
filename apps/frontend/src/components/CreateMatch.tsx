@@ -12,6 +12,12 @@ type Status = 'idle' | 'validating' | 'pending' | 'success' | 'error';
 const MIN_STAKE_STROOPS = 1n;
 const MAX_STAKE_STROOPS = 10_000_000_000_000n;
 
+// Fee/payout preview (#112) and responsible-play controls (#114).
+import { PayoutBreakdown } from './PayoutBreakdown';
+import { ResponsiblePlay } from './ResponsiblePlay';
+import { checkWagerAllowed } from '../utils/responsible-play';
+import { stakeFromXlmInput } from '../utils/payout';
+
 interface CreateMatchProps {
   contractId: string;
   player1Address: string | null;
@@ -228,6 +234,18 @@ export function CreateMatch({
         setErrorMsg('Please connect your wallet first');
         setStatus('error');
         return;
+      }
+
+      // Self-exclusion and the stake limit stop the flow before anything is
+      // validated or signed. (#114)
+      const requestedStake = stakeFromXlmInput(formData.stakeAmount);
+      if (requestedStake !== null) {
+        const check = checkWagerAllowed(player1Address, requestedStake);
+        if (!check.allowed) {
+          setErrorMsg(check.message);
+          setStatus('error');
+          return;
+        }
       }
 
       setStatus('validating');
@@ -499,6 +517,12 @@ export function CreateMatch({
             </div>
           )}
 
+          <PayoutBreakdown
+            stake={stakeFromXlmInput(formData.stakeAmount)}
+            token={token}
+            action="create"
+          />
+
           {/* Submit Button */}
           <button
             type="submit"
@@ -522,6 +546,8 @@ export function CreateMatch({
           )}
         </form>
       )}
+
+      <ResponsiblePlay address={player1Address} />
     </div>
   );
 }

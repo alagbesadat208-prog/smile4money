@@ -18,6 +18,11 @@ type AllowanceStatus = 'unknown' | 'checking' | 'sufficient' | 'insufficient';
 /** Average Stellar ledger close time in seconds. */
 const LEDGER_CLOSE_SECS = 5;
 
+// Fee/payout preview (#112) and responsible-play enforcement (#114).
+import { PayoutBreakdown } from './PayoutBreakdown';
+import { checkWagerAllowed } from '../utils/responsible-play';
+import { stakeFromStroops } from '../utils/payout';
+
 /**
  * Compute how many seconds remain before the match times out.
  *
@@ -309,6 +314,21 @@ export function DepositStake({
   const handleDeposit = useCallback(async () => {
     if (!matchId) return;
 
+    // Self-exclusion and the stake limit block the deposit before the wallet
+    // is asked to sign. (#114)
+    if (playerAddress) {
+      // Exclusion applies even before the stake is known; the limit needs it.
+      const check = checkWagerAllowed(
+        playerAddress,
+        stakeFromStroops(matchDetails?.stakeAmount) ?? 0n,
+      );
+      if (!check.allowed) {
+        setStatus('error');
+        setErrorMsg(check.message);
+        return;
+      }
+    }
+
     setStatus('pending');
     setErrorMsg('');
     setTxHash(null);
@@ -320,7 +340,7 @@ export function DepositStake({
       setStatus('error');
       setErrorMsg(err instanceof Error ? err.message : 'Deposit transaction failed');
     }
-  }, [matchId, onDeposit]);
+  }, [matchId, onDeposit, playerAddress, matchDetails]);
 
   const isLoading = status === 'loading';
   const isPending = status === 'pending';
@@ -423,6 +443,14 @@ export function DepositStake({
             </p>
           )}
         </div>
+      )}
+
+      {matchDetails && !hasDeposited(matchDetails) && (
+        <PayoutBreakdown
+          stake={stakeFromStroops(matchDetails.stakeAmount)}
+          token={matchDetails.token}
+          action="deposit"
+        />
       )}
 
       {/* Allowance check banner */}

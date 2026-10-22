@@ -1,0 +1,141 @@
+# Software bill of materials for release artifacts (#103).
+#
+# For every release this builds the deployable artifacts, generates a
+# CycloneDX JSON inventory of every direct and transitive dependency in each
+# one, and binds the two together with signed GitHub attestations:
+#
+#   artifact                         SBOM
+#   escrow.wasm, oracle.wasm         sbom/smile4money-{escrow,oracle}.cdx.json (cargo-cyclonedx, from Cargo.lock)
+#   backend-dist.tar.gz              sbom/backend.cdx.json   (npm sbom, from apps/backend/package-lock.json)
+#   frontend-dist.tar.gz             sbom/frontend.cdx.json  (npm sbom, from apps/frontend/package-lock.json)
+#
+# Each artifact gets a build-provenance attestation and an SBOM attestation
+# with the same subject digest, so `gh attestation verify <file>` links a
+# deployed file to both how it was built and what it contains. The SBOMs are
+# also attached to the GitHub release and kept as a workflow artifact.
+# See docs/sbom.md.
+
+name: SBOM
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write # attach SBOMs to the release
+  id-token: write # sign attestations
+  attestations: write
+
+jobs:
+  sbom:
+    name: Build artifacts and SBOMs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: 1.88.0
+          targets: wasm32-unknown-unknown
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version 0.5
+
+      - name: Build contracts
+        run: cargo build --locked --release --target wasm32-unknown-unknown
+
+      - name: Contract SBOMs (CycloneDX)
+        run: |
+          set -euo pipefail
+          mkdir -p sbom release
+          cargo cyclonedx --format json --spec-version 1.5
+          # One BOM per workspace crate, written next to its Cargo.toml. Name
+          # each by the crate it describes, whatever file name the tool used.
+          find contracts \( -name '*.cdx.json' -o -name 'bom.json' \) -not -path '*/target/*' -print0 |
+            while IFS= read -r -d '' f; do
+              mv "$f" "sbom/$(jq -r '.metadata.component.name' "$f").cdx.json"
+            done
+          # The deployed contracts, under the names scripts/deploy_*.sh use.
+          cp target/wasm32-unknown-unknown/release/smile4money_escrow.wasm release/escrow.wasm
+          cp target/wasm32-unknown-unknown/release/smile4money_oracle.wasm release/oracle.wasm
+          ls -l sbom release
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+
+      - name: Backend build and SBOM
+        working-directory: apps/backend
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          # Production dependencies only: what ships in the deployed backend.
+          npm sbom --sbom-format cyclonedx --omit dev > ../../sbom/backend.cdx.json
+          tar -czf ../../release/backend-dist.tar.gz dist package.json package-lock.json
+
+      - name: Frontend build and SBOM
+        working-directory: apps/frontend
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          npm sbom --sbom-format cyclonedx --omit dev > ../../sbom/frontend.cdx.json
+          tar -czf ../../release/frontend-dist.tar.gz dist
+
+      - name: Check SBOMs are valid CycloneDX
+        run: |
+          set -euo pipefail
+          for f in sbom/*.cdx.json; do
+            jq -e '.bomFormat == "CycloneDX" and (.components | length) > 0' "$f" > /dev/null \
+              || { echo "::error file=$f::not a CycloneDX BOM with components"; exit 1; }
+            echo "$f: $(jq '.components | length' "$f") components"
+          done
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/*
+
+      - name: Attest backend SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-path: release/backend-dist.tar.gz
+          sbom-path: sbom/backend.cdx.json
+
+      - name: Attest frontend SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-path: release/frontend-dist.tar.gz
+          sbom-path: sbom/frontend.cdx.json
+
+      - name: Attest escrow contract SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-path: release/escrow.wasm
+          sbom-path: sbom/smile4money-escrow.cdx.json
+
+      - name: Attest oracle contract SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-path: release/oracle.wasm
+          sbom-path: sbom/smile4money-oracle.cdx.json
+
+      - name: Upload SBOMs and artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.event.release.tag_name || github.sha }}
+          path: |
+            sbom/
+            release/
+          retention-days: 90
+
+      - name: Attach SBOMs to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" sbom/*.cdx.json release/* --clobber
