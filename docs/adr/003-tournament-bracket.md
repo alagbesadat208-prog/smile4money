@@ -190,6 +190,16 @@ as well. Archived records must be restored using Soroban's restoration workflow
 before claiming; never recreate missing allocations or clear their bitmap. Terminal
 state guards prevent allocation from restarting. There is no claim-expiry confiscation.
 
+Build the tournament for `wasm32v1-none` on the pinned Rust 1.88 toolchain:
+
+```sh
+rustup target add wasm32v1-none
+cargo build -p smile4money-tournament-bracket --target wasm32v1-none --release
+```
+
+The default `wasm32-unknown-unknown` target on this toolchain emits reference-types
+instructions that the SDK 22 host rejects; the MVP-compatible target avoids them.
+
 Tests cover the maximum 64-player field: timeout allocation plus all 64 independent
 refunds, partial cancellation, final prize allocation and claim, replay protection,
 invalid entitlement and transfer/reserve failure recovery. Resource tests reset the
