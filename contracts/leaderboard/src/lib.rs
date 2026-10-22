@@ -136,7 +136,7 @@ impl LeaderboardContract {
     }
 
     /// Return whether result recording is paused.
-    pub fn is_paused(env: Env) -> bool {
+    pub fn is_paused(env: &Env) -> bool {
         env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
     }
 
@@ -338,7 +338,7 @@ impl LeaderboardContract {
         let roster_len = roster.len();
         let mut idx = 0u32;
         while idx < roster_len {
-            let player = roster.get(idx);
+            let player = roster.get(idx).unwrap();
             let stats = Self::load_stats(&env, &player);
             if stats.matches_played() > 0 {
                 ranked.push_back((player, stats));
@@ -359,9 +359,12 @@ impl LeaderboardContract {
         let len = ranked.len();
         for i in 1..len {
             let mut j = i;
-            while j > 0 && Self::ranks_after(&ranked.get(j - 1), &ranked.get(j)) {
-                let prev = ranked.get(j - 1);
-                let cur = ranked.get(j);
+            while j > 0 {
+                let prev = ranked.get(j - 1).unwrap();
+                let cur = ranked.get(j).unwrap();
+                if !Self::ranks_after(&prev, &cur) {
+                    break;
+                }
                 ranked.set(j, prev);
                 ranked.set(j - 1, cur);
                 j -= 1;
@@ -372,11 +375,11 @@ impl LeaderboardContract {
             return Err(Error::InvalidRange);
         }
 
-        let end = core::cmp::min(ranked.len(), offset.saturating_add(limit) as usize);
+        let end = core::cmp::min(ranked.len(), offset.saturating_add(limit));
         let mut out: Vec<LeaderboardEntry> = Vec::new(&env);
-        let mut i = offset as usize;
+        let mut i = offset;
         while i < end {
-            let (player, stats) = ranked.get(i);
+            let (player, stats) = ranked.get(i).unwrap();
             out.push_back(LeaderboardEntry { player, stats });
             i += 1;
         }
