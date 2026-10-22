@@ -109,6 +109,7 @@ pub struct LeaderboardEntry {
 /// | `Paused`             | Instance   | Whether recording results is blocked  |
 /// | `Stats(Address)`     | Persistent | [`PlayerStats`] for one address       |
 /// | `ResultCount`        | Instance   | Number of results recorded so far     |
+/// | `SettlementId(String)` | Persistent | Whether a settlement ID was processed |
 /// | `Sources(Address)`   | Instance   | Whether an address may submit results |
 /// | `Roster`             | Instance   | Every address that has a stats entry  |
 #[contracttype]

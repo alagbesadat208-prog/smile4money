@@ -94,7 +94,7 @@ retries; settlement IDs are retained for the same ledger TTL as player stats.
 **Errors:**
 - `Unauthorized` — caller is not a registered source
 - `ContractPaused` — recording is paused
-- `InvalidResult` — `player1 == player2`, or `payout` is negative
+- `InvalidResult` — players are identical, payout is negative, or settlement ID is empty
 
 ---
 

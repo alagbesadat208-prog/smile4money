@@ -346,6 +346,8 @@ fn record_result_is_idempotent_by_settlement_id() {
     );
     assert_eq!(f.client.result_count(), 1);
     assert_eq!(f.client.get_stats(&f.player1).wins, 1);
+    assert_eq!(f.client.get_stats(&f.player1).earnings, 10);
+    assert_eq!(f.client.get_stats(&f.player2).losses, 1);
 }
 
 #[test]
