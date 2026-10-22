@@ -26,7 +26,6 @@ export interface PlayerIdentityResult {
 }
 
 export interface CreateMatchInput {
-  player1: string;
   player2: string;
   stakeAmount: number;
   token: string;
@@ -38,6 +37,7 @@ export interface CreateMatchInput {
 export type CreateMatchSuccess = { ok: true; match: MatchRecord };
 export type CreateMatchFailure = { ok: false; status: number; error: string; details?: string };
 export type CreateMatchResult = CreateMatchSuccess | CreateMatchFailure;
+type MatchCreationStore = Pick<MatchStore, 'createMatch'>;
 
 /**
  * Validate input fields for creating a match.
@@ -156,7 +156,7 @@ export async function getGameResultWithPlayerIdentities(
  * result to an HTTP response.
  */
 export async function createMatchForPlayer(
-  store: MatchStore,
+  store: MatchCreationStore,
   player1: string,
   input: CreateMatchInput,
 ): Promise<CreateMatchResult> {

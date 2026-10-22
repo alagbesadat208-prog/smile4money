@@ -216,6 +216,18 @@ export class PollingJobStore {
     return job;
   }
 
+  /** Idempotent insertion used by the durable outbox recovery path. */
+  ensureJob(
+    matchId: number,
+    gameId: string,
+    platform: 'lichess' | 'chessdotcom',
+    username?: string,
+  ): PollJob {
+    const existingId = this.matchGameKeyToJobId.get(PollingJobStore.matchGameKey(matchId, gameId));
+    if (existingId) return this.jobs.get(existingId)!;
+    return this.createJob(matchId, gameId, platform, username);
+  }
+
   /**
    * Get a polling job by ID.
    */

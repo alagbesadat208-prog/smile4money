@@ -218,6 +218,8 @@ failure can go unnoticed. The SQLite store writes to `apps/backend/data/oracle-q
 automatically on first use) and survives process restarts and redeploys as long as that file
 persists.
 
+The match, DLQ, and rate-limit SQLite files keep ordered `schema_version` ledgers. Startup applies each missing migration inside its own transaction. Match creation writes the match, durable settlement job, and outbox event together; the server dispatches pending events to the polling worker at least once, using the stable event ID for idempotent recovery after a restart.
+
 **In production, never run with `QUEUE_STORE=memory`.** If `NODE_ENV=production` and `memory` is
 requested anyway, `initializeQueue()` auto-corrects to SQLite and logs a warning explaining the
 override — this is a deliberate choice over silently allowing data loss in production, since an
@@ -231,13 +233,22 @@ than crashing the process on a missing module.
 
 ## DLQ TTL Eviction
 
-DLQ entries are not cleaned up automatically by writing or reading them — without eviction they
-would accumulate forever. A background task, started alongside the retry worker in
+Expired DLQ entries are archived in bounded batches before their payloads are removed. The audit
+table preserves each entry ID, creation time, archive time, and reason. The DLQ has a default
+capacity of 10,000 terminal failures; when full, the oldest entries are archived and evicted to
+make room. `DLQ_MAX_ENTRIES` changes that cap. Settlement jobs in `pending` or `processing` state
+are never pruned. Completed, failed, and superseded jobs, plus delivered outbox events, are
+archived in batches with their stable IDs retained in the match database.
+
+A background task, started alongside the retry worker in
 `server.ts`, periodically deletes entries older than a configurable TTL:
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `DLQ_TTL_DAYS` | `7` | Age (in days) after which a DLQ entry is evicted. Non-numeric, zero, or negative values fall back to the default with a warning. |
+| `DLQ_MAX_ENTRIES` | `10000` | Maximum number of retained DLQ payloads. Oldest terminal entries are archived when capacity is reached. |
+| `SETTLEMENT_TERMINAL_RETENTION_DAYS` | `90` | Retention period for completed, failed, and superseded settlement jobs. |
+| `OUTBOX_DELIVERED_RETENTION_DAYS` | `30` | Retention period for successfully dispatched outbox events. |
 
 The eviction task runs once every 24 hours and logs the number of entries deleted on each run
 (`oracle_dlq: TTL eviction run complete`, with a `deleted` count). It is implemented in

@@ -13,12 +13,14 @@ export interface ShutdownDeps {
   server: { close: (callback: (err?: Error) => void) => void };
   /** Drains the polling queue: waits for any in-flight poll to finish. */
   stopPollingWorker: () => Promise<void>;
+  stopOutboxDispatcher?: () => void | Promise<void>;
   /** Stops the DLQ retry worker's interval. Synchronous — no drain needed. */
   stopRetryWorker: () => void;
   /** Stops the DLQ TTL eviction task's interval. */
   stopDlqEviction: () => void;
   /** Closes the persistent queue store's DB handle. */
   closeQueue: () => Promise<void>;
+  closeMatchStore?: () => Promise<void>;
   /** Closes the circuit breaker's persistence store DB handle. */
   closeCircuitBreakerStore: () => Promise<void>;
   logger: {
@@ -89,9 +91,10 @@ export function createShutdownHandler(deps: ShutdownDeps): (signal: string) => P
         deps.stopPollingWorker(),
         Promise.resolve(deps.stopRetryWorker()),
         Promise.resolve(deps.stopDlqEviction()),
+        Promise.resolve(deps.stopOutboxDispatcher?.()),
       ]);
 
-      await Promise.all([deps.closeQueue(), deps.closeCircuitBreakerStore()]);
+      await Promise.all([deps.closeQueue(), deps.closeCircuitBreakerStore(), deps.closeMatchStore?.()]);
 
       deps.logger.info({}, 'Server closed');
       clearTimeoutFn(forceExitTimer);

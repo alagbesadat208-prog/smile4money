@@ -22,6 +22,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { withRetry } from './sqlite-queue-store.js';
 import type { RateLimitBackend, RateLimitResult } from '../middleware/rate-limit.js';
+import { applySqliteMigrations } from './sqlite-migrations.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -64,18 +65,20 @@ export class SqliteRateLimitStore implements RateLimitBackend {
       this.getDb().run('PRAGMA journal_mode=WAL', (err: Error | null) => cb(err)),
     );
 
-    await withRetry<void>('rate_limit:initialize:createTable', (cb) =>
-      this.getDb().run(
-        `
-        CREATE TABLE IF NOT EXISTS rate_limit_buckets (
-          clientId TEXT PRIMARY KEY NOT NULL,
-          tokens REAL NOT NULL,
-          lastRefill INTEGER NOT NULL
-        )
-        `,
-        (err: Error | null) => cb(err),
-      ),
-    );
+    await applySqliteMigrations(this.getDb(), [
+      {
+        version: 1,
+        name: 'create-rate-limit-buckets',
+        statements: [
+          `CREATE TABLE IF NOT EXISTS rate_limit_buckets (clientId TEXT PRIMARY KEY NOT NULL, tokens REAL NOT NULL, lastRefill INTEGER NOT NULL)`,
+        ],
+      },
+      {
+        version: 2,
+        name: 'rate-limit-refill-index',
+        statements: [`CREATE INDEX IF NOT EXISTS idx_rate_limit_last_refill ON rate_limit_buckets(lastRefill)`],
+      },
+    ]);
   }
 
   /**
@@ -171,8 +174,7 @@ export class SqliteRateLimitStore implements RateLimitBackend {
     }
 
     const now = Date.now();
-    const refilled =
-      row.tokens + ((now - row.lastRefill) / this.refillIntervalMs) * this.refillAmount;
+    const refilled = row.tokens + ((now - row.lastRefill) / this.refillIntervalMs) * this.refillAmount;
     return Math.min(this.capacity, Math.max(0, refilled));
   }
 

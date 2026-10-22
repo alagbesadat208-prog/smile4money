@@ -82,7 +82,7 @@ export function validateSubmitResultInput(input: Partial<SubmitResultInput>): st
  * result to an HTTP response.
  */
 export async function verifyGameResult(
-  store: MatchStore,
+  store: Pick<MatchStore, 'findByGameId' | 'count'>,
   input: SubmitResultInput,
 ): Promise<SubmitResultOutcome> {
   const { matchId, gameId, platform, username } = input;

@@ -3,7 +3,7 @@ dotenv.config();
 
 import { app } from './app.js';
 import { initializeQueue, closeQueue, startRetryWorker, startDlqEvictionTask, listDlqEntries, writeToDlq, type DlqEntry } from './queue.js';
-import { initializeMatchStore } from './store/index.js';
+import { initializeMatchStore, closeMatchStore, matchStore } from './store/index.js';
 import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/circuit-breaker.js';
 import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
 import ChessPlatformPoller from './services/game-poller.js';
@@ -121,6 +121,7 @@ async function main() {
       // instead of polling a match no payout can still reach.
       getCurrentLedger,
       onGameCompleted: async (job, result) => {
+        await matchStore.updateSettlementState(job.matchId, 'completed');
         logger.info(
           {
             match_id: job.matchId,
@@ -135,6 +136,7 @@ async function main() {
         // e.g. await submitToOracle({ matchId: job.matchId, gameId: job.gameId, result })
       },
       onMaxAttemptsExceeded: async (job, reason) => {
+        await matchStore.updateSettlementState(job.matchId, 'failed');
         logger.error(
           {
             match_id: job.matchId,
@@ -151,7 +153,47 @@ async function main() {
         );
       },
     });
+    const activeSettlementJobs = await matchStore.listActiveSettlementJobs();
+    for (const job of activeSettlementJobs) {
+      pollingStore.ensureJob(job.matchId, job.gameId, job.platform, job.username);
+    }
     const stopPollingWorker = pollingWorker.start();
+
+    // Deliver committed work at least once. The durable job table restores
+    // active work across restarts; ensureJob makes an interrupted replay safe.
+    let dispatching = false;
+    let dispatchPromise: Promise<void> | null = null;
+    const dispatchOutbox = async () => {
+      if (dispatching) return;
+      dispatching = true;
+      dispatchPromise = (async () => {
+        try {
+          await matchStore.dispatchOutbox(async (event) => {
+            const payload = event.payload as {
+              matchId: number;
+              gameId: string;
+              platform: 'lichess' | 'chessdotcom';
+              username?: string;
+            };
+            pollingStore.ensureJob(payload.matchId, payload.gameId, payload.platform, payload.username);
+            await matchStore.updateSettlementState(payload.matchId, 'processing');
+          });
+          await matchStore.cleanupTerminalWork();
+        } catch (error) {
+          logger.error({ error }, 'settlement_outbox_dispatch_failed');
+        } finally {
+          dispatching = false;
+        }
+      })();
+      try {
+        await dispatchPromise;
+      } finally {
+        dispatchPromise = null;
+      }
+    };
+    void dispatchOutbox();
+    const outboxTimer = setInterval(() => void dispatchOutbox(), 1000);
+    outboxTimer.unref?.();
 
     // Start the Express server
     const server = app.listen(port, () => {
@@ -167,9 +209,14 @@ async function main() {
     const shutdown = createShutdownHandler({
       server,
       stopPollingWorker,
+      stopOutboxDispatcher: async () => {
+        clearInterval(outboxTimer);
+        await dispatchPromise;
+      },
       stopRetryWorker,
       stopDlqEviction,
       closeQueue,
+      closeMatchStore,
       closeCircuitBreakerStore,
       logger,
       shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000),

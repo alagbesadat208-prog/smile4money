@@ -11,18 +11,23 @@ router.use(authenticate);
 
 router.post('/', async (req, res) => {
   const payload = req.body;
+  const player1 = req.address;
+
+  if (!player1) {
+    return res.status(401).json(errorEnvelope(ErrorCode.UNAUTHORIZED, 'Authentication required'));
+  }
 
   if (!payload || typeof payload !== 'object') {
     return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'Request body must be JSON'));
   }
 
   // Validate input fields before calling the service
-  const validationError = validateCreateMatchInput(req.address, payload);
+  const validationError = validateCreateMatchInput(player1, payload);
   if (validationError) {
     return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, validationError));
   }
 
-  const result = await createMatchForPlayer(store, req.address, {
+  const result = await createMatchForPlayer(store, player1, {
     player2: payload.player2,
     stakeAmount: payload.stakeAmount,
     token: payload.token,
