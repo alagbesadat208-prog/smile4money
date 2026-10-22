@@ -1,4 +1,4 @@
-import axios from 'axios';
+import { providerGet, checkHttpStatus, quarantine, validateChronology } from './provider-validation.js';
 import { RateLimitError } from '../errors/RateLimitError.js';
 
 /** Maps to the on-chain MatchResult enum. */
@@ -13,6 +13,7 @@ export interface GameResult {
 }
 
 export class GameNotFoundError extends Error {
+  readonly policy = 'stop' as const;
   constructor(gameId: string) {
     super(`Lichess game not found: ${gameId}`);
     this.name = 'GameNotFoundError';
@@ -80,19 +81,20 @@ export async function fetchLichessResult(gameId: string): Promise<GameResult> {
   const url = `https://lichess.org/api/game/${encodeURIComponent(gameId)}`;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const response = await axios.get(url, {
+    const response = await providerGet(url, {
       headers: {
         Accept: 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       timeout: 10_000,
-      validateStatus: (s) => s < 500,
+      validateStatus: () => true,
     });
 
     if (response.status === 429) {
       if (attempt === MAX_RETRIES) {
         throw new RateLimitError(
           `Lichess API rate limit exceeded (429) after ${MAX_RETRIES} retries`,
+          parseRetryAfterMs(response.headers?.['retry-after']),
         );
       }
       const retryAfterMs = parseRetryAfterMs(response.headers?.['retry-after']);
@@ -104,11 +106,12 @@ export async function fetchLichessResult(gameId: string): Promise<GameResult> {
       throw new GameNotFoundError(gameId);
     }
 
-    if (response.status !== 200) {
-      throw new Error(`Lichess API error: ${response.status}`);
-    }
+    checkHttpStatus('Lichess', response.status);
 
     const data = response.data as {
+      createdAt: number;
+      lastMoveAt: number;
+      speed?: string;
       id: string;
       status: string;
       winner?: 'white' | 'black';
@@ -118,7 +121,14 @@ export async function fetchLichessResult(gameId: string): Promise<GameResult> {
       };
     };
 
+    if (!data || data.id !== gameId || typeof data.status !== 'string' ||
+        typeof data.players?.white?.user?.name !== 'string' || !data.players.white.user.name.trim() ||
+        typeof data.players?.black?.user?.name !== 'string' || !data.players.black.user.name.trim() ||
+        (data.winner !== undefined && data.winner !== 'white' && data.winner !== 'black')) {
+      quarantine('Lichess', 'malformed_game');
+    }
     const isTerminal = TERMINAL_STATUSES.has(data.status);
+    if (isTerminal) validateChronology('Lichess', data.createdAt, data.lastMoveAt, data.speed === 'correspondence');
     let result: MatchResult | null = null;
     if (isTerminal) {
       if (data.winner === 'white') result = 'Player1Wins';

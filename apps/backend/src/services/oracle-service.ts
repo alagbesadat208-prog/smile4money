@@ -12,6 +12,7 @@ import { verifyPlayerIdentities, verifyIdentityHash } from './player-identity.js
 import type { PlayerIdentityMap } from './player-identity.js';
 import type { MatchStore } from '../store/match-store.js';
 import logger from '../logger.js';
+import { ProviderFetchError } from '../fetchers/provider-validation.js';
 import { errorToHttpStatus, ValidationError, NotFoundError } from '../errors/errorToHttpStatus.js';
 
 export interface SubmitResultInput {
@@ -51,13 +52,10 @@ export type SubmitResultOutcome = SubmitResultSuccess | SubmitResultFailure;
 export function validateSubmitResultInput(input: Partial<SubmitResultInput>): string | null {
   const { matchId, gameId, platform, username } = input;
 
-  // #1717 — matchId is forwarded to the Stellar transaction builder, which
-  // expects a positive integer (a contract-side u64 match id). A non-numeric
-  // value, a float, zero, or a negative number must be rejected here, at the
-  // route layer, rather than surfacing as a runtime error deep in the
-  // transaction-building call stack.
-  if (typeof matchId !== 'number' || !Number.isInteger(matchId) || matchId <= 0) {
-    return 'matchId must be a positive integer';
+  // The contract uses u64 and starts at zero. The number-based API can
+  // represent only the safe-integer subset of u64 without rounding IDs.
+  if (typeof matchId !== 'number' || !Number.isSafeInteger(matchId) || matchId < 0) {
+    return 'matchId must be a non-negative safe integer';
   }
   if (!gameId || typeof gameId !== 'string' || gameId.length === 0) {
     return 'gameId is required';
@@ -171,6 +169,10 @@ export async function verifyGameResult(
         error: 'Game not found on platform',
         details: error.message,
       };
+    }
+    if (error instanceof ProviderFetchError) {
+      return { ok: false, status: errorToHttpStatus(error),
+        error: error.message, hint: error.policy === 'retry' ? 'retry_provider' : 'operator_review' };
     }
     throw error;
   }

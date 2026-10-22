@@ -12,13 +12,16 @@ import { fetchLichessResult, GameNotFoundError } from '../fetchers/lichess.js';
 import { fetchChessDotComResult, RateLimitError } from '../fetchers/chessdotcom.js';
 import type { GamePoller, PollJob, PollJobStatus } from './polling.js';
 import logger from '../logger.js';
+import { ProviderFetchError } from '../fetchers/provider-validation.js';
 
 /**
  * Create a game poller that fetches results from chess platform APIs.
  *
  * Handles:
- * - GameNotFoundError → 'failed' status (game deleted or invalid ID)
- * - API errors → 'failed' status (network, rate limiting, etc.)
+ * - GameNotFoundError → stop polling
+ * - Transient provider failures → retry within the worker attempt budget
+ * - Invalid evidence/access failures → immediate operator review
+ * - Rate limits → retry on a later polling cycle
  * - Game in progress (result === null) → 'in_progress' status
  * - Game completed (result !== null) → 'completed' status with result
  */
@@ -82,6 +85,9 @@ export class ChessPlatformPoller implements GamePoller {
         result: result.result,
       };
     } catch (err) {
+      if (err instanceof ProviderFetchError) {
+        return { status: 'failed', action: err.policy, reason: err.message };
+      }
       // Handle rate limit errors — return 'in_progress' to retry
       if (err instanceof RateLimitError) {
         logger.warn(
@@ -113,6 +119,7 @@ export class ChessPlatformPoller implements GamePoller {
         return {
           status: 'failed',
           reason: `Game not found: ${err.message}`,
+          action: 'stop',
         };
       }
 

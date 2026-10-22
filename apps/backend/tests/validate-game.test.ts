@@ -16,6 +16,8 @@ const createApp = () => {
 
 const BASE_LICHESS_GAME = {
   id: 'abc123',
+  createdAt: 1700000000000,
+  lastMoveAt: 1700000060000,
   status: 'mate',
   winner: 'white',
   players: {
@@ -28,7 +30,8 @@ const makeChessGame = (gameId: string, whiteResult: string, blackResult: string)
   url: `https://www.chess.com/game/live/${gameId}`,
   pgn: '',
   time_control: '600',
-  end_time: 0,
+  start_time: 1700000000,
+  end_time: 1700000060,
   white: { username: 'alice', result: whiteResult },
   black: { username: 'bob', result: blackResult },
 });
@@ -154,14 +157,14 @@ describe('POST /api/validate-game', () => {
       expect(response.body.error.message).toContain('not found');
     });
 
-    it('returns 500 with valid=false on lichess API unexpected error', async () => {
-      mockedAxios.get = vi.fn().mockResolvedValue({ status: 429, data: {} });
+    it('returns 503 with valid=false on lichess provider outage', async () => {
+      mockedAxios.get = vi.fn().mockResolvedValue({ status: 503, data: {} });
 
       const response = await request(app)
         .post('/api/validate-game')
         .send({ gameId: 'abc123', platform: 'lichess' });
 
-      expect(response.status).toBe(500);
+      expect(response.status).toBe(503);
       expect(response.body.valid).toBe(false);
       expect(response.body.message).toContain('Validation failed');
       expect(response.body.error.code).toBe('INTERNAL_ERROR');
@@ -251,7 +254,7 @@ describe('POST /api/validate-game', () => {
         .post('/api/validate-game')
         .send({ gameId: 'game42', platform: 'chessdotcom', username: 'alice' });
 
-      expect(response.status).toBe(500);
+      expect(response.status).toBe(503);
       expect(response.body.valid).toBe(false);
       expect(response.body.message).toContain('Validation failed');
       expect(response.body.error.code).toBe('INTERNAL_ERROR');

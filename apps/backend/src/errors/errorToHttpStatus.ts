@@ -15,6 +15,7 @@
  * rather than hardcoding a numeric status.
  */
 
+import { ProviderFetchError } from '../fetchers/provider-validation.js';
 import { RateLimitError } from './RateLimitError.js';
 import { RpcTimeoutError } from './RpcTimeoutError.js';
 import { GameNotFoundError as LichessFetcherGameNotFoundError } from '../fetchers/lichess.js';
@@ -63,6 +64,10 @@ export class ConflictError extends Error {
  * unrecognized error is, by definition, an unexpected server-side failure.
  */
 export function errorToHttpStatus(error: unknown): number {
+  if (error instanceof ProviderFetchError) {
+    return error.policy === 'retry' ? 503 : 422;
+  }
+
   // 400 — malformed/invalid input; the caller must change the request.
   if (error instanceof ValidationError) {
     return 400;

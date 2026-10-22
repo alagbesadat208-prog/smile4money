@@ -9,12 +9,13 @@ const makeGame = (gameId: string, whiteResult: string, blackResult: string) => (
   url: `https://www.chess.com/game/live/${gameId}`,
   pgn: '',
   time_control: '600',
-  end_time: 0,
+  start_time: 1700000000,
+  end_time: 1700000060,
   white: { username: 'alice', result: whiteResult },
   black: { username: 'bob', result: blackResult },
 });
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => { vi.clearAllMocks(); });
 
 describe('fetchChessDotComResult', () => {
   it('returns Player1Wins when white wins', async () => {

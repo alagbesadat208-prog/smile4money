@@ -12,10 +12,15 @@ import express from 'express';
 import oracleRouter from '../src/routes/oracle.js';
 import { matchStore } from '../src/store/index.js';
 import jwt from 'jsonwebtoken';
+import axios from 'axios';
 
 vi.mock('axios');
+vi.mock('../src/store/index.js', async () => {
+  const { MatchStore } = await import('../src/store/match-store.js');
+  return { matchStore: new MatchStore() };
+});
 
-const secret = 'test-secret';
+const secret = process.env.JWT_SECRET || 'test-secret';
 const makeToken = (address = 'GORACLE1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA') =>
   jwt.sign({ address }, secret, { expiresIn: '1h' });
 
@@ -141,7 +146,7 @@ describe('POST /api/oracle/submit-result — match not found', () => {
   });
 });
 
-// #1717 — matchId must be validated as a positive integer before any
+// matchId must be validated as a non-negative safe integer before any
 // downstream processing (store lookup, chess-platform API calls, Stellar
 // transaction building).
 describe('POST /api/oracle/submit-result — matchId validation', () => {
@@ -168,7 +173,7 @@ describe('POST /api/oracle/submit-result — matchId validation', () => {
   it.each([
     ['non-numeric string', 'not-a-number'],
     ['a float', 1.5],
-    ['zero', 0],
+    ['unsafe integer', Number.MAX_SAFE_INTEGER + 1],
     ['negative', -1],
   ])('returns 400 when matchId is %s', async (_label, matchId) => {
     const res = await request(createApp())
@@ -178,7 +183,24 @@ describe('POST /api/oracle/submit-result — matchId validation', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
-    expect(res.body.error.message).toBe('matchId must be a positive integer');
+    expect(res.body.error.message).toBe('matchId must be a non-negative safe integer');
+  });
+
+  it('verifies the first match through HTTP with identifier zero', async () => {
+    const match = await matchStore.createMatch({
+      player1: 'p1', player2: 'p2', player1Username: 'alice', player2Username: 'bob',
+      stakeAmount: 1, token: 'XLM', gameId: VALID_BODY.gameId, platform: 'lichess',
+    });
+    expect(match.matchId).toBe(0);
+    vi.mocked(axios.get).mockResolvedValueOnce({ status: 200, data: {
+      id: VALID_BODY.gameId, status: 'mate', winner: 'white',
+      createdAt: 1700000000000, lastMoveAt: 1700000060000,
+      players: { white: { user: { name: 'alice' } }, black: { user: { name: 'bob' } } },
+    } });
+    const res = await request(createApp()).post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken()}`).send({ ...VALID_BODY, matchId: 0 });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ verified: true, matchId: 0, result: 'Player1Wins' });
   });
 
   it('rejects an invalid matchId before touching the match store', async () => {
