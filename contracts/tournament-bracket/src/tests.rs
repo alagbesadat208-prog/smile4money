@@ -15,7 +15,7 @@ fn setup() -> (Env, Address, BracketContractClient<'static>, Address) {
 
 #[test]
 fn test_vacant_slots_are_not_byes_before_lock() {
-    let (env, _contract_id, client, _admin) = setup();
+    let (env, _contract_id, client, admin) = setup();
     let p1 = Address::generate(&env);
 
     let bracket_id = client.create_bracket(&4);
@@ -45,7 +45,7 @@ fn test_vacant_slots_are_not_byes_before_lock() {
         Err(Ok(Error::SlotVacant))
     );
     assert_eq!(
-        client.try_submit_result(&bracket_id, &0, &p1, &_admin),
+        client.try_submit_result(&bracket_id, &0, &p1, &admin),
         Err(Ok(Error::SlotVacant))
     );
 }
