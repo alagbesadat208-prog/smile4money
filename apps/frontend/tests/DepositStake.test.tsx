@@ -44,15 +44,7 @@ vi.mock('@stellar/stellar-sdk', () => ({
   rpc: {
     Server: vi.fn().mockImplementation(() => ({
       simulateTransaction: vi.fn().mockImplementation(async () => getSimulateResponse()),
-      getLedgers: vi.fn().mockImplementation(() => ({
-        order: () => ({
-          limit: () => ({
-            call: async () => ({
-              records: [{ sequence: '50000' }],
-            }),
-          }),
-        }),
-      })),
+      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 50000 }),
     })),
   },
   Account: class Account {
@@ -146,11 +138,7 @@ describe('DepositStake — match info display', () => {
 
     const player1Address = defaultMatch.player1;
     render(
-      <DepositStake
-        matchId="123"
-        playerAddress={player1Address}
-        contractId="test-contract"
-      />,
+      <DepositStake matchId="123" playerAddress={player1Address} contractId="test-contract" />,
     );
 
     await screen.findByTestId('match-info');
@@ -201,6 +189,24 @@ describe('DepositStake — deposit button states', () => {
     await waitFor(() => {
       expect(screen.getByTestId('deposit-btn')).toBeInTheDocument();
     });
+  });
+
+  it('does not announce success without an explicitly confirmed receipt', async () => {
+    const onDeposit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <DepositStake
+        matchId="123"
+        playerAddress="GABCDEF123456"
+        contractId="test-contract"
+        onDeposit={onDeposit}
+      />,
+    );
+
+    fireEvent.click(await screen.findByTestId('deposit-btn'));
+    expect(await screen.findByTestId('deposit-status')).toHaveTextContent(
+      'No confirmed deposit transaction was returned.',
+    );
+    expect(screen.getByTestId('deposit-status')).not.toHaveTextContent('Deposit successful!');
   });
 
   /**

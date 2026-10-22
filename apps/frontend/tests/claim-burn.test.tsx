@@ -9,8 +9,7 @@ function renderWithProviders(ui: React.ReactElement) {
   const element = React.isValidElement<ClaimBurnProps>(ui)
     ? React.cloneElement(ui, {
         onSimulateTransaction:
-          ui.props.onSimulateTransaction ??
-          vi.fn().mockResolvedValue({ minResourceFee: '100' }),
+          ui.props.onSimulateTransaction ?? vi.fn().mockResolvedValue({ minResourceFee: '100' }),
       })
     : ui;
   return render(<ToastProvider>{element}</ToastProvider>);
@@ -156,9 +155,7 @@ describe('ClaimBurn — confirmation flow', () => {
     await userEvent.type(screen.getByTestId('amount-input'), '10');
     fireEvent.click(screen.getByTestId('submit-btn'));
 
-    expect(await screen.findByTestId('error-msg')).toHaveTextContent(
-      'Transaction simulation failed: HostError',
-    );
+    expect(await screen.findByTestId('claim-burn-status')).toHaveTextContent('HostError');
     expect(screen.queryByTestId('confirm-overlay')).not.toBeInTheDocument();
     expect(onClaim).not.toHaveBeenCalled();
   });
@@ -174,7 +171,7 @@ describe('ClaimBurn — confirmation flow', () => {
 
 describe('ClaimBurn — submit and error handling', () => {
   it('calls onClaim with entered amount on submit', async () => {
-    const onClaim = vi.fn().mockResolvedValue(undefined);
+    const onClaim = vi.fn().mockResolvedValue({ hash: 'confirmed-hash', confirmed: true });
     renderWithProviders(<ClaimBurn walletState="connected" onClaim={onClaim} />);
     await userEvent.type(screen.getByTestId('amount-input'), '12.5');
     fireEvent.click(screen.getByTestId('submit-btn'));
@@ -191,15 +188,31 @@ describe('ClaimBurn — submit and error handling', () => {
   });
 
   it('calls onBurn with amount', async () => {
-    const onBurn = vi.fn().mockResolvedValue(undefined);
+    const onBurn = vi.fn().mockResolvedValue({ hash: 'confirmed-hash', confirmed: true });
     renderWithProviders(<ClaimBurn walletState="connected" onBurn={onBurn} />);
     fireEvent.click(screen.getByTestId('toggle-burn'));
     await userEvent.type(screen.getByTestId('amount-input'), '5');
     fireEvent.click(screen.getByTestId('submit-btn'));
     await screen.findByTestId('confirm-overlay');
     fireEvent.click(screen.getByTestId('confirm-btn'));
-    await waitFor(() => expect(screen.getByTestId('success-msg')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId('claim-burn-status')).toHaveTextContent('burned successfully'),
+    );
     expect(onBurn).toHaveBeenCalledWith('5');
+  });
+
+  it('does not announce success when an action returns without a confirmed transaction', async () => {
+    const onClaim = vi.fn().mockResolvedValue(undefined);
+    renderWithProviders(<ClaimBurn walletState="connected" onClaim={onClaim} />);
+    await userEvent.type(screen.getByTestId('amount-input'), '3');
+    fireEvent.click(screen.getByTestId('submit-btn'));
+    await screen.findByTestId('confirm-overlay');
+    fireEvent.click(screen.getByTestId('confirm-btn'));
+
+    expect(await screen.findByTestId('claim-burn-status')).toHaveTextContent(
+      'No confirmed transaction was returned.',
+    );
+    expect(screen.getByTestId('claim-burn-status')).not.toHaveTextContent('successfully');
   });
 
   it('shows error on failure', async () => {
@@ -209,8 +222,9 @@ describe('ClaimBurn — submit and error handling', () => {
     fireEvent.click(screen.getByTestId('submit-btn'));
     await screen.findByTestId('confirm-overlay');
     fireEvent.click(screen.getByTestId('confirm-btn'));
-    await waitFor(() => expect(screen.getByTestId('error-msg')).toBeInTheDocument());
-    expect(screen.getByTestId('error-msg')).toHaveTextContent('Transaction failed');
+    await waitFor(() =>
+      expect(screen.getByTestId('claim-burn-status')).toHaveTextContent('Transaction failed'),
+    );
   });
 
   it('resets status on amount change after error', async () => {
@@ -220,9 +234,11 @@ describe('ClaimBurn — submit and error handling', () => {
     fireEvent.click(screen.getByTestId('submit-btn'));
     await screen.findByTestId('confirm-overlay');
     fireEvent.click(screen.getByTestId('confirm-btn'));
-    await waitFor(() => expect(screen.getByTestId('error-msg')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId('claim-burn-status')).toHaveTextContent('Transaction failed'),
+    );
     fireEvent.change(screen.getByTestId('amount-input'), { target: { value: '20' } });
-    expect(screen.queryByTestId('error-msg')).not.toBeInTheDocument();
+    expect(screen.getByTestId('claim-burn-status')).not.toHaveTextContent('Transaction failed');
   });
 });
 
@@ -273,14 +289,16 @@ describe('ClaimBurn — max balance button', () => {
   });
 
   it('disables max button while pending', async () => {
-    const onClaim = vi.fn().mockResolvedValue(undefined);
+    const onClaim = vi.fn().mockResolvedValue({ hash: 'confirmed-hash', confirmed: true });
     renderWithProviders(<ClaimBurn walletState="connected" balance="10" onClaim={onClaim} />);
     fireEvent.change(screen.getByTestId('amount-input'), { target: { value: '10' } });
     fireEvent.click(screen.getByTestId('submit-btn'));
     await screen.findByTestId('confirm-overlay');
     fireEvent.click(screen.getByTestId('confirm-btn'));
     expect(screen.getByTestId('max-btn')).toBeDisabled();
-    await waitFor(() => expect(screen.getByTestId('success-msg')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId('claim-burn-status')).toHaveTextContent('claimed successfully'),
+    );
   });
 
   it('does not call onClaim when form is submitted while disconnected', () => {
@@ -309,7 +327,9 @@ describe('ClaimBurn — accessibility', () => {
     fireEvent.click(screen.getByTestId('submit-btn'));
     await screen.findByTestId('confirm-overlay');
     fireEvent.click(screen.getByTestId('confirm-btn'));
-    await waitFor(() => expect(screen.getByTestId('error-msg')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId('claim-burn-status')).toHaveTextContent('Transaction failed'),
+    );
     expect(screen.getByTestId('amount-input')).toHaveAttribute(
       'aria-describedby',
       'claim-burn-error',

@@ -1,8 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import type { WalletStatus, Network } from '../types';
-import { useDebounce } from '../hooks/useDebounce';
 import { useToast } from './Toast';
-import { TxHash } from './TxHash';
 import { TransactionStatus } from './TransactionStatus';
 
 type Mode = 'claim' | 'burn';
@@ -13,22 +11,17 @@ export interface TransactionSimulationResponse {
   error?: string;
 }
 
-interface TxRecord {
-  mode: Mode;
-  amount: string;
-  hash: string | null;
-  timestamp: number;
+export interface ConfirmedTransaction {
+  hash: string;
+  confirmed: true;
 }
 
 export interface ClaimBurnProps {
   walletState: WalletStatus;
   onConnect?: () => void;
-  onClaim?: (amount: string) => Promise<string | void>;
-  onBurn?: (amount: string) => Promise<string | void>;
-  onSimulateTransaction?: (
-    mode: Mode,
-    amount: string,
-  ) => Promise<TransactionSimulationResponse>;
+  onClaim?: (amount: string) => Promise<ConfirmedTransaction | void>;
+  onBurn?: (amount: string) => Promise<ConfirmedTransaction | void>;
+  onSimulateTransaction?: (mode: Mode, amount: string) => Promise<TransactionSimulationResponse>;
   onSwitchNetwork?: () => void;
   onDisconnect?: () => void;
   onRefreshBalance?: () => void;
@@ -168,15 +161,18 @@ export function ClaimBurn({
     setTxHash(null);
     try {
       const action = mode === 'claim' ? onClaim : onBurn;
-      const hash = await action?.(confirmAmount);
-      if (hash) setTxHash(hash);
+      const receipt = await action?.(confirmAmount);
+      if (!receipt || receipt.confirmed !== true || !receipt.hash) {
+        throw new Error('No confirmed transaction was returned.');
+      }
+      setTxHash(receipt.hash);
       setStatus('success');
       setInputAmount('');
       toast.success(
         mode === 'claim'
           ? `${tokenSymbol} claimed successfully!`
           : `${tokenSymbol} burned successfully!`,
-        hash ? `Transaction hash: ${hash}` : undefined,
+        `Transaction hash: ${receipt.hash}`,
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Transaction failed';
@@ -549,19 +545,19 @@ export function ClaimBurn({
             {status === 'simulating'
               ? 'Estimating fee…'
               : isPending
-              ? mode === 'claim'
-                ? 'Claiming…'
-                : 'Burning…'
-              : mode === 'claim'
-                ? 'Claim'
-                : 'Burn'}
+                ? mode === 'claim'
+                  ? 'Claiming…'
+                  : 'Burning…'
+                : mode === 'claim'
+                  ? 'Claim'
+                  : 'Burn'}
           </button>
         )}
       </form>
 
       {/* Transaction status with aria-live announcements */}
       <TransactionStatus
-        status={status as any}
+        status={status === 'simulating' || status === 'confirm' ? 'idle' : status}
         pendingMessage={mode === 'claim' ? 'Claiming tokens…' : 'Burning tokens…'}
         successMessage={
           mode === 'claim'

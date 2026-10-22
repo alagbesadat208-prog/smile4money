@@ -13,8 +13,8 @@ describe('App', () => {
   it('composes providers and renders the home screen', () => {
     render(<App />);
     expect(screen.getByTestId('network-badge')).toBeInTheDocument();
-    expect(screen.getByTestId('wallet-not-installed')).toBeInTheDocument();
     expect(screen.getByTestId('history-page')).toBeInTheDocument();
+    expect(screen.queryByTestId('claim-burn')).not.toBeInTheDocument();
   });
 
   it('toggles the theme through the composed providers', () => {
