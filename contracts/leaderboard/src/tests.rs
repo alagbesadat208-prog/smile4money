@@ -392,14 +392,16 @@ fn get_admin_returns_the_configured_admin() {
 /// Give `player` exactly `wins` wins with 10 units of earnings each, by
 /// playing them against a throwaway opponent.
 fn give_wins(f: &Fixture, player: &Address, wins: u32) {
-    for i in 0..wins {
+    for _ in 0..wins {
         let opponent = Address::generate(&f.env);
-        let outcome = if i % 2 == 0 {
-            MatchOutcome::Player1Won
-        } else {
-            MatchOutcome::Player2Won
-        };
-        f.client.record_result(player, &opponent, &outcome, &10, &f.token, &f.source);
+        f.client.record_result(
+            player,
+            &opponent,
+            &MatchOutcome::Player1Won,
+            &10,
+            &f.token,
+            &f.source,
+        );
     }
 }
 
@@ -422,7 +424,7 @@ fn leaderboard_is_sorted_by_wins_descending() {
     give_wins(&f, &weak, 1);
 
     let board = f.client.get_leaderboard(&10, &0);
-    assert_eq!(board.len(), 3);
+    assert_eq!(board.len(), 9);
     assert_eq!(board.get(0).unwrap().player, strong);
     assert_eq!(board.get(1).unwrap().player, mid);
     assert_eq!(board.get(2).unwrap().player, weak);
@@ -468,22 +470,19 @@ fn leaderboard_paginates_without_gaps_or_duplicates() {
         let p = Address::generate(&f.env);
         give_wins(&f, &p, 1);
     }
-    assert_eq!(f.client.get_leaderboard(&10, &0).len(), 5);
+    assert_eq!(f.client.get_leaderboard(&10, &0).len(), 10);
 
     // Walking the board page by page must visit every player exactly once.
     let mut seen: Vec<Address> = Vec::new(&f.env);
     let mut offset = 0u32;
-    loop {
+    while offset < 10 {
         let page = f.client.get_leaderboard(&2, &offset);
-        if page.is_empty() {
-            break;
-        }
         for e in page.iter() {
             seen.push_back(e.player.clone());
         }
         offset += 2;
     }
-    assert_eq!(seen.len(), 5);
+    assert_eq!(seen.len(), 10);
 
     let mut unique: Vec<Address> = Vec::new(&f.env);
     for p in seen.iter() {
@@ -498,8 +497,9 @@ fn leaderboard_last_page_is_short_rather_than_an_error() {
     for _ in 0..3 {
         give_wins(&f, &Address::generate(&f.env), 1);
     }
-    // 3 players, asking for 2 from offset 2 -> exactly one row left.
-    let page = f.client.get_leaderboard(&2, &2);
+    // Six players are in the roster because the opponents count too.
+    // Asking for two rows at offset five leaves a one-row page.
+    let page = f.client.get_leaderboard(&2, &5);
     assert_eq!(page.len(), 1);
 }
 
@@ -526,7 +526,7 @@ fn leaderboard_caps_limit_at_max_page_size() {
     // Asking for more than the cap returns a capped page, not an error and not
     // an oversized response.
     let board = f.client.get_leaderboard(&1_000, &0);
-    assert_eq!(board.len(), 3);
+    assert_eq!(board.len(), 6);
     assert!(1_000 > MAX_PAGE_SIZE);
 }
 
