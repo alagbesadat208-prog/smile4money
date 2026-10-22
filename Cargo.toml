@@ -2,6 +2,7 @@
 members = [
     "contracts/escrow",
     "contracts/oracle",
+    "contracts/tournament-bracket",
 ]
 resolver = "2"
 
