@@ -1,5 +1,9 @@
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{
+    testutils::Address as _,
+    token::{Client as TokenClient, StellarAssetClient},
+    Address, Env,
+};
 
 fn setup() -> (Env, Address, BracketContractClient<'static>, Address) {
     let env = Env::default();
@@ -199,4 +203,157 @@ fn test_malformed_nodes_detected_and_rejected() {
         client.try_get_node_state(&bracket_id, &0),
         Err(Ok(Error::MalformedNode))
     );
+}
+
+#[test]
+fn test_emergency_pause_authorization_and_blocked_progression() {
+    let (env, _contract_id, client, admin) = setup();
+    let stranger = Address::generate(&env);
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+
+    // Non-admin cannot pause or unpause.
+    assert_eq!(client.try_pause(&stranger), Err(Ok(Error::Unauthorized)));
+    assert_eq!(client.try_unpause(&stranger), Err(Ok(Error::Unauthorized)));
+
+    let open_bracket = client.create_bracket(&4);
+    client.register(&open_bracket, &p1);
+
+    let locked_bracket = client.create_bracket(&4);
+    client.register(&locked_bracket, &p1);
+    client.register(&locked_bracket, &p2);
+    client.register(&locked_bracket, &p3);
+    client.lock_registration(&locked_bracket, &admin);
+
+    // Activate emergency mode.
+    assert!(!client.is_paused());
+    client.pause(&admin);
+    assert!(client.is_paused());
+
+    // Every progression entrypoint is blocked while paused.
+    assert_eq!(
+        client.try_create_bracket(&4),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        client.try_register(&open_bracket, &p2),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        client.try_lock_registration(&open_bracket, &admin),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        client.try_submit_result(&locked_bracket, &0, &p1, &admin),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        client.try_advance_bye(&locked_bracket, &1),
+        Err(Ok(Error::ContractPaused))
+    );
+
+    // Read queries remain available while paused.
+    assert_eq!(client.get_bracket(&locked_bracket).registered, 3);
+    assert_eq!(client.get_node_state(&locked_bracket, &0), NodeState::Ready);
+}
+
+#[test]
+fn test_emergency_mode_preserves_participant_exits_and_refunds() {
+    let (env, _contract_id, client, admin) = setup();
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+
+    let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_addr = token_contract.address();
+    let asset_client = StellarAssetClient::new(&env, &token_addr);
+    let token_client = TokenClient::new(&env, &token_addr);
+
+    asset_client.mint(&p1, &1000);
+    asset_client.mint(&p2, &1000);
+    asset_client.mint(&p3, &1000);
+
+    let bracket_id = client.create_paid_bracket(&4, &token_addr, &250);
+    client.register(&bracket_id, &p1);
+    client.register(&bracket_id, &p2);
+    client.register(&bracket_id, &p3);
+    assert_eq!(token_client.balance(&p1), 750);
+    assert_eq!(token_client.balance(&p2), 750);
+    assert_eq!(token_client.balance(&p3), 750);
+
+    // Lock the bracket. During normal play (not paused, not cancelled), a locked
+    // bracket rejects arbitrary withdrawal.
+    client.lock_registration(&bracket_id, &admin);
+    assert_eq!(
+        client.try_withdraw(&bracket_id, &p1),
+        Err(Ok(Error::RegistrationClosed))
+    );
+
+    // Operator triggers emergency pause due to an incident.
+    client.pause(&admin);
+
+    // Participant p1 can immediately exit and recover their 250 entry fee while paused,
+    // even before the operator explicitly cancels the bracket.
+    client.withdraw(&bracket_id, &p1);
+    assert_eq!(token_client.balance(&p1), 1000);
+    assert!(client.get_bracket(&bracket_id).cancelled);
+
+    // Double withdrawal by p1 is rejected.
+    assert_eq!(
+        client.try_withdraw(&bracket_id, &p1),
+        Err(Ok(Error::NotRegistered))
+    );
+
+    // Participant p2 also exits while paused.
+    client.withdraw(&bracket_id, &p2);
+    assert_eq!(token_client.balance(&p2), 1000);
+
+    // Even after emergency mode is lifted, the affected bracket remains cancelled so
+    // remaining participant p3 can still withdraw and match progression stays blocked.
+    client.unpause(&admin);
+    assert_eq!(
+        client.try_submit_result(&bracket_id, &0, &p2, &admin),
+        Err(Ok(Error::BracketCancelled))
+    );
+    client.withdraw(&bracket_id, &p3);
+    assert_eq!(token_client.balance(&p3), 1000);
+    assert_eq!(client.get_bracket(&bracket_id).registered, 0);
+}
+
+#[test]
+fn test_cancel_bracket_while_paused_allows_exits() {
+    let (env, _contract_id, client, admin) = setup();
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    let bracket_id = client.create_bracket(&4);
+    client.register(&bracket_id, &p1);
+    client.register(&bracket_id, &p2);
+    client.lock_registration(&bracket_id, &admin);
+
+    client.pause(&admin);
+
+    // Non-admin cannot cancel.
+    assert_eq!(
+        client.try_cancel_bracket(&bracket_id, &stranger),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Admin can cancel while paused.
+    client.cancel_bracket(&bracket_id, &admin);
+    assert!(client.get_bracket(&bracket_id).cancelled);
+
+    // Second cancel is rejected.
+    assert_eq!(
+        client.try_cancel_bracket(&bracket_id, &admin),
+        Err(Ok(Error::BracketCancelled))
+    );
+
+    // Both participants can exit while paused or after unpausing.
+    client.withdraw(&bracket_id, &p1);
+    client.unpause(&admin);
+    client.withdraw(&bracket_id, &p2);
+    assert_eq!(client.get_bracket(&bracket_id).registered, 0);
 }

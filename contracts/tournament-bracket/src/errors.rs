@@ -33,4 +33,14 @@ pub enum Error {
     AlreadyResolved = 14,
     /// The bracket counter would overflow.
     Overflow = 15,
+    /// Emergency mode is active: tournament progression is paused.
+    ContractPaused = 16,
+    /// The bracket has been cancelled: only participant exits are allowed.
+    BracketCancelled = 17,
+    /// The caller does not occupy an active slot in this bracket.
+    NotRegistered = 18,
+    /// The bracket has already been completed.
+    AlreadyCompleted = 19,
+    /// The entry fee amount is invalid.
+    InvalidAmount = 20,
 }

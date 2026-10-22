@@ -69,17 +69,24 @@ pub struct Node {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bracket {
     pub id: u64,
-    /// Address allowed to seal the bracket and to submit results.
+    /// Address allowed to seal the bracket, cancel it, and submit results.
     pub admin: Address,
     /// Number of first round sides. Always a power of two.
     pub size: u32,
     /// Number of rounds, `log2(size)`.
     pub rounds: u32,
-    /// Number of participants that entered the bracket.
+    /// Number of participants currently registered in the bracket.
     pub registered: u32,
     /// Registration is closed: every side of the first round that was still
     /// vacant has been sealed as an explicit bye.
     pub locked: bool,
+    /// Whether the bracket has been cancelled. Cancelled brackets cannot
+    /// progress, but remaining participants may still exit and claim refunds.
+    pub cancelled: bool,
+    /// Optional token used for entry fees and refunds.
+    pub token: Option<Address>,
+    /// Entry fee per participant (0 for free brackets).
+    pub entry_fee: i128,
     /// Winner of the bracket, set once the final is decided.
     pub champion: Option<Address>,
 }
@@ -87,6 +94,7 @@ pub struct Bracket {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    Paused,
     Bracket(u64),
     BracketCount,
     /// Keyed by (bracket id, node id).
