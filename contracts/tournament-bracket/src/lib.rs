@@ -244,6 +244,20 @@ impl TournamentBracket {
             return Err(Error::InvalidPlayerCount);
         }
 
+        let rounds = n.trailing_zeros();
+        let expected_node_total = n.checked_sub(1).ok_or(Error::InvalidPlayerCount)?;
+        let mut computed_node_total = 0u32;
+        let mut round = 0u32;
+        while round < rounds {
+            computed_node_total = computed_node_total
+                .checked_add(Self::node_count(n, round))
+                .ok_or(Error::InvalidPlayerCount)?;
+            round += 1;
+        }
+        if computed_node_total != expected_node_total || computed_node_total > MAX_PLAYERS - 1 {
+            return Err(Error::InvalidPlayerCount);
+        }
+
         let prize_pool = entry_fee
             .checked_mul(n as i128)
             .ok_or(Error::InvalidAmount)?;
@@ -275,8 +289,7 @@ impl TournamentBracket {
             token: token_addr,
             entry_fee,
             player_count: n,
-            // `n` is a power of two, so this is exactly log2(n).
-            rounds: n.trailing_zeros(),
+            rounds,
             funded_count: 0,
             state: TournamentState::Registration,
             champion: None,

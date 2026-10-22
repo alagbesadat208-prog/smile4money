@@ -306,8 +306,14 @@ fn field_size_bounds_are_enforced() {
     let id = f.client.create_tournament(&FEE, &f.players);
     assert_eq!(f.client.get_tournament(&id).rounds, 6);
     assert_eq!(f.client.get_prize_pool(&id), FEE * 64);
-    // 6 rounds of 32/16/8/4/2/1 nodes, so round 0 stops at index 31 and there is
-    // no seventh round.
+    // 6 rounds of 32/16/8/4/2/1 nodes = 63 reachable nodes.
+    let mut total_nodes = 0;
+    for (round, count) in [32u32, 16, 8, 4, 2, 1].into_iter().enumerate() {
+        total_nodes += count;
+        f.client.get_node(&id, &(round as u32), &(count - 1));
+    }
+    assert_eq!(total_nodes, 63);
+    // Round 0 stops at index 31 and there is no seventh round.
     assert_eq!(
         f.client.try_get_node(&id, &0, &32),
         Err(Ok(Error::NodeNotFound))
@@ -317,6 +323,15 @@ fn field_size_bounds_are_enforced() {
         Err(Ok(Error::NodeNotFound))
     );
     f.client.get_node(&id, &0, &31);
+
+    let minimum = Fixture::with_field(2);
+    let min_id = minimum.client.create_tournament(&FEE, &minimum.players);
+    assert_eq!(minimum.client.get_tournament(&min_id).rounds, 1);
+    minimum.client.get_node(&min_id, &0, &0);
+    assert_eq!(
+        minimum.client.try_get_node(&min_id, &1, &0),
+        Err(Ok(Error::NodeNotFound))
+    );
 
     let env = Env::default();
     env.mock_all_auths();
@@ -333,6 +348,10 @@ fn field_size_bounds_are_enforced() {
     assert_eq!(
         client.try_create_tournament(&FEE, &many),
         Err(Ok(Error::InvalidPlayerCount))
+    );
+    assert_eq!(
+        client.try_get_tournament(&0),
+        Err(Ok(Error::TournamentNotFound))
     );
 }
 
