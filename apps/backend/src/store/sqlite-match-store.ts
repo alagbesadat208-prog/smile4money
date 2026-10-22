@@ -184,6 +184,13 @@ export class SqliteMatchStore {
     });
   }
 
+  async listMatches(): Promise<MatchRecord[]> {
+    return new Promise((resolve, reject) => {
+      this.getDb().all('SELECT * FROM matches ORDER BY matchId',
+        (error, rows: MatchRecord[]) => error ? reject(error) : resolve(rows));
+    });
+  }
+
   async count(): Promise<number> {
     return new Promise((resolve, reject) => {
       this.getDb().get(

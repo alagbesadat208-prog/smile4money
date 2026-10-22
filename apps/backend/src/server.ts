@@ -1,163 +1,69 @@
-import dotenv from 'dotenv';
+import dotenv from "dotenv";
 dotenv.config();
 
-import { app } from './app.js';
-import { initializeQueue, closeQueue, startRetryWorker, startDlqEvictionTask, listDlqEntries, writeToDlq, type DlqEntry } from './queue.js';
-import { initializeMatchStore } from './store/index.js';
-import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/circuit-breaker.js';
-import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
-import ChessPlatformPoller from './services/game-poller.js';
-import { getCurrentLedger } from './services/stellar.js';
-import { loadRetryConfig, submitWithIdempotence, type OracleSubmission } from './services/oracle-submit.js';
-import { createShutdownHandler } from './shutdown.js';
-import logger from './logger.js';
+import { app } from "./app.js";
+import { initializeQueue, closeQueue, startDlqEvictionTask } from "./queue.js";
+import { SettlementStore } from "./store/settlement-store.js";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { matchStore, initializeMatchStore } from "./store/index.js";
+import {
+  initializeCircuitBreaker,
+  closeCircuitBreakerStore,
+} from "./services/circuit-breaker.js";
+import {
+  DurableOracleWorker,
+  parsePollingIntervalMs,
+} from "./services/polling.js";
+import { SorobanSettlementClient } from "./services/oracle-submit.js";
+import { createShutdownHandler } from "./shutdown.js";
+import logger from "./logger.js";
 
 const port = Number(process.env.PORT || 4000);
-
-/**
- * Placeholder for the actual Stellar contract submission handler.
- * This would be wired up with the Stellar SDK and oracle keypair.
- * For now, it throws to indicate this is not yet implemented.
- */
-async function submitOracleResultToContract(submission: OracleSubmission): Promise<void> {
-  // TODO: Implement actual Stellar contract submission
-  // This should:
-  // 1. Create a transaction builder
-  // 2. Add the oracle contract's submit_result operation
-  // 3. Sign with the oracle keypair
-  // 4. Submit to Soroban RPC
-  throw new Error('Oracle contract submission not yet implemented. Set up Stellar SDK and oracle keypair.');
-}
-
-/**
- * Placeholder for checking if a result already exists on-chain.
- * Used for idempotent submission (skip if already submitted).
- */
-async function checkResultExistsOnChain(matchId: number): Promise<boolean> {
-  // TODO: Implement existence check via Stellar RPC
-  // This should query the oracle contract to see if a result exists for this matchId
-  return false; // For now, assume it doesn't exist so retries will attempt submission
-}
-
-/**
- * Oracle retry handler for reprocessing DLQ entries.
- * 
- * Reconstructs the original OracleSubmission from the DLQ entry payload and attempts
- * to submit it to the blockchain with idempotence checks. If submission fails, the error
- * is thrown so the entry remains in the DLQ for the next retry cycle.
- */
-async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
-  const submission = entry.payload as OracleSubmission;
-  
-  if (!submission || typeof submission !== 'object' || !('matchId' in submission)) {
-    throw new Error(`Invalid DLQ entry payload: expected OracleSubmission, got ${typeof entry.payload}`);
-  }
-
-  logger.debug(
-    { dlqId: entry.id, matchId: submission.matchId, gameId: submission.gameId },
-    'oracle_dlq: retrying oracle submission'
-  );
-
-  const config = loadRetryConfig();
-  
-  try {
-    // Attempt submission with idempotence check
-    // If the result already exists on-chain, this returns cleanly
-    // If submission fails, the error is thrown and propagates to the caller
-    await submitWithIdempotence(
-      submission,
-      submitOracleResultToContract,
-      checkResultExistsOnChain,
-      config
-    );
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.warn(
-      { dlqId: entry.id, matchId: submission.matchId, error: message },
-      'oracle_dlq: submission failed, entry will remain in DLQ'
-    );
-    throw err; // Re-throw so the entry stays in the DLQ
-  }
-}
 
 async function main() {
   try {
     // Initialize the persistent queue store
     await initializeQueue();
-    logger.info('Queue store initialized');
+    logger.info("Queue store initialized");
 
     // Initialize the persistent match store (SQLite-backed)
     await initializeMatchStore();
-    logger.info('Match store initialized');
+    logger.info("Match store initialized");
 
     // Initialize the circuit breaker with SQLite-backed persistence (#1716),
     // restoring its prior state (or resetting to CLOSED if it went stale
     // while this process was down) before the retry worker starts using it.
     await initializeCircuitBreaker();
-    logger.info('Circuit breaker initialized');
+    logger.info("Circuit breaker initialized");
 
-    // Load any pending jobs from the queue on startup
-    const pendingEntries = await listDlqEntries();
-    logger.info(
-      { count: pendingEntries.length },
-      `Loaded ${pendingEntries.length} pending oracle submissions from queue`
+    const client = SorobanSettlementClient.fromEnvironment();
+    const outbox = new SettlementStore(
+      process.env.SETTLEMENT_DB_PATH ||
+        path.join(
+          path.dirname(fileURLToPath(import.meta.url)),
+          "../data/settlements.db",
+        ),
+      `${client.config.networkPassphrase}:${client.config.escrowContract}`,
     );
-
-    // Start the retry worker
-    const stopRetryWorker = startRetryWorker(retryOracleSubmission, 60_000);
-
-    // Start the DLQ TTL eviction task (deletes entries older than DLQ_TTL_DAYS)
+    await outbox.initialize();
+    const worker = new DurableOracleWorker(
+      matchStore,
+      outbox,
+      client,
+      parsePollingIntervalMs(process.env.POLLING_INTERVAL_MS),
+    );
+    app.locals.oracleWorker = worker;
+    const stopPollingWorker = worker.start();
+    // Legacy DLQ entries need manual review: they have no persisted signed
+    // envelope/hash and cannot safely be blindly retried by the new pipeline.
     const stopDlqEviction = startDlqEvictionTask();
-
-    // Set up the polling worker with DLQ wiring for max-attempts exceeded
-    const pollingStore = new PollingJobStore();
-    const gamePoller = new ChessPlatformPoller();
-    const pollingWorker = new PollingWorker(pollingStore, gamePoller, {
-      pollingIntervalMs: parsePollingIntervalMs(process.env.POLLING_INTERVAL_MS),
-      maxPollingAttempts: Number(process.env.MAX_POLLING_ATTEMPTS ?? 1440),
-      backoffMultiplier: Number(process.env.POLLING_BACKOFF_MULTIPLIER ?? 1.0),
-      // #51 — lets the worker detect a match that has exceeded the escrow
-      // contract's on-chain timeout_ledgers window and move it to DLQ
-      // instead of polling a match no payout can still reach.
-      getCurrentLedger,
-      onGameCompleted: async (job, result) => {
-        logger.info(
-          {
-            match_id: job.matchId,
-            game_id: job.gameId,
-            platform: job.platform,
-            result,
-            attempts: job.pollingAttempt,
-          },
-          'polling_job_game_completed_submitting_to_oracle',
-        );
-        // TODO: invoke the oracle submission pipeline here
-        // e.g. await submitToOracle({ matchId: job.matchId, gameId: job.gameId, result })
-      },
-      onMaxAttemptsExceeded: async (job, reason) => {
-        logger.error(
-          {
-            match_id: job.matchId,
-            game_id: job.gameId,
-            platform: job.platform,
-            attempts: job.pollingAttempt,
-            reason,
-          },
-          'polling_job_max_attempts_exceeded_writing_to_dlq',
-        );
-        await writeToDlq(
-          { job },
-          reason ?? 'max polling attempts exceeded',
-        );
-      },
-    });
-    const stopPollingWorker = pollingWorker.start();
 
     // Start the Express server
     const server = app.listen(port, () => {
       logger.info(
         { port },
-        `smile4money-backend listening on http://localhost:${port}`
+        `smile4money-backend listening on http://localhost:${port}`,
       );
     });
 
@@ -167,18 +73,22 @@ async function main() {
     const shutdown = createShutdownHandler({
       server,
       stopPollingWorker,
-      stopRetryWorker,
+      stopRetryWorker: () => {},
       stopDlqEviction,
-      closeQueue,
+      closeQueue: async () => {
+        await outbox.close();
+        await matchStore.close();
+        await closeQueue();
+      },
       closeCircuitBreakerStore,
       logger,
       shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000),
     });
 
-    process.on('SIGTERM', () => void shutdown('SIGTERM'));
-    process.on('SIGINT', () => void shutdown('SIGINT'));
+    process.on("SIGTERM", () => void shutdown("SIGTERM"));
+    process.on("SIGINT", () => void shutdown("SIGINT"));
   } catch (error) {
-    logger.error({ error }, 'Failed to start server');
+    logger.error({ error }, "Failed to start server");
     process.exit(1);
   }
 }

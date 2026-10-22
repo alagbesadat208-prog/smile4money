@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll, afterAll, afterEach } from 'vitest';
 import {
   loadRetryConfig,
   calculateBackoffDelay,
@@ -8,18 +8,20 @@ import {
   type RetryConfig,
   type OracleSubmission,
 } from '../src/services/oracle-submit.js';
-import { listDlqEntries, removeDlqEntry } from '../src/queue.js';
+import { initializeQueue, closeQueue, listDlqEntries, removeDlqEntry } from '../src/queue.js';
 
+beforeAll(async () => { process.env.QUEUE_STORE = 'memory'; await initializeQueue(); });
+afterAll(async () => { await closeQueue(); });
+afterEach(() => { vi.useRealTimers(); });
 // Clear DLQ between tests
-function clearDlq() {
-  for (const entry of listDlqEntries()) {
-    removeDlqEntry(entry.id);
+async function clearDlq() {
+  for (const entry of await listDlqEntries()) {
+    await removeDlqEntry(entry.id);
   }
 }
 
-beforeEach(() => {
-  clearDlq();
-  vi.useFakeTimers();
+beforeEach(async () => {
+  await clearDlq();
 });
 
 describe('loadRetryConfig', () => {
@@ -132,6 +134,7 @@ describe('submitWithRetry', () => {
   });
 
   it('respects exponential backoff timing', async () => {
+    vi.useFakeTimers();
     const handler = vi
       .fn()
       .mockRejectedValueOnce(new Error('err'))
@@ -141,18 +144,20 @@ describe('submitWithRetry', () => {
 
     // Verify delays match exponential backoff
     const delay1 = calculateBackoffDelay(0, config); // 100ms
+    await vi.advanceTimersByTimeAsync(0);
     expect(vi.getTimerCount()).toBe(1);
-    vi.advanceTimersByTime(delay1);
+    await vi.advanceTimersByTimeAsync(delay1);
     
     await promise;
     expect(handler).toHaveBeenCalledTimes(2);
   });
 
-  it('increases attempt count on retries', async () => {
+  it('exhausts submission attempts before initializing the DLQ retry counter', async () => {
     const handler = vi.fn().mockRejectedValue(new Error('err'));
     const result = await submitWithRetry(submission, handler, config);
 
-    expect(result?.attempts).toBe(config.maxRetries + 1);
+    expect(handler).toHaveBeenCalledTimes(config.maxRetries + 1);
+    expect(result?.attempts).toBe(0);
   });
 
   it('preserves submission details in DLQ entry', async () => {
@@ -160,7 +165,7 @@ describe('submitWithRetry', () => {
     const result = await submitWithRetry(submission, handler, config);
 
     expect(result?.payload).toEqual(submission);
-    const dlqEntries = listDlqEntries();
+    const dlqEntries = await listDlqEntries();
     expect(dlqEntries[0].payload).toEqual(submission);
   });
 });
@@ -185,7 +190,7 @@ describe('retryDlqEntry', () => {
     })();
 
     expect(dlqEntry).toBeDefined();
-    expect(listDlqEntries()).toHaveLength(1);
+    expect(await listDlqEntries()).toHaveLength(1);
 
     // Retry the entry
     const handler = vi.fn().mockResolvedValue(undefined);
@@ -213,14 +218,14 @@ describe('retryDlqEntry', () => {
       return await submitWithRetry(submission, handler, config);
     })();
 
-    expect(listDlqEntries()).toHaveLength(1);
+    expect(await listDlqEntries()).toHaveLength(1);
 
     // Retry fails
     const handler = vi.fn().mockRejectedValue(new Error('still failing'));
     const success = await retryDlqEntry(dlqEntry!, handler);
 
     expect(success).toBe(false);
-    expect(listDlqEntries()).toHaveLength(1);
+    expect(await listDlqEntries()).toHaveLength(1);
   });
 
   it('returns false when handler throws', async () => {
@@ -325,7 +330,7 @@ describe('submitWithIdempotence', () => {
     // Should write to DLQ after retries exhausted
     expect(result).toBeDefined();
     expect(result?.payload).toEqual(submission);
-    expect(listDlqEntries()).toHaveLength(1);
+    expect(await listDlqEntries()).toHaveLength(1);
   });
 
   it('handles idempotent race condition: result exists mid-retry', async () => {

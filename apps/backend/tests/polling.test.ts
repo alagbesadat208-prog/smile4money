@@ -610,34 +610,45 @@ describe('Game Polling System', () => {
       expect(completedStore.getJobByMatchId(11)).toBeNull();
     });
 
-    it('logs an error but does not rethrow when onGameCompleted throws', async () => {
-      const onGameCompleted = vi.fn().mockRejectedValue(new Error('oracle_down'));
+    it("retains the completed result and retries without repolling when the callback fails", async () => {
+      const onGameCompleted = vi
+        .fn()
+        .mockRejectedValue(new Error("oracle_down"));
       const errorStore = new PollingJobStore();
 
-      const errorWorker = new PollingWorker(
-        errorStore,
-        poller,
-        {
-          pollingIntervalMs: 100,
-          maxPollingAttempts: 5,
-          backoffMultiplier: 1.0,
-          onGameCompleted,
-          onMaxAttemptsExceeded: vi.fn().mockResolvedValue(undefined),
-        },
-      );
+      const errorWorker = new PollingWorker(errorStore, poller, {
+        pollingIntervalMs: 100,
+        maxPollingAttempts: 5,
+        backoffMultiplier: 1.0,
+        onGameCompleted,
+        onMaxAttemptsExceeded: vi.fn().mockResolvedValue(undefined),
+      });
 
-      errorStore.createJob(12, 'game-error', 'lichess');
-      poller.setGameStatus('game-error', 'completed');
-      poller.setGameResult('game-error', 'Player2Wins');
+      errorStore.createJob(12, "game-error", "lichess");
+      poller.setGameStatus("game-error", "completed");
+      poller.setGameResult("game-error", "Player2Wins");
 
       // Should not throw even though the callback rejects
       const cleanup = errorWorker.start();
       await expect(
         new Promise<void>((resolve) => setTimeout(resolve, 50)),
       ).resolves.toBeUndefined();
-      cleanup();
+      await cleanup();
 
       expect(onGameCompleted).toHaveBeenCalled();
+      expect(errorStore.getJobByMatchId(12)?.pendingResult).toBe("Player2Wins");
+      onGameCompleted.mockResolvedValue(undefined);
+      const retryWorker = new PollingWorker(errorStore, poller, {
+        pollingIntervalMs: 100,
+        onGameCompleted,
+        onMaxAttemptsExceeded: vi.fn().mockResolvedValue(undefined),
+      });
+      const pollSpy = vi.spyOn(poller, 'poll');
+      const stopRetry = retryWorker.start();
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      await stopRetry();
+      expect(errorStore.getJobByMatchId(12)).toBeNull();
+      expect(pollSpy).not.toHaveBeenCalled();
     });
   });
 
