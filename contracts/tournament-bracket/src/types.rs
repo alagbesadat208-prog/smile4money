@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, String};
 
 /// A single side of a bracket node.
 ///
@@ -64,6 +64,8 @@ pub struct Node {
     pub slot1: Slot,
     /// Second side of the node.
     pub slot2: Slot,
+    /// Unique external game identifier bound to this playable node within the bracket.
+    pub game_id: Option<String>,
     /// Provisional winner recorded when a result is first reported; subject to
     /// amendment by the authorized reviewer until `review_deadline`.
     pub pending_winner: Option<Address>,
@@ -114,4 +116,6 @@ pub enum DataKey {
     BracketCount,
     /// Keyed by (bracket id, node id).
     Node(u64, u64),
+    /// Keyed by (bracket id, external game id) -> node id.
+    GameId(u64, String),
 }

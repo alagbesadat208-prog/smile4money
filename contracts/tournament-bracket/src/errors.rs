@@ -53,4 +53,10 @@ pub enum Error {
     InvalidReviewWindow = 24,
     /// A participant would occupy both sides of a match or appear more than once.
     DuplicateParticipant = 25,
+    /// The external game identifier is empty or exceeds the maximum length.
+    InvalidGameId = 26,
+    /// The external game identifier is already used by a node in this bracket.
+    DuplicateGameId = 27,
+    /// The provided external game identifier does not match the node's stored game ID.
+    GameIdMismatch = 28,
 }
