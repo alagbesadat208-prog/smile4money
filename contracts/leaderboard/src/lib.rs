@@ -193,8 +193,24 @@ impl LeaderboardContract {
             (Some(w), Some(l)) => {
                 let mut w_stats = Self::load_stats(&env, w);
                 w_stats.wins += 1;
-                w_stats.earnings += payout;
-                w_stats.token = token.clone();
+                let mut asset_index = 0;
+                let mut asset_found = false;
+                while asset_index < w_stats.earnings_by_asset.len() {
+                    let mut earnings = w_stats.earnings_by_asset.get(asset_index).unwrap();
+                    if earnings.token == token {
+                        earnings.amount = earnings.amount.checked_add(payout).ok_or(Error::Overflow)?;
+                        w_stats.earnings_by_asset.set(asset_index, earnings);
+                        asset_found = true;
+                        break;
+                    }
+                    asset_index += 1;
+                }
+                if !asset_found {
+                    w_stats.earnings_by_asset.push_back(AssetEarnings {
+                        token: token.clone(),
+                        amount: payout,
+                    });
+                }
                 Self::store_stats(&env, w, &w_stats);
 
                 let mut l_stats = Self::load_stats(&env, l);
@@ -248,7 +264,7 @@ impl LeaderboardContract {
             .ok_or(Error::NotInitialized)
     }
 
-    /// Return a page of the leaderboard, ranked by wins then earnings.
+    /// Return a page of the leaderboard, ranked by wins and address.
     ///
     /// Paging is `offset`-based. `limit` is capped at [`MAX_PAGE_SIZE`], so a
     /// caller asking for more gets one full page rather than a response too
@@ -256,15 +272,13 @@ impl LeaderboardContract {
     ///
     /// ## Ranking and its limits
     ///
-    /// Rows are ordered by **wins** descending, then `earnings` descending,
-    /// then address ascending as a tie-break. The final tie-break matters: two
+    /// Rows are ordered by **wins** descending, then address ascending. The
+    /// address tie-break matters: two
     /// players with identical records must come back in a stable order, or
     /// paging would show duplicates on one page and skip rows on the next.
     ///
-    /// The earnings tie-break is only meaningful **within a single token** —
-    /// a raw stroop count of USDC and one of XLM are not comparable numbers.
-    /// The `token` field is returned on every row so a caller can group or
-    /// label by currency rather than silently adding unlike units together.
+    /// Earnings are returned separately by token and are never compared across
+    /// denominations when ranking.
     ///
     /// Only players with at least one completed match appear. A caller paging
     /// to the end gets a short page rather than an error, which is the normal
@@ -313,8 +327,7 @@ impl LeaderboardContract {
             idx += 1;
         }
 
-        // Insertion sort, descending by (wins, earnings) with an ascending
-        // address tie-break.
+        // Insertion sort, descending by wins with an ascending address tie-break.
         //
         // Why not sort in Rust and worry about cost? Because `Vec::sort` is
         // unavailable in `no_std` for Soroban's ordered collections, and
@@ -372,7 +385,7 @@ impl LeaderboardContract {
         env.storage()
             .persistent()
             .get(&DataKey::Stats(player.clone()))
-            .unwrap_or_else(|| PlayerStats::empty(player))
+            .unwrap_or_else(|| PlayerStats::empty(env))
     }
 
     /// Write a player's stats and bump their TTL.
@@ -403,7 +416,7 @@ impl LeaderboardContract {
         let len = roster.len();
         let mut i = 0u32;
         while i < len {
-            if roster.get(i) == *player {
+            if roster.get(i).unwrap() == *player {
                 return;
             }
             i += 1;
@@ -426,9 +439,6 @@ impl LeaderboardContract {
     ) -> bool {
         if a.1.wins != b.1.wins {
             return a.1.wins < b.1.wins;
-        }
-        if a.1.earnings != b.1.earnings {
-            return a.1.earnings < b.1.earnings;
         }
         a.0 > b.0
     }

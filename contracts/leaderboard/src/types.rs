@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address, Env, Vec};
 
 /// Errors returned by the leaderboard contract.
 ///
@@ -10,6 +10,7 @@ use soroban_sdk::{contracterror, contracttype, Address};
 /// |  4   | InvalidResult    | Result is not a recognised variant             |
 /// |  5   | InvalidRange     | `limit` is zero or the page offset is past the end |
 /// |  6   | ContractPaused   | Result recording is paused                     |
+/// |  7   | Overflow         | An earnings amount exceeds its integer range   |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -30,6 +31,9 @@ pub enum Error {
 
     /// [E006] Result recording is paused.
     ContractPaused = 6,
+
+    /// [E007] An earnings amount exceeds its integer range.
+    Overflow = 7,
 }
 
 /// The outcome of a single match, as reported by the escrow contract.
@@ -47,10 +51,7 @@ pub enum MatchOutcome {
 /// A player's lifetime record.
 ///
 /// `wins + losses + draws` is the number of completed matches that player has
-/// taken part in. `earnings` is in the token's smallest unit and is therefore
-/// **not** comparable across tokens — a player who only staked USDC and a
-/// player who only staked XLM produce numbers on different scales. The
-/// leaderboard surfaces the token alongside the figure for this reason.
+/// taken part in. Earnings are grouped by token denomination.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlayerStats {
@@ -60,26 +61,40 @@ pub struct PlayerStats {
     pub losses: u32,
     /// Completed matches drawn.
     pub draws: u32,
-    /// Total amount won, in the token's smallest unit.
-    pub earnings: i128,
-    /// Address of the token `earnings` is denominated in.
+    /// Amounts won, grouped by token denomination.
+    pub earnings_by_asset: Vec<AssetEarnings>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetEarnings {
+    /// Address of the token this amount is denominated in.
     pub token: Address,
+    /// Total amount won in the token's smallest unit.
+    pub amount: i128,
 }
 
 impl PlayerStats {
     /// A zeroed record for a player who has not been seen.
-    ///
-    /// Written by hand rather than derived from `Default` because `Address` has
-    /// no `Default` impl. Returning a zeroed record (rather than `None`) keeps
-    /// `get_stats` total — a caller never has to handle an absent player.
-    pub fn empty(token: &Address) -> Self {
+    pub fn empty(env: &Env) -> Self {
         PlayerStats {
             wins: 0,
             losses: 0,
             draws: 0,
-            earnings: 0,
-            token: token.clone(),
+            earnings_by_asset: Vec::new(env),
         }
+    }
+
+    pub fn earnings_for(&self, token: &Address) -> i128 {
+        let mut index = 0;
+        while index < self.earnings_by_asset.len() {
+            let asset = self.earnings_by_asset.get(index).unwrap();
+            if asset.token == *token {
+                return asset.amount;
+            }
+            index += 1;
+        }
+        0
     }
 
     /// Total completed matches this player took part in.

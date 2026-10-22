@@ -15,9 +15,15 @@ vi.mock('@stellar/stellar-sdk', () => ({
   Networks: { TESTNET: 'Test SDF Network ; September 2015' },
   Operation: { invokeContractFunction: vi.fn() },
   TransactionBuilder: class {
-    addOperation() { return this; }
-    setTimeout() { return this; }
-    build() { return {}; }
+    addOperation() {
+      return this;
+    }
+    setTimeout() {
+      return this;
+    }
+    build() {
+      return {};
+    }
   },
   nativeToScVal: vi.fn(),
   rpc: { Server: vi.fn() },
@@ -36,7 +42,12 @@ const CONTRACT = 'CDUMMYCONTRACTID';
 function entry(player: string, wins: number, earnings: string): LeaderboardEntry {
   return {
     player,
-    stats: { wins, losses: 0, draws: 0, earnings, token: 'CTOKENADDRESS' },
+    stats: {
+      wins,
+      losses: 0,
+      draws: 0,
+      earnings_by_asset: [{ amount: earnings, token: 'CTOKENADDRESS' }],
+    },
   };
 }
 
@@ -130,10 +141,7 @@ describe('Leaderboard — pagination', () => {
 
   it('requests the next page with an offset', async () => {
     // A full page first, then a short one, so Next stays enabled after page 1.
-    const fetchPage = vi
-      .fn()
-      .mockResolvedValueOnce(rows(PAGE_SIZE))
-      .mockResolvedValueOnce(rows(3));
+    const fetchPage = vi.fn().mockResolvedValueOnce(rows(PAGE_SIZE)).mockResolvedValueOnce(rows(3));
     render(<Leaderboard contractId={CONTRACT} fetchPage={fetchPage} />);
     await screen.findByTestId('leaderboard-table');
 
@@ -146,10 +154,7 @@ describe('Leaderboard — pagination', () => {
   });
 
   it('numbers rows continuously across pages', async () => {
-    const fetchPage = vi
-      .fn()
-      .mockResolvedValueOnce(rows(PAGE_SIZE))
-      .mockResolvedValueOnce(rows(2))
+    const fetchPage = vi.fn().mockResolvedValueOnce(rows(PAGE_SIZE)).mockResolvedValueOnce(rows(2));
     render(<Leaderboard contractId={CONTRACT} fetchPage={fetchPage} />);
     await screen.findByTestId('leaderboard-table');
 
@@ -177,9 +182,7 @@ describe('Leaderboard — pagination', () => {
     await waitFor(() => expect(fetchPage).toHaveBeenCalledTimes(3));
     // Paging back re-requests offset 0 rather than reusing cached rows.
     expect(fetchPage.mock.calls[2]).toEqual([PAGE_SIZE, 0]);
-    await waitFor(() =>
-      expect(screen.getAllByTestId('leaderboard-row')).toHaveLength(PAGE_SIZE),
-    );
+    await waitFor(() => expect(screen.getAllByTestId('leaderboard-row')).toHaveLength(PAGE_SIZE));
   });
 
   it('keeps the rows the contract returned, in the order it returned them', async () => {
@@ -213,10 +216,39 @@ describe('decodeEntries', () => {
     vi.mocked(scValToNative).mockReturnValue([
       {
         player: 'GAAA',
-        stats: { wins: 1n, losses: 0n, draws: 0n, earnings: 9007199254740993n, token: 'CTOK' },
+        stats: {
+          wins: 1n,
+          losses: 0n,
+          draws: 0n,
+          earnings_by_asset: [{ amount: 9007199254740993n, token: 'CTOK' }],
+        },
       },
     ] as never);
     const out = decodeEntries('anything');
-    expect(out[0].stats.earnings).toBe('9007199254740993');
+    expect(out[0].stats.earnings_by_asset[0].amount).toBe('9007199254740993');
+  });
+
+  it('preserves separate earnings amounts for each token', async () => {
+    const { scValToNative } = await import('@stellar/stellar-sdk');
+    vi.mocked(scValToNative).mockReturnValue([
+      {
+        player: 'GAAA',
+        stats: {
+          wins: 2n,
+          losses: 0n,
+          draws: 0n,
+          earnings_by_asset: [
+            { token: 'CTOK1', amount: 100n },
+            { token: 'CTOK2', amount: 250n },
+          ],
+        },
+      },
+    ] as never);
+
+    const rows = decodeEntries('anything');
+    expect(rows[0].stats.earnings_by_asset).toEqual([
+      { token: 'CTOK1', amount: '100' },
+      { token: 'CTOK2', amount: '250' },
+    ]);
   });
 });
