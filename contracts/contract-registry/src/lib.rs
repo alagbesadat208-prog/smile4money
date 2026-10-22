@@ -1,7 +1,9 @@
 #![no_std]
 
 use smile4money_common::constants::MATCH_TTL_LEDGERS;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -12,27 +14,30 @@ pub enum Error {
     ContractNotFound = 4,
     AlreadyRegistered = 5,
     Overflow = 6,
+    InvalidRange = 7,
 }
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    Admin = 0,
-    Paused = 1,
-    MaxEvents = 2,
+    Admin,
+    Paused,
+    MaxEvents,
     /// Counter of live registrations; kept in instance storage for pagination.
-    RegistrationCount = 3,
+    RegistrationCount,
     /// Per-contract registration record, stored in persistent storage under
     /// its own entry keyed by the contract's `Symbol`. This keeps reads O(1)
     /// and avoids deserializing (and eventually outgrowing) a single map.
-    Registration(Symbol) = 4,
-    Events = 5,
+    Registration(Symbol),
+    Events,
+    Names,
 }
 
 #[contracttype]
 #[derive(Clone)]
 pub struct ContractRecord {
     pub registrant: Address,
+    pub contract_address: Address,
     pub contract_id: Symbol,
     pub active: bool,
 }
@@ -40,9 +45,9 @@ pub struct ContractRecord {
 #[contract]
 pub struct ContractRegistry;
 
-/// TTL handling for per-registration persistent entries, mirroring how the
-/// escrow contract keeps match records alive.
-const REGISTRATION_TTL_LEDGERS: u32 = 100_000;
+/// Maximum number of names returned by one enumeration call.
+pub const MAX_PAGE_SIZE: u32 = 50;
+const REGISTRATION_TTL_LEDGERS: u32 = MATCH_TTL_LEDGERS;
 const REGISTRATION_TTL_BUMP: u32 = 50_000;
 
 /// Instance-storage TTL threshold (~30 days at 5 s/ledger).
@@ -65,10 +70,12 @@ impl ContractRegistry {
         env.storage()
             .instance()
             .set(&DataKey::MaxEvents, &max_events);
-        env.storage().instance().set(
-            &DataKey::Registrations,
-            &Map::<Symbol, ContractRecord>::new(&env),
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::RegistrationCount, &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::Names, &Vec::<Symbol>::new(&env));
         env.storage()
             .instance()
             .set(&DataKey::Events, &Vec::<Symbol>::new(&env));
@@ -113,42 +120,12 @@ impl ContractRegistry {
         Ok(())
     }
 
-    pub fn register_contract(env: Env, caller: Address, contract_id: Symbol) -> Result<(), Error> {
-        Self::ensure_not_paused(&env)?;
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        if admin != caller {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
-
-        let mut registrations: Map<Symbol, ContractRecord> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Registrations)
-            .unwrap();
-        if registrations.contains_key(contract_id.clone()) {
-            return Err(Error::AlreadyRegistered);
-        }
-
-        env.storage().persistent().set(
-            &key,
-            &ContractRecord {
-                registrant: caller.clone(),
-                contract_id: contract_id.clone(),
-                active: true,
-            },
-        );
-        env.storage()
-            .instance()
-            .set(&DataKey::Registrations, &registrations);
-        Ok(())
-    }
-
-    pub fn update_contract(env: Env, caller: Address, contract_id: Symbol) -> Result<(), Error> {
+    pub fn register_contract(
+        env: Env,
+        caller: Address,
+        contract_id: Symbol,
+        contract_address: Address,
+    ) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
         let admin: Address = env
             .storage()
@@ -161,12 +138,75 @@ impl ContractRegistry {
         caller.require_auth();
 
         let key = DataKey::Registration(contract_id.clone());
-        if !env.storage().persistent().has(&key) {
-            return Err(Error::ContractNotFound);
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyRegistered);
         }
+        let count = Self::registration_count(env.clone())
+            .checked_add(1)
+            .ok_or(Error::Overflow)?;
+        let mut names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Names)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut position = 0;
+        while position < names.len() && names.get(position).unwrap() < contract_id {
+            position += 1;
+        }
+        names.insert(position, contract_id.clone());
+        env.storage().instance().set(&DataKey::Names, &names);
         env.storage()
             .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+            .set(&DataKey::RegistrationCount, &count);
+        Self::store_registration(
+            &env,
+            &key,
+            &ContractRecord {
+                registrant: caller,
+                contract_id,
+                contract_address,
+                active: true,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn update_contract(
+        env: Env,
+        caller: Address,
+        contract_id: Symbol,
+        contract_address: Address,
+    ) -> Result<(), Error> {
+        Self::ensure_not_paused(&env)?;
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != caller {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+
+        let key = DataKey::Registration(contract_id.clone());
+        let mut record: ContractRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::ContractNotFound)?;
+        let prior_address = record.contract_address.clone();
+        record.contract_address = contract_address.clone();
+        Self::store_registration(&env, &key, &record);
+        env.events().publish(
+            (symbol_short!("registry"), symbol_short!("replaced"), 1u32),
+            (
+                contract_id,
+                prior_address,
+                contract_address,
+                caller,
+                env.ledger().sequence(),
+            ),
+        );
         Ok(())
     }
 
@@ -179,11 +219,8 @@ impl ContractRegistry {
         let key = DataKey::Registration(contract_id.clone());
         let record: ContractRecord = env
             .storage()
-            .instance()
-            .get(&DataKey::Registrations)
-            .unwrap_or_else(|| Map::new(&env));
-        let record = registrations
-            .get(contract_id.clone())
+            .persistent()
+            .get(&key)
             .ok_or(Error::ContractNotFound)?;
         let is_registrant = record.registrant == caller;
         if !is_registrant {
@@ -197,10 +234,23 @@ impl ContractRegistry {
             }
         }
         caller.require_auth();
-        registrations.remove(contract_id.clone());
+        let mut names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Names)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(position) = names.first_index_of(&contract_id) {
+            names.remove(position);
+        }
+        env.storage().persistent().remove(&key);
+        env.storage().instance().set(&DataKey::Names, &names);
+        env.storage().instance().set(
+            &DataKey::RegistrationCount,
+            &Self::registration_count(env.clone()).saturating_sub(1),
+        );
         env.storage()
             .instance()
-            .set(&DataKey::Registrations, &registrations);
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
 
@@ -220,10 +270,44 @@ impl ContractRegistry {
             .ok_or(Error::ContractNotFound)
     }
 
+    /// Names in ascending Symbol order. Read all pages at the same ledger
+    /// snapshot: insertions and removals can shift offsets between ledgers.
+    /// Zero limits are rejected; oversized limits are capped; exhausted pages are empty.
+    pub fn list_names(env: Env, offset: u32, limit: u32) -> Result<Vec<Symbol>, Error> {
+        if limit == 0 {
+            return Err(Error::InvalidRange);
+        }
+        let names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Names)
+            .unwrap_or_else(|| Vec::new(&env));
+        let end = core::cmp::min(names.len(), offset.saturating_add(limit.min(MAX_PAGE_SIZE)));
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(names.get(i).unwrap());
+        }
+        Ok(page)
+    }
+
+    fn store_registration(env: &Env, key: &DataKey, record: &ContractRecord) {
+        env.storage().persistent().set(key, record);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, REGISTRATION_TTL_BUMP, REGISTRATION_TTL_LEDGERS);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
     pub fn submit_event(env: Env, caller: Address, event_name: Symbol) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
         // Only the configured admin may submit registry events.
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::Unauthorized)?;
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
         if admin != caller {
             return Err(Error::Unauthorized);
         }

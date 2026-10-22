@@ -1,12 +1,27 @@
 #![cfg(test)]
 
+extern crate std;
 use super::*;
 use soroban_sdk::{testutils::Address as _, Env, FromVal, IntoVal, Symbol, Val, Vec};
+use std::format;
 
 /// Raw contract invocation, so tests can exercise the public read-only
 /// accessors that are not part of the generated client (they take `Env`).
-fn call_raw(env: &Env, contract_id: &Address, name: &str, args: Vec<Val>) -> Result<Val, soroban_sdk::Error> {
-    env.invoke_contract(contract_id, &Symbol::new(env, name), args)
+fn call_raw(
+    env: &Env,
+    contract_id: &Address,
+    name: &str,
+    args: Vec<Val>,
+) -> Result<Val, soroban_sdk::Error> {
+    match env.try_invoke_contract::<Val, soroban_sdk::Error>(
+        contract_id,
+        &Symbol::new(env, name),
+        args,
+    ) {
+        Ok(Ok(value)) => Ok(value),
+        Err(Ok(error)) => Err(error),
+        _ => panic!("unexpected invocation failure"),
+    }
 }
 
 // ============================================================================
@@ -100,7 +115,11 @@ fn test_pause_blocks_mutations() {
 
     // All mutating operations should fail
     assert!(matches!(
-        client.try_register_contract(&admin, &Symbol::new(&env, "blocked")),
+        client.try_register_contract(
+            &admin,
+            &Symbol::new(&env, "blocked"),
+            &Address::generate(&env)
+        ),
         Err(Ok(Error::ContractPaused))
     ));
     assert!(matches!(
@@ -108,7 +127,7 @@ fn test_pause_blocks_mutations() {
         Err(Ok(Error::ContractPaused))
     ));
     assert!(matches!(
-        client.try_update_contract(&admin, &Symbol::new(&env, "any")),
+        client.try_update_contract(&admin, &Symbol::new(&env, "any"), &Address::generate(&env)),
         Err(Ok(Error::ContractPaused))
     ));
     assert!(matches!(
@@ -143,7 +162,7 @@ fn test_unpause_resumes_mutations() {
 
     // Operations should now work
     let contract_symbol = Symbol::new(&env, "resumed");
-    let result = client.try_register_contract(&admin, &contract_symbol);
+    let result = client.try_register_contract(&admin, &contract_symbol, &Address::generate(&env));
     assert!(result.is_ok());
 }
 
@@ -174,7 +193,7 @@ fn test_register_contract_success() {
     let client = ContractRegistryClient::new(&env, &contract_id);
 
     let contract_symbol = Symbol::new(&env, "my_contract");
-    let result = client.try_register_contract(&admin, &contract_symbol);
+    let result = client.try_register_contract(&admin, &contract_symbol, &Address::generate(&env));
     assert!(result.is_ok());
 }
 
@@ -186,7 +205,11 @@ fn test_register_contract_requires_admin_auth() {
     let client = ContractRegistryClient::new(&env, &contract_id);
 
     assert!(matches!(
-        client.try_register_contract(&caller, &Symbol::new(&env, "demo")),
+        client.try_register_contract(
+            &caller,
+            &Symbol::new(&env, "demo"),
+            &Address::generate(&env)
+        ),
         Err(Ok(Error::Unauthorized))
     ));
 }
@@ -199,11 +222,11 @@ fn test_register_contract_duplicate_fails() {
     let client = ContractRegistryClient::new(&env, &contract_id);
 
     let contract_symbol = Symbol::new(&env, "duplicate");
-    client.register_contract(&admin, &contract_symbol);
+    client.register_contract(&admin, &contract_symbol, &Address::generate(&env));
 
     // Attempting to register the same contract again should fail
     assert!(matches!(
-        client.try_register_contract(&admin, &contract_symbol),
+        client.try_register_contract(&admin, &contract_symbol, &Address::generate(&env)),
         Err(Ok(Error::AlreadyRegistered))
     ));
 }
@@ -218,18 +241,12 @@ fn test_register_multiple_contracts() {
     // Register three contracts
     for i in 0..3 {
         let symbol = Symbol::new(&env, &format!("contract_{}", i));
-        let result = client.try_register_contract(&admin, &symbol);
+        let result = client.try_register_contract(&admin, &symbol, &Address::generate(&env));
         assert!(result.is_ok(), "Failed to register contract_{}", i);
     }
 
     // The instance counter tracks every live registration for pagination.
-    let count: Val = call_raw(
-        &env,
-        &contract_id,
-        "registration_count",
-        Vec::new(&env),
-    )
-    .unwrap();
+    let count: Val = call_raw(&env, &contract_id, "registration_count", Vec::new(&env)).unwrap();
     assert_eq!(u32::from_val(&env, &count), 3);
 }
 
@@ -242,8 +259,8 @@ fn test_get_registration_returns_record_without_touching_other_entries() {
 
     let sym1 = Symbol::new(&env, "alpha");
     let sym2 = Symbol::new(&env, "beta");
-    client.register_contract(&admin, &sym1);
-    client.register_contract(&admin, &sym2);
+    client.register_contract(&admin, &sym1, &Address::generate(&env));
+    client.register_contract(&admin, &sym2, &Address::generate(&env));
 
     // Reads one per-contract persistent entry; unknown symbols simply miss.
     assert!(call_raw(
@@ -272,18 +289,12 @@ fn test_deregister_decrements_registration_count() {
 
     let sym1 = Symbol::new(&env, "one");
     let sym2 = Symbol::new(&env, "two");
-    client.register_contract(&admin, &sym1);
-    client.register_contract(&admin, &sym2);
+    client.register_contract(&admin, &sym1, &Address::generate(&env));
+    client.register_contract(&admin, &sym2, &Address::generate(&env));
 
     client.deregister_contract(&admin, &sym1);
 
-    let count: Val = call_raw(
-        &env,
-        &contract_id,
-        "registration_count",
-        Vec::new(&env),
-    )
-    .unwrap();
+    let count: Val = call_raw(&env, &contract_id, "registration_count", Vec::new(&env)).unwrap();
     assert_eq!(u32::from_val(&env, &count), 1);
 
     // The removed entry is gone; the survivor still resolves.
@@ -312,7 +323,11 @@ fn test_register_contract_while_paused_fails() {
 
     client.pause(&admin);
     assert!(matches!(
-        client.try_register_contract(&admin, &Symbol::new(&env, "blocked")),
+        client.try_register_contract(
+            &admin,
+            &Symbol::new(&env, "blocked"),
+            &Address::generate(&env)
+        ),
         Err(Ok(Error::ContractPaused))
     ));
 }
@@ -329,10 +344,10 @@ fn test_update_contract_success() {
     let client = ContractRegistryClient::new(&env, &contract_id);
 
     let contract_symbol = Symbol::new(&env, "to_update");
-    client.register_contract(&admin, &contract_symbol);
+    client.register_contract(&admin, &contract_symbol, &Address::generate(&env));
 
     // Update should succeed
-    let result = client.try_update_contract(&admin, &contract_symbol);
+    let result = client.try_update_contract(&admin, &contract_symbol, &Address::generate(&env));
     assert!(result.is_ok());
 }
 
@@ -344,7 +359,11 @@ fn test_update_contract_requires_admin_auth() {
     let client = ContractRegistryClient::new(&env, &contract_id);
 
     assert!(matches!(
-        client.try_update_contract(&caller, &Symbol::new(&env, "demo")),
+        client.try_update_contract(
+            &caller,
+            &Symbol::new(&env, "demo"),
+            &Address::generate(&env)
+        ),
         Err(Ok(Error::Unauthorized))
     ));
 }
@@ -358,7 +377,11 @@ fn test_update_nonexistent_contract_fails() {
 
     // Attempt to update a contract that was never registered
     assert!(matches!(
-        client.try_update_contract(&admin, &Symbol::new(&env, "nonexistent")),
+        client.try_update_contract(
+            &admin,
+            &Symbol::new(&env, "nonexistent"),
+            &Address::generate(&env)
+        ),
         Err(Ok(Error::ContractNotFound))
     ));
 }
@@ -371,11 +394,11 @@ fn test_update_contract_while_paused_fails() {
     let client = ContractRegistryClient::new(&env, &contract_id);
 
     let symbol = Symbol::new(&env, "contract");
-    client.register_contract(&admin, &symbol);
+    client.register_contract(&admin, &symbol, &Address::generate(&env));
     client.pause(&admin);
 
     assert!(matches!(
-        client.try_update_contract(&admin, &symbol),
+        client.try_update_contract(&admin, &symbol, &Address::generate(&env)),
         Err(Ok(Error::ContractPaused))
     ));
 }
@@ -392,7 +415,7 @@ fn test_deregister_contract_by_admin() {
     let client = ContractRegistryClient::new(&env, &contract_id);
 
     let contract_symbol = Symbol::new(&env, "to_remove");
-    client.register_contract(&admin, &contract_symbol);
+    client.register_contract(&admin, &contract_symbol, &Address::generate(&env));
     let result = client.try_deregister_contract(&admin, &contract_symbol);
     assert!(result.is_ok());
 }
@@ -405,7 +428,7 @@ fn test_deregister_contract_allows_admin_or_registrant() {
     let client = ContractRegistryClient::new(&env, &contract_id);
     let contract_symbol = Symbol::new(&env, "demo");
 
-    client.register_contract(&admin, &contract_symbol);
+    client.register_contract(&admin, &contract_symbol, &Address::generate(&env));
     client.deregister_contract(&admin, &contract_symbol);
 }
 
@@ -430,7 +453,7 @@ fn test_deregister_contract_while_paused_fails() {
     let client = ContractRegistryClient::new(&env, &contract_id);
 
     let symbol = Symbol::new(&env, "contract");
-    client.register_contract(&admin, &symbol);
+    client.register_contract(&admin, &symbol, &Address::generate(&env));
     client.pause(&admin);
 
     assert!(matches!(
@@ -447,7 +470,7 @@ fn test_deregister_by_unauthorized_user_fails() {
     let client = ContractRegistryClient::new(&env, &contract_id);
 
     let symbol = Symbol::new(&env, "contract");
-    client.register_contract(&admin, &symbol);
+    client.register_contract(&admin, &symbol, &Address::generate(&env));
 
     // Attempt to deregister as a different user (not admin, not registrant)
     assert!(matches!(
@@ -549,7 +572,9 @@ fn test_non_admin_does_not_consume_event_capacity() {
     let client = ContractRegistryClient::new(&env, &contract_id);
 
     // Admin can submit one event
-    assert!(client.try_submit_event(&admin, &Symbol::new(&env, "one")) .is_ok());
+    assert!(client
+        .try_submit_event(&admin, &Symbol::new(&env, "one"))
+        .is_ok());
 
     // Non-admin attempts should be rejected and must not consume the cap
     assert!(matches!(
@@ -578,17 +603,21 @@ fn test_full_workflow_register_update_deregister() {
     let symbol = Symbol::new(&env, "workflow");
 
     // Register
-    assert!(client.try_register_contract(&admin, &symbol).is_ok());
+    assert!(client
+        .try_register_contract(&admin, &symbol, &Address::generate(&env))
+        .is_ok());
 
     // Update
-    assert!(client.try_update_contract(&admin, &symbol).is_ok());
+    assert!(client
+        .try_update_contract(&admin, &symbol, &Address::generate(&env))
+        .is_ok());
 
     // Deregister
     assert!(client.try_deregister_contract(&admin, &symbol).is_ok());
 
     // Verify it's gone
     assert!(matches!(
-        client.try_update_contract(&admin, &symbol),
+        client.try_update_contract(&admin, &symbol, &Address::generate(&env)),
         Err(Ok(Error::ContractNotFound))
     ));
 }
@@ -605,20 +634,24 @@ fn test_multiple_contracts_independent() {
     let sym3 = Symbol::new(&env, "contract_3");
 
     // Register all
-    client.register_contract(&admin, &sym1);
-    client.register_contract(&admin, &sym2);
-    client.register_contract(&admin, &sym3);
+    client.register_contract(&admin, &sym1, &Address::generate(&env));
+    client.register_contract(&admin, &sym2, &Address::generate(&env));
+    client.register_contract(&admin, &sym3, &Address::generate(&env));
 
     // Deregister only sym2
     assert!(client.try_deregister_contract(&admin, &sym2).is_ok());
 
     // sym1 and sym3 should still be queryable
-    assert!(client.try_update_contract(&admin, &sym1).is_ok());
-    assert!(client.try_update_contract(&admin, &sym3).is_ok());
+    assert!(client
+        .try_update_contract(&admin, &sym1, &Address::generate(&env))
+        .is_ok());
+    assert!(client
+        .try_update_contract(&admin, &sym3, &Address::generate(&env))
+        .is_ok());
 
     // sym2 should not be found
     assert!(matches!(
-        client.try_update_contract(&admin, &sym2),
+        client.try_update_contract(&admin, &sym2, &Address::generate(&env)),
         Err(Ok(Error::ContractNotFound))
     ));
 }
@@ -633,19 +666,25 @@ fn test_pause_unpause_cycle() {
     let symbol = Symbol::new(&env, "cycle_test");
 
     // Register before pause
-    client.register_contract(&admin, &symbol);
+    client.register_contract(&admin, &symbol, &Address::generate(&env));
 
     // Pause and verify blocked
     client.pause(&admin);
     assert!(matches!(
-        client.try_register_contract(&admin, &Symbol::new(&env, "blocked")),
+        client.try_register_contract(
+            &admin,
+            &Symbol::new(&env, "blocked"),
+            &Address::generate(&env)
+        ),
         Err(Ok(Error::ContractPaused))
     ));
 
     // Unpause and verify working again
     client.unpause(&admin);
     let symbol2 = Symbol::new(&env, "after_unpause");
-    assert!(client.try_register_contract(&admin, &symbol2).is_ok());
+    assert!(client
+        .try_register_contract(&admin, &symbol2, &Address::generate(&env))
+        .is_ok());
 }
 
 #[test]
@@ -666,4 +705,91 @@ fn test_event_cap_boundary() {
         client.try_submit_event(&admin, &Symbol::new(&env, "overflow")),
         Err(Ok(Error::MaxEventsReached))
     ));
+}
+
+#[test]
+fn replacement_resolves_new_address_and_emits_ordered_history() {
+    use soroban_sdk::testutils::{Events, Ledger};
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, outsider, id) = setup_with_max_events(&env, 0);
+    let client = ContractRegistryClient::new(&env, &id);
+    let name = Symbol::new(&env, "escrow");
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    let third = Address::generate(&env);
+    client.register_contract(&admin, &name, &first);
+    assert_eq!(client.get_registration(&name).contract_address, first);
+    assert_eq!(
+        client.try_update_contract(&outsider, &name, &second),
+        Err(Ok(Error::Unauthorized))
+    );
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    client.update_contract(&admin, &name, &second);
+    let mut events = env.events().all();
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 20);
+    client.update_contract(&admin, &name, &third);
+    events.append(&env.events().all());
+    let record = client.get_registration(&name);
+    assert_eq!(record.contract_address, third);
+    assert_eq!(record.contract_id, name);
+    assert_eq!(record.registrant, admin);
+    assert!(record.active);
+    assert_eq!(client.registration_count(), 1);
+    assert_eq!(
+        client.list_names(&0, &10),
+        soroban_sdk::vec![&env, name.clone()]
+    );
+    assert_eq!(events.len(), 2);
+    for (index, old, new, ledger) in [(0, first, second.clone(), 10u32), (1, second, third, 20u32)]
+    {
+        let (emitter, topics, data) = events.get(index).unwrap();
+        assert_eq!(emitter, id);
+        assert_eq!(
+            topics,
+            (symbol_short!("registry"), symbol_short!("replaced"), 1u32).into_val(&env)
+        );
+        let decoded: (Symbol, Address, Address, Address, u32) = FromVal::from_val(&env, &data);
+        assert_eq!(decoded, (name.clone(), old, new, admin.clone(), ledger));
+    }
+}
+
+#[test]
+fn enumeration_is_sorted_bounded_and_tracks_membership() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _, id) = setup(&env);
+    let client = ContractRegistryClient::new(&env, &id);
+    assert!(client.list_names(&0, &2).is_empty());
+    assert_eq!(client.try_list_names(&0, &0), Err(Ok(Error::InvalidRange)));
+    for name in ["charlie", "alpha", "bravo"] {
+        client.register_contract(&admin, &Symbol::new(&env, name), &Address::generate(&env));
+    }
+    let first = client.list_names(&0, &2);
+    assert_eq!(
+        first,
+        soroban_sdk::vec![&env, Symbol::new(&env, "alpha"), Symbol::new(&env, "bravo")]
+    );
+    assert_eq!(first, client.list_names(&0, &2));
+    assert_eq!(
+        client.list_names(&2, &2),
+        soroban_sdk::vec![&env, Symbol::new(&env, "charlie")]
+    );
+    assert!(client.list_names(&3, &2).is_empty());
+    assert!(client.list_names(&u32::MAX, &u32::MAX).is_empty());
+    client.deregister_contract(&admin, &Symbol::new(&env, "bravo"));
+    client.register_contract(
+        &admin,
+        &Symbol::new(&env, "bravo"),
+        &Address::generate(&env),
+    );
+    assert_eq!(client.list_names(&0, &2), first);
+    for i in 0..MAX_PAGE_SIZE {
+        client.register_contract(
+            &admin,
+            &Symbol::new(&env, &format!("name_{:02}", i)),
+            &Address::generate(&env),
+        );
+    }
+    assert_eq!(client.list_names(&0, &u32::MAX).len(), MAX_PAGE_SIZE);
 }
