@@ -88,9 +88,7 @@ impl PlayerStats {
 
     /// Total completed matches this player took part in.
     pub fn matches_played(&self) -> Option<u32> {
-        self.wins
-            .checked_add(self.losses)?
-            .checked_add(self.draws)
+        self.wins.checked_add(self.losses)?.checked_add(self.draws)
     }
 }
 

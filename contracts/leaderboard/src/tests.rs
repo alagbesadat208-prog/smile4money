@@ -33,11 +33,21 @@ fn setup() -> Fixture {
     let client = LeaderboardContractClient::new(&env, &id);
     client.initialize(&admin, &source);
 
-    Fixture { env, client, contract_id: id, admin, source, player1, player2, token }
+    Fixture {
+        env,
+        client,
+        contract_id: id,
+        admin,
+        source,
+        player1,
+        player2,
+        token,
+    }
 }
 
 fn record(f: &Fixture, outcome: MatchOutcome, payout: i128, p1: &Address, p2: &Address) {
-    f.client.record_result(p1, p2, &outcome, &payout, &f.token, &f.source);
+    f.client
+        .record_result(p1, p2, &outcome, &payout, &f.token, &f.source);
 }
 
 #[test]
@@ -353,7 +363,10 @@ fn result_recording_rejects_earnings_overflow() {
 fn result_recording_rejects_result_count_overflow() {
     let f = setup();
     f.env.as_contract(&f.contract_id, || {
-        f.env.storage().instance().set(&DataKey::ResultCount, &u32::MAX);
+        f.env
+            .storage()
+            .instance()
+            .set(&DataKey::ResultCount, &u32::MAX);
     });
 
     assert_eq!(
@@ -438,8 +451,22 @@ fn leaderboard_ties_break_on_earnings() {
     let poor = Address::generate(&f.env);
 
     // Same number of wins, different earnings.
-    f.client.record_result(&rich, &Address::generate(&f.env), &MatchOutcome::Player1Won, &500, &f.token, &f.source);
-    f.client.record_result(&poor, &Address::generate(&f.env), &MatchOutcome::Player1Won, &5, &f.token, &f.source);
+    f.client.record_result(
+        &rich,
+        &Address::generate(&f.env),
+        &MatchOutcome::Player1Won,
+        &500,
+        &f.token,
+        &f.source,
+    );
+    f.client.record_result(
+        &poor,
+        &Address::generate(&f.env),
+        &MatchOutcome::Player1Won,
+        &5,
+        &f.token,
+        &f.source,
+    );
 
     let board = f.client.get_leaderboard(&10, &0);
     assert_eq!(board.get(0).unwrap().player, rich);
@@ -453,8 +480,22 @@ fn leaderboard_order_is_stable_for_identical_records() {
     let f = setup();
     let a = Address::generate(&f.env);
     let b = Address::generate(&f.env);
-    f.client.record_result(&a, &Address::generate(&f.env), &MatchOutcome::Player1Won, &42, &f.token, &f.source);
-    f.client.record_result(&b, &Address::generate(&f.env), &MatchOutcome::Player1Won, &42, &f.token, &f.source);
+    f.client.record_result(
+        &a,
+        &Address::generate(&f.env),
+        &MatchOutcome::Player1Won,
+        &42,
+        &f.token,
+        &f.source,
+    );
+    f.client.record_result(
+        &b,
+        &Address::generate(&f.env),
+        &MatchOutcome::Player1Won,
+        &42,
+        &f.token,
+        &f.source,
+    );
 
     let first = f.client.get_leaderboard(&10, &0);
     let second = f.client.get_leaderboard(&10, &0);
@@ -506,7 +547,10 @@ fn leaderboard_last_page_is_short_rather_than_an_error() {
 #[test]
 fn leaderboard_rejects_zero_limit() {
     let f = setup();
-    assert_eq!(f.client.try_get_leaderboard(&0, &0), Err(Ok(Error::InvalidRange)));
+    assert_eq!(
+        f.client.try_get_leaderboard(&0, &0),
+        Err(Ok(Error::InvalidRange))
+    );
 }
 
 #[test]
@@ -514,7 +558,10 @@ fn leaderboard_rejects_offset_past_the_end() {
     let f = setup();
     give_wins(&f, &Address::generate(&f.env), 1);
     // One player exists, so offset 5 is past the end.
-    assert_eq!(f.client.try_get_leaderboard(&10, &5), Err(Ok(Error::InvalidRange)));
+    assert_eq!(
+        f.client.try_get_leaderboard(&10, &5),
+        Err(Ok(Error::InvalidRange))
+    );
 }
 
 #[test]
