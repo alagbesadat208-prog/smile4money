@@ -549,6 +549,18 @@ fn unknown_tournament_is_rejected() {
 }
 
 #[test]
+fn initialize_requires_admin_authorization() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let contract = env.register(TournamentBracket, ());
+    let client = TournamentBracketClient::new(&env, &contract);
+
+    assert!(client.try_initialize(&admin, &oracle, &token).is_err());
+}
+
+#[test]
 fn initialize_is_not_repeatable() {
     let f = Fixture::four_players();
     assert_eq!(
