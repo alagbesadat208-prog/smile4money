@@ -256,3 +256,47 @@ These items are not yet implemented and represent the next infrastructure work t
 | `environments.toml` | Network RPC URLs and passphrases |
 | `.env.example` | Template for environment variables |
 | `rust-toolchain.toml` | Pinned Rust toolchain |
+
+### SQLite production concurrency
+
+SQLite supports **one backend process in one replica**, with database files on a
+local persistent volume. Each connection uses WAL journal mode and a busy timeout
+of 5,000 ms; existing bounded lock retries remain enabled. Concurrent requests
+within that process are supported; SQLite serializes their writes. WAL permits
+readers alongside the single active writer. Do not place these files on a network
+filesystem or share them across containers/hosts.
+
+Set `SQLITE_CONCURRENCY_MODE=single-process` (the default), `BACKEND_REPLICAS=1`,
+and `WEB_CONCURRENCY=1`. Startup rejects another mode or a declared process/replica
+count other than one, for every SQLite store. Set `SQLITE_BUSY_TIMEOUT_MS` to an
+integer from 1 through 60,000 to change the per-connection wait. Deployment
+manifests must declare the real replica/worker counts: the service cannot discover
+undeclared replicas. This restriction covers matches, rate limits, queue, and
+circuit-breaker state, even if `QUEUE_STORE` uses another backend. Scaling requires
+migrating all local stores and coordinating workers first.
+
+### Oracle signer rotation
+
+Mount the current Stellar secret seed in a secret-manager-owned file and set
+`ORACLE_SIGNER_SECRET_FILE` to its path. Restrict file access to the service user.
+Set `STELLAR_RPC_URL` and `CONTRACT_ORACLE` for the deployed oracle. The service
+loads the seed at startup and before each submission attempt, then reads the
+contract's active `InstanceState.admin` from RPC and compares it to the public
+key. Missing, malformed, unauthorized keys or an unavailable role lookup fail
+closed before submission. A pending admin proposal is insufficient.
+
+Complete the contract's `propose_admin` / `accept_admin` transfer and atomically
+replace the mounted secret file with the new seed. Pause workers during the
+transfer if uninterrupted attempts matter; failures in the transition leave jobs
+queued. Restarting is unnecessary for a running worker to pick up the file.
+Jobs contain submission data only, never a seed or signer address; do not rewrite
+or discard pending jobs. The retry worker removes a job only after its handler
+succeeds and does not create a replacement job on failure.
+
+The transport prepares `submit_result` with Soroban RPC, signs with that attempt's
+validated key, and confirms the transaction before removing the job. On an
+ambiguous timeout the job stays queued; the next attempt queries `has_result`
+before submitting again. Set `STELLAR_NETWORK=testnet` (default) or `mainnet`, or
+provide `STELLAR_NETWORK_PASSPHRASE` explicitly for a custom network. The source
+account must be funded, and the deployed contract must use the current oracle
+`InstanceState` storage layout.

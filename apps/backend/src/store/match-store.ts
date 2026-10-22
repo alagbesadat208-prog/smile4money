@@ -85,6 +85,22 @@ export class MatchStore {
     return null;
   }
 
+  async unlinkIdentities(address: string): Promise<number> {
+    let count = 0;
+    for (const match of this.matches.values()) {
+      if (
+        (match.player1 === address || match.player2 === address) &&
+        (match.player1Username || match.player2Username || match.identityHash)
+      ) {
+        delete match.player1Username;
+        delete match.player2Username;
+        delete match.identityHash;
+        count++;
+      }
+    }
+    return count;
+  }
+
   async count(): Promise<number> {
     return this.matches.size;
   }

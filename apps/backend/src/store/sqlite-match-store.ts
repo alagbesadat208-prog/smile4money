@@ -1,3 +1,4 @@
+import { sqliteSettings, configureSqlite } from './sqlite-config.js';
 /**
  * SQLite-backed MatchStore
  *
@@ -37,12 +38,15 @@ export class SqliteMatchStore {
 
   private getDb(): sqlite3.Database {
     if (!this.db) {
-      throw new Error('SqliteMatchStore not initialized. Call initialize() first.');
+      throw new Error(
+        'SqliteMatchStore not initialized. Call initialize() first.',
+      );
     }
     return this.db;
   }
 
   async initialize(): Promise<void> {
+    sqliteSettings();
     // Ensure the data directory exists
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
@@ -56,8 +60,10 @@ export class SqliteMatchStore {
           return;
         }
 
-        this.db!.run(
-          `
+        configureSqlite(this.db!)
+          .then(() => {
+            this.db!.run(
+              `
           CREATE TABLE IF NOT EXISTS matches (
             matchId INTEGER PRIMARY KEY AUTOINCREMENT,
             player1 TEXT NOT NULL,
@@ -72,27 +78,29 @@ export class SqliteMatchStore {
             identityHash TEXT
           )
           `,
-          (err: Error | null) => {
-            if (err) {
-              reject(err);
-              return;
-            }
-
-            // Load nextId from the max existing matchId
-            this.db!.get(
-              'SELECT COALESCE(MAX(matchId), -1) + 1 AS nextId FROM matches',
-              (err: Error | null, row: any) => {
+              (err: Error | null) => {
                 if (err) {
                   reject(err);
                   return;
                 }
-                this.nextId = row?.nextId ?? 0;
-                this.initialized = true;
-                resolve();
+
+                // Load nextId from the max existing matchId
+                this.db!.get(
+                  'SELECT COALESCE(MAX(matchId), -1) + 1 AS nextId FROM matches',
+                  (err: Error | null, row: any) => {
+                    if (err) {
+                      reject(err);
+                      return;
+                    }
+                    this.nextId = row?.nextId ?? 0;
+                    this.initialized = true;
+                    resolve();
+                  },
+                );
               },
             );
-          },
-        );
+          })
+          .catch(reject);
       });
     });
   }
@@ -179,6 +187,21 @@ export class SqliteMatchStore {
             state: row.state,
             identityHash: row.identityHash ?? undefined,
           });
+        },
+      );
+    });
+  }
+
+  async unlinkIdentities(address: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      this.getDb().run(
+        `UPDATE matches SET player1Username = NULL, player2Username = NULL, identityHash = NULL
+         WHERE (player1 = ? OR player2 = ?) AND
+         (player1Username IS NOT NULL OR player2Username IS NOT NULL OR identityHash IS NOT NULL)`,
+        [address, address],
+        function (this: sqlite3.RunResult, err: Error | null) {
+          if (err) reject(err);
+          else resolve(this.changes);
         },
       );
     });

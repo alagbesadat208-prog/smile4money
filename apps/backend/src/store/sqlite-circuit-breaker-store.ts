@@ -1,3 +1,4 @@
+import { sqliteSettings, configureSqlite } from "./sqlite-config.js";
 /**
  * SQLite-backed persistence for the RPC circuit breaker (#1716).
  *
@@ -49,6 +50,7 @@ export class SqliteCircuitBreakerStore {
   }
 
   async initialize(): Promise<void> {
+    sqliteSettings();
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -60,6 +62,8 @@ export class SqliteCircuitBreakerStore {
         else resolve();
       });
     });
+
+    await configureSqlite(this.getDb());
 
     await withRetry<void>("circuit_breaker:initialize:walMode", (cb) =>
       this.getDb().run(`PRAGMA journal_mode=WAL`, (err: Error | null) => cb(err)),

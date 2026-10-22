@@ -1,3 +1,4 @@
+import { sqliteSettings, configureSqlite } from "./sqlite-config.js";
 /**
  * SQLite Persistent Queue Store
  *
@@ -45,7 +46,10 @@ function getMaxRetries(): number {
 }
 
 function getRetryBaseDelayMs(): number {
-  return readPositiveInt(process.env.SQLITE_RETRY_BASE_DELAY_MS, DEFAULT_BASE_DELAY_MS);
+  return readPositiveInt(
+    process.env.SQLITE_RETRY_BASE_DELAY_MS,
+    DEFAULT_BASE_DELAY_MS,
+  );
 }
 
 export interface SqliteError extends Error {
@@ -134,69 +138,20 @@ export class SQLiteQueueStore implements PersistentQueueStore {
   }
 
   async initialize(): Promise<void> {
+    sqliteSettings();
     // Ensure the data directory exists
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.db = new sqlite3.Database(this.dbPath, (err: Error | null) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-
-        // WAL allows readers to continue while writes are in progress.
-        this.db!.run(`PRAGMA journal_mode=WAL`, (err: Error | null) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-
-          // Create table if not exists
-          this.db!.run(
-            `
-          CREATE TABLE IF NOT EXISTS oracle_dlq (
-            id TEXT PRIMARY KEY NOT NULL,
-            payload TEXT NOT NULL,
-            failureReason TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            createdAt INTEGER NOT NULL,
-            lastAttemptAt INTEGER,
-            expireAt INTEGER NOT NULL,
-            CONSTRAINT expireAt_check CHECK (expireAt > 0)
-          )
-            `,
-            (err: Error | null) => {
-              if (err) {
-                reject(err);
-                return;
-              }
-
-              // Create index for efficient queries and TTL cleanup
-              this.db!.run(
-                `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_expireAt ON oracle_dlq(expireAt)`,
-                (err: Error | null) => {
-                  if (err) {
-                    reject(err);
-                    return;
-                  }
-
-                  this.initialized = true;
-                  resolve();
-                },
-              );
-            },
-          );
-        });
+        if (err) reject(err);
+        else resolve();
       });
     });
-
-    // WAL allows readers to continue while writes are in progress.
-    await withRetry<void>("initialize:walMode", (cb) =>
-      this.getDb().run(`PRAGMA journal_mode=WAL`, (err: Error | null) => cb(err)),
-    );
+    await configureSqlite(this.getDb());
 
     await withRetry<void>("initialize:createTable", (cb) =>
       this.getDb().run(
@@ -251,12 +206,17 @@ export class SQLiteQueueStore implements PersistentQueueStore {
   async getAll(): Promise<DlqEntry[]> {
     // Delete expired entries first.
     await withRetry<void>("getAll:deleteExpired", (cb) =>
-      this.getDb().run(`DELETE FROM oracle_dlq WHERE expireAt < ?`, [Date.now()], (err: Error | null) => cb(err)),
+      this.getDb().run(
+        `DELETE FROM oracle_dlq WHERE expireAt < ?`,
+        [Date.now()],
+        (err: Error | null) => cb(err),
+      ),
     );
 
     const rows = await withRetry<any[]>("getAll:select", (cb) =>
-      this.getDb().all(`SELECT * FROM oracle_dlq ORDER BY createdAt ASC`, (err: Error | null, result: any[]) =>
-        cb(err, result),
+      this.getDb().all(
+        `SELECT * FROM oracle_dlq ORDER BY createdAt ASC`,
+        (err: Error | null, result: any[]) => cb(err, result),
       ),
     );
 
@@ -272,7 +232,11 @@ export class SQLiteQueueStore implements PersistentQueueStore {
 
   async remove(id: string): Promise<void> {
     await withRetry<void>("remove", (cb) =>
-      this.getDb().run(`DELETE FROM oracle_dlq WHERE id = ?`, [id], (err: Error | null) => cb(err)),
+      this.getDb().run(
+        `DELETE FROM oracle_dlq WHERE id = ?`,
+        [id],
+        (err: Error | null) => cb(err),
+      ),
     );
   }
 
@@ -296,8 +260,10 @@ export class SQLiteQueueStore implements PersistentQueueStore {
     values.push(id);
 
     await withRetry<void>("update", (cb) =>
-      this.getDb().run(`UPDATE oracle_dlq SET ${setClauses.join(", ")} WHERE id = ?`, values, (err: Error | null) =>
-        cb(err),
+      this.getDb().run(
+        `UPDATE oracle_dlq SET ${setClauses.join(", ")} WHERE id = ?`,
+        values,
+        (err: Error | null) => cb(err),
       ),
     );
   }
@@ -315,7 +281,9 @@ export class SQLiteQueueStore implements PersistentQueueStore {
 
   async clear(): Promise<void> {
     await withRetry<void>("clear", (cb) =>
-      this.getDb().run(`DELETE FROM oracle_dlq`, (err: Error | null) => cb(err)),
+      this.getDb().run(`DELETE FROM oracle_dlq`, (err: Error | null) =>
+        cb(err),
+      ),
     );
   }
 

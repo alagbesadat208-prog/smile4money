@@ -1,3 +1,4 @@
+import { sqliteSettings, configureSqlite } from "./sqlite-config.js";
 /**
  * SQLite-backed rate limiter counters (#1723).
  *
@@ -46,6 +47,7 @@ export class SqliteRateLimitStore implements RateLimitBackend {
   }
 
   async initialize(): Promise<void> {
+    sqliteSettings();
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -60,6 +62,8 @@ export class SqliteRateLimitStore implements RateLimitBackend {
 
     // WAL so readers (getRemainingTokens) never block writers (isAllowed)
     // across instances sharing this file.
+    await configureSqlite(this.getDb());
+
     await withRetry<void>('rate_limit:initialize:walMode', (cb) =>
       this.getDb().run('PRAGMA journal_mode=WAL', (err: Error | null) => cb(err)),
     );

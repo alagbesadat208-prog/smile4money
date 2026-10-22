@@ -97,7 +97,7 @@ describe('withRetry (#52)', () => {
     expect(retryLogs).toHaveLength(2);
     for (const entry of retryLogs) {
       expect(entry.sqlite_error_code).toBe('SQLITE_BUSY');
-      expect(typeof entry.sqlite_error_message).toBe('string');
+      expect(entry.sqlite_error_message).toBeUndefined();
     }
   });
 

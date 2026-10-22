@@ -23,15 +23,7 @@ import type {
 
 export type { DlqEntry };
 
-// Simple structured logger (avoids circular dependency on logger.ts)
-const logger = {
-  info: (context: object, message: string) =>
-    console.log(JSON.stringify({ level: "info", message, ...context })),
-  warn: (context: object, message: string) =>
-    console.warn(JSON.stringify({ level: "warn", message, ...context })),
-  error: (context: object, message: string) =>
-    console.error(JSON.stringify({ level: "error", message, ...context })),
-};
+import logger from "./logger.js";
 
 let queueStore: PersistentQueueStore | null = null;
 

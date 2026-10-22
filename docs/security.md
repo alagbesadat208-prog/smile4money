@@ -369,3 +369,52 @@ The oracle service validates all required environment variables at startup and e
 ## Reporting Vulnerabilities
 
 Open a GitHub issue with the label `security`. For critical vulnerabilities, contact the maintainers directly before public disclosure.
+
+### API log privacy policy
+
+All application and queue logs pass through `src/logger.ts`. Only approved static
+event messages (`src/log-events.ts`) are emitted; arbitrary messages become
+`log_event`. The structured context allowlist is `safeLogContext`: finite numeric
+operational counters/timings/status and enumerated HTTP methods, platforms,
+store/circuit states, SQLite contention codes, and the queue-depth metric.
+Unknown context fields are omitted; invalid values in approved fields are masked
+as `[REDACTED]`. Context cannot override timestamp, level, service, or event.
+
+At every log level, including debug, do not emit request/response bodies, headers,
+URLs, paths, queries, wallet addresses, usernames, game/match IDs, proofs,
+provider tokens, raw errors, stacks, or nested objects. Errors can contain provider
+responses and credentials, so their text is not an approved diagnostic field.
+Use approved event names and counters to diagnose failures. Add fields or events
+only after reviewing their privacy implications; do not interpolate user data.
+
+### Linked chess identity retention and deletion
+
+Platform usernames and their identity-binding hash are retained in off-chain match
+records to verify the correct players before accepting a result. The service does
+not collect or persist separate identity proofs or provider credentials in these
+records. Linkage is retained while linked (no automatic time expiry); users may
+request deletion at any time. Do not use linkage for analytics or profiling.
+
+An authenticated user can call `DELETE /api/matches/identities` with their usual
+wallet JWT. No wallet parameter is accepted: the verified token identifies the
+requester. The operation is idempotent and returns 204. It clears both usernames
+and the identity-binding hash from every off-chain match involving that wallet;
+the pair is removed together because the binding describes both participants.
+It leaves other wallets' matches unchanged. Future verification of those matches
+fails closed for missing identities. Unlinking pending matches can therefore
+prevent settlement until the normal dispute/timeout process resolves them.
+Creating a new match can create a new linkage.
+
+Deletion preserves match IDs, game IDs, wallet addresses, stake, token, and state
+needed for settlement; it never edits immutable contract results or on-chain
+transactions. Public game IDs and on-chain wallet activity may still permit
+external re-identification. Unlinking cannot erase public chess-platform data or
+blockchain history; this API must not promise that outcome.
+
+The API performs logical deletion in the live database immediately. SQLite pages,
+WAL files, snapshots, and backups may retain earlier bytes. Operators must restrict
+backup access, expire backups within 30 days, and reapply deletion requests before
+restoring a backup into service. Erase retired volumes through the storage
+provider's deletion procedure. Do not retain exported linkage records or identity
+payloads in logs. The 30-day backup limit is an operational policy, not a database
+TTL or a claim of forensic erasure by the unlink endpoint.
