@@ -178,8 +178,8 @@ pub enum Error {
     /// (`Completed` or `Cancelled`) before calling `emergency_drain`.
     ActiveMatchExists = 33,
 
-    /// [E028] `override_result` was called after the dispute window expired.
-    DisputeWindowExpired = 28,
+    /// [E034] `override_result` was called after the dispute window expired.
+    DisputeWindowExpired = 34,
 }
 
 /// Convert a [`SharedError`] into an escrow [`Error`].

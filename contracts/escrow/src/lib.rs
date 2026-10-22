@@ -66,22 +66,15 @@ mod types;
 pub use constants::*;
 
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, symbol_short, token, vec, Address, Env, String, Symbol, TryFromVal, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, vec, Address, Env, String, Symbol, Vec};
 
-/// Topic symbol for the event emitted when the contract is paused.
-const CONTRACT_PAUSED: Symbol = symbol_short!("paused");
-/// Topic symbol for the event emitted when the contract is unpaused.
-const CONTRACT_UNPAUSED: Symbol = symbol_short!("unpaused");
 use types::{DataKey, Match, MatchState, OptionalWinner, Platform, Winner};
 
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
-    // The all-zeros Stellar account key encodes to this strkey.
-    // We construct the Address via the ScAddress XDR path since
-    // TryFromVal<Env, String> is not implemented for Address.
-    use soroban_sdk::xdr::{AccountId, PublicKey, ScAddress, Uint256};
-    let zero_key = Uint256([0u8; 32]);
-    let sc_addr = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(zero_key)));
-    let zero_address = Address::try_from_val(env, &sc_addr).expect("invalid zero address");
+    let zero_address = Address::from_string(&String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
     addr == &zero_address
 }
 
@@ -110,48 +103,6 @@ pub struct EscrowContract;
 #[allow(missing_docs)]
 #[contractimpl]
 impl EscrowContract {
-    /// Pause the contract, blocking state-changing operations.
-    ///
-    /// Only the admin may call this. Emits a `ContractPaused` event carrying the
-    /// admin address and the current ledger sequence number so the action can be
-    /// detected and audited on-chain.
-    pub fn pause(env: Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &true);
-        Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (CONTRACT_PAUSED, admin.clone()),
-            env.ledger().sequence(),
-        );
-        Ok(())
-    }
-
-    /// Unpause the contract, re-enabling state-changing operations.
-    ///
-    /// Only the admin may call this. Emits a `ContractUnpaused` event carrying the
-    /// admin address and the current ledger sequence number so the action can be
-    /// detected and audited on-chain.
-    pub fn unpause(env: Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &false);
-        Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (CONTRACT_UNPAUSED, admin.clone()),
-            env.ledger().sequence(),
-        );
-        Ok(())
-    }
-
     /// Return whether the contract is currently paused.
     pub fn is_paused(env: &Env) -> bool {
         env.storage()
@@ -407,7 +358,7 @@ impl EscrowContract {
             .get(&DataKey::Admin)
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
-        if Self::is_paused(env.clone()) {
+        if Self::is_paused(&env) {
             return Ok(());
         }
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -427,7 +378,7 @@ impl EscrowContract {
             .get(&DataKey::Admin)
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
-        if !Self::is_paused(env.clone()) {
+        if !Self::is_paused(&env) {
             return Ok(());
         }
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -554,7 +505,7 @@ impl EscrowContract {
             id,
             player1,
             player2,
-            stake_amount,
+            stake_amount: stake_amount as u128,
             token,
             game_id,
             platform,
@@ -636,13 +587,14 @@ impl EscrowContract {
             return Err(Error::AlreadyFunded);
         }
 
+        let stake_amount = i128::try_from(m.stake_amount).map_err(|_| Error::InvalidAmount)?;
         let client = token::Client::new(&env, &m.token);
         let allowance = client.allowance(&player, &env.current_contract_address());
-        if allowance < m.stake_amount {
+        if allowance < stake_amount {
             return Err(Error::InsufficientAllowance);
         }
         client
-            .try_transfer(&player, &env.current_contract_address(), &m.stake_amount)
+            .try_transfer(&player, &env.current_contract_address(), &stake_amount)
             .map_err(|_| Error::TransferFailed)?
             .map_err(|_| Error::TransferFailed)?;
 
@@ -655,17 +607,17 @@ impl EscrowContract {
         // Check if exactly one player has now deposited (half-funded state)
         let one_deposited = (m.player1_deposited as u8) + (m.player2_deposited as u8) == 1;
 
+        let player_label = if is_p1 {
+            symbol_short!("player1")
+        } else {
+            symbol_short!("player2")
+        };
         if one_deposited {
             // STATE TRANSITION: Pending → Half-Funded (one player deposited)
             // Emit event to signal this observability milestone
-            let player_label = if is_p1 {
-                symbol_short!("player1")
-            } else {
-                symbol_short!("player2")
-            };
             env.events().publish(
                 (Symbol::new(&env, "match"), symbol_short!("half_fun")),
-                (match_id, player_label, m.stake_amount),
+                (match_id, player_label.clone(), m.stake_amount),
             );
         }
 
@@ -923,11 +875,12 @@ impl EscrowContract {
             OptionalWinner::None => return Err(Error::InvalidState),
         };
 
+        let stake_amount = i128::try_from(m.stake_amount).map_err(|_| Error::InvalidAmount)?;
         let client = token::Client::new(&env, &m.token);
 
         let payout_amount: i128 = match &winner {
-            Winner::Draw => m.stake_amount,
-            _ => m.stake_amount * 2,
+            Winner::Draw => stake_amount,
+            _ => stake_amount * 2,
         };
 
         let total_payout = match &winner {
@@ -1018,12 +971,13 @@ impl EscrowContract {
             return Err(Error::MatchTimedOut);
         }
 
+        let stake_amount = i128::try_from(m.stake_amount).map_err(|_| Error::InvalidAmount)?;
         let client = token::Client::new(&env, &m.token);
-        let refund_total = m.stake_amount * 2;
+        let refund_total = stake_amount * 2;
         Self::ensure_reserve_for_payout(&env, &m.token, refund_total)?;
         // Refund both players their original stake
-        client.transfer(&env.current_contract_address(), &m.player1, &m.stake_amount);
-        client.transfer(&env.current_contract_address(), &m.player2, &m.stake_amount);
+        client.transfer(&env.current_contract_address(), &m.player1, &stake_amount);
+        client.transfer(&env.current_contract_address(), &m.player2, &stake_amount);
 
         // STATE TRANSITION: Active → Cancelled (via timeout)
         m.state = MatchState::Cancelled;
@@ -1092,22 +1046,23 @@ impl EscrowContract {
             caller.require_auth();
         }
 
+        let stake_amount = i128::try_from(m.stake_amount).map_err(|_| Error::InvalidAmount)?;
         let client = token::Client::new(&env, &m.token);
-        let player1_refund: i128 = if m.player1_deposited { m.stake_amount } else { 0 };
-        let player2_refund: i128 = if m.player2_deposited { m.stake_amount } else { 0 };
+        let player1_refund: i128 = if m.player1_deposited { stake_amount } else { 0 };
+        let player2_refund: i128 = if m.player2_deposited { stake_amount } else { 0 };
         let refund_total = player1_refund + player2_refund;
         if refund_total > 0 {
             Self::ensure_reserve_for_payout(&env, &m.token, refund_total)?;
         }
         if m.player1_deposited {
             client
-                .try_transfer(&env.current_contract_address(), &m.player1, &m.stake_amount)
+                .try_transfer(&env.current_contract_address(), &m.player1, &stake_amount)
                 .map_err(|_| Error::TransferFailed)?
                 .map_err(|_| Error::TransferFailed)?;
         }
         if m.player2_deposited {
             client
-                .try_transfer(&env.current_contract_address(), &m.player2, &m.stake_amount)
+                .try_transfer(&env.current_contract_address(), &m.player2, &stake_amount)
                 .map_err(|_| Error::TransferFailed)?
                 .map_err(|_| Error::TransferFailed)?;
         }
