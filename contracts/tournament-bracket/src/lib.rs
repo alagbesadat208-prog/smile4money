@@ -138,6 +138,49 @@ impl TournamentBracket {
         Ok(t.funded_count)
     }
 
+    /// Renew a completed or cancelled tournament's permanent records.
+    ///
+    /// Anyone may pay to extend the instance, tournament and all bracket nodes
+    /// to `MATCH_TTL_LEDGERS`. At most `MAX_PLAYERS - 1` nodes are visited; no
+    /// other tournament is scanned. Only TTL metadata changes: settlement facts,
+    /// token balances and events are untouched, including on repeated calls.
+    ///
+    /// Records are never deleted by this contract. After network archival,
+    /// restore the required entries before invoking this operation. Ordinary
+    /// views do not renew TTLs. See the contract README for the retention policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TournamentNotFound` for an unknown ID, `InvalidState` for a live
+    /// tournament, or `NodeNotFound` if a required bracket record is missing.
+    pub fn extend_record_ttl(env: Env, tournament_id: u64) -> Result<(), Error> {
+        let t = Self::load_tournament(&env, tournament_id)?;
+        if t.state != TournamentState::Completed && t.state != TournamentState::Cancelled {
+            return Err(Error::InvalidState);
+        }
+
+        // Validate the full footprint before extending any entry. Never rebuild
+        // absent records from guesses about winners or refunded participants.
+        let mut keys = Vec::new(&env);
+        for round in 0..t.rounds {
+            for index in 0..Self::node_count(t.player_count, round) {
+                let key = DataKey::Node(tournament_id, round, index);
+                if !env.storage().persistent().has(&key) {
+                    return Err(Error::NodeNotFound);
+                }
+                keys.push_back(key);
+            }
+        }
+        keys.push_back(DataKey::Tournament(tournament_id));
+        for key in keys {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        }
+        Self::bump_instance_ttl(&env);
+        Ok(())
+    }
+
     // ---------------------------- lifecycle ----------------------------
 
     /// Initialize the contract.

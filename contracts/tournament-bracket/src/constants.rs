@@ -62,8 +62,8 @@ pub const INSTANCE_LIFETIME_THRESHOLD: u32 = MATCH_TTL_LEDGERS;
 /// Number of ledgers instance-storage entries are extended to.
 ///
 /// **Source:** the same 30-day window as [`INSTANCE_LIFETIME_THRESHOLD`], so the
-/// instance counter and the persistent tournament records it points at always
-/// expire together.
+/// instance counter can be renewed for the same duration as persistent records.
+/// Each entry still has an independent TTL based on its last extension.
 pub const INSTANCE_BUMP_AMOUNT: u32 = MATCH_TTL_LEDGERS;
 
 /// Reserve buffer (in stroops) the contract must always retain, so that a payout

@@ -1,8 +1,13 @@
 extern crate std;
 
+use std::format;
+
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Ledger as _,
+    },
     token::{Client as TokenClient, StellarAssetClient},
     vec, Address, Env, String, Vec,
 };
@@ -12,6 +17,13 @@ const FEE: i128 = 100;
 
 /// Balances before any fees are paid, so expected deltas are easy to read.
 const STARTING_BALANCE: i128 = 10_000;
+
+fn test_env() -> Env {
+    // Assertions inspect values directly; snapshot files are not used.
+    Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    })
+}
 
 /// A deployed bracket plus the addresses and token needed to drive it.
 struct Fixture<'a> {
@@ -27,13 +39,19 @@ struct Fixture<'a> {
 
 impl<'a> Fixture<'a> {
     fn with_field(player_count: usize) -> Self {
-        let env = Env::default();
+        let env = test_env();
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
         let token_id = env.register_stellar_asset_contract_v2(admin.clone());
         let token = token_id.address();
+        // Time-travel tests need the external token instance to stay live too.
+        env.as_contract(&token, || {
+            env.storage()
+                .instance()
+                .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        });
 
         let contract = env.register(TournamentBracket, ());
         let client = TournamentBracketClient::new(&env, &contract);
@@ -73,7 +91,7 @@ impl<'a> Fixture<'a> {
     }
 
     fn balance(&self, who: &Address) -> i128 {
-        asset(&self.env, &self.token).balance(who)
+        TokenClient::new(&self.env, &self.token).balance(who)
     }
 
     fn seed(&self, i: u32) -> Address {
@@ -90,8 +108,184 @@ impl<'a> Fixture<'a> {
     }
 }
 
-fn asset(env: &Env, token: &Address) -> StellarAssetClient {
+fn asset<'a>(env: &'a Env, token: &Address) -> StellarAssetClient<'a> {
     StellarAssetClient::new(env, token)
+}
+
+// Retention changes rent metadata, never the permanent settlement records.
+fn assert_retention_preserves_settlement(f: &Fixture, id: u64) {
+    let tournament = f.client.get_tournament(&id);
+    let before = f.env.as_contract(&f.contract, || {
+        (
+            f.env.storage().persistent().all(),
+            f.env.storage().instance().all(),
+        )
+    });
+    let balances: std::vec::Vec<_> = f.players.iter().map(|p| f.balance(&p)).collect();
+    let reserve = f.balance(&f.contract);
+    f.env
+        .ledger()
+        .set_sequence_number(f.env.ledger().sequence() + 100);
+    // No mock authorization: any transaction payer can maintain the records.
+    f.env.mock_auths(&[]);
+    for _ in 0..2 {
+        f.client.extend_record_ttl(&id);
+        assert!(f.env.auths().is_empty());
+        assert_eq!(f.client.get_tournament(&id), tournament);
+        f.env.as_contract(&f.contract, || {
+            assert_eq!(f.env.storage().persistent().all(), before.0);
+            assert_eq!(f.env.storage().instance().all(), before.1);
+            assert!(f.env.storage().instance().get_ttl() >= MATCH_TTL_LEDGERS);
+            assert!(
+                f.env
+                    .storage()
+                    .persistent()
+                    .get_ttl(&DataKey::Tournament(id))
+                    >= MATCH_TTL_LEDGERS
+            );
+            for round in 0..tournament.rounds {
+                for index in 0..(tournament.player_count >> (round + 1)) {
+                    assert!(
+                        f.env
+                            .storage()
+                            .persistent()
+                            .get_ttl(&DataKey::Node(id, round, index))
+                            >= MATCH_TTL_LEDGERS
+                    );
+                }
+            }
+        });
+        assert_eq!(f.balance(&f.contract), reserve);
+        assert_eq!(
+            f.players
+                .iter()
+                .map(|p| f.balance(&p))
+                .collect::<std::vec::Vec<_>>(),
+            balances
+        );
+    }
+}
+
+#[test]
+fn retention_preserves_champion_payout_and_all_match_facts() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    f.client
+        .submit_match_result(&id, &0, &1, &game_id(&f.env, 2), &f.seed(1));
+    f.client
+        .submit_match_result(&id, &1, &0, &game_id(&f.env, 3), &f.seed(0));
+    let tournament = f.client.get_tournament(&id);
+    assert_retention_preserves_settlement(&f, id);
+    // Renewed records remain queryable beyond their original live-until ledger.
+    f.env
+        .ledger()
+        .set_sequence_number(tournament.completed_ledger.unwrap() + MATCH_TTL_LEDGERS + 1);
+    assert_eq!(f.client.get_tournament(&id), tournament);
+    assert_eq!(f.client.get_champion(&id), f.seed(0));
+    assert_eq!(f.client.get_node(&id, &0, &0).winner, Some(f.seed(0)));
+    assert_eq!(f.client.get_node(&id, &1, &0).winner, Some(f.seed(0)));
+    f.env.mock_all_auths();
+    assert_eq!(
+        f.client.try_claim_timeout(&id, &f.seed(0)),
+        Err(Ok(Error::TournamentFinished))
+    );
+    assert_eq!(
+        f.client
+            .try_submit_match_result(&id, &1, &0, &game_id(&f.env, 4), &f.seed(1)),
+        Err(Ok(Error::TournamentFinished))
+    );
+}
+
+#[test]
+fn retention_preserves_partial_refund_and_other_tournaments() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.deposit(&id, &f.seed(0));
+    f.client.cancel_tournament(&id);
+    let other = f.client.create_tournament(&FEE, &f.players);
+    let other_ttl = f.env.as_contract(&f.contract, || {
+        f.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Tournament(other))
+    });
+    assert_retention_preserves_settlement(&f, id);
+    assert_eq!(f.balance(&f.seed(0)), STARTING_BALANCE);
+    assert_eq!(f.client.get_tournament(&id).funded_count, 0);
+    f.env.as_contract(&f.contract, || {
+        assert_eq!(
+            f.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Tournament(other)),
+            other_ttl - 100
+        );
+    });
+}
+
+#[test]
+fn retention_preserves_timeout_refunds() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    f.env.ledger().set_sequence_number(TIMEOUT_LEDGERS + 1);
+    f.client.claim_timeout(&id, &f.seed(0));
+    assert_retention_preserves_settlement(&f, id);
+}
+
+#[test]
+fn retention_rejects_unknown_and_unsettled_records() {
+    let f = Fixture::with_field(2);
+    assert_eq!(
+        f.client.try_extend_record_ttl(&0),
+        Err(Ok(Error::TournamentNotFound))
+    );
+    let id = f.client.create_tournament(&FEE, &f.players);
+    assert_eq!(
+        f.client.try_extend_record_ttl(&id),
+        Err(Ok(Error::InvalidState))
+    );
+    for player in f.players.iter() {
+        f.client.deposit(&id, &player);
+    }
+    assert_eq!(
+        f.client.try_extend_record_ttl(&id),
+        Err(Ok(Error::InvalidState))
+    );
+}
+
+#[test]
+fn retention_covers_all_63_nodes_of_the_largest_bracket() {
+    let f = Fixture::with_field(MAX_PLAYERS as usize);
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.cancel_tournament(&id);
+    assert_retention_preserves_settlement(&f, id);
+}
+
+#[test]
+fn retention_never_recreates_missing_records() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.cancel_tournament(&id);
+    f.env.as_contract(&f.contract, || {
+        f.env
+            .storage()
+            .persistent()
+            .remove(&DataKey::Node(id, 0, 0))
+    });
+    let before = f
+        .env
+        .as_contract(&f.contract, || f.env.storage().persistent().all());
+    assert_eq!(
+        f.client.try_extend_record_ttl(&id),
+        Err(Ok(Error::NodeNotFound))
+    );
+    f.env.as_contract(&f.contract, || {
+        assert_eq!(f.env.storage().persistent().all(), before)
+    });
 }
 
 fn game_id(env: &Env, n: u32) -> String {
@@ -318,7 +512,7 @@ fn field_size_bounds_are_enforced() {
     );
     f.client.get_node(&id, &0, &31);
 
-    let env = Env::default();
+    let env = test_env();
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(admin.clone());
@@ -358,7 +552,7 @@ fn single_player_field_is_rejected() {
 
 #[test]
 fn duplicate_entrants_are_rejected() {
-    let env = Env::default();
+    let env = test_env();
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(admin.clone());
@@ -367,7 +561,13 @@ fn duplicate_entrants_are_rejected() {
     client.initialize(&admin, &admin, &token_id.address());
 
     let dup = Address::generate(&env);
-    let players = vec![&env, dup.clone(), dup.clone(), Address::generate(&env)];
+    let players = vec![
+        &env,
+        dup.clone(),
+        dup.clone(),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
     assert_eq!(
         client.try_create_tournament(&FEE, &players),
         Err(Ok(Error::DuplicatePlayer))
@@ -376,7 +576,7 @@ fn duplicate_entrants_are_rejected() {
 
 #[test]
 fn zero_address_entrant_is_rejected() {
-    let env = Env::default();
+    let env = test_env();
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(admin.clone());
