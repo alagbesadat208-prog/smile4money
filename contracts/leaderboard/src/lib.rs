@@ -69,7 +69,9 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::ResultCount, &0u32);
-        env.storage().instance().set(&DataKey::Sources(source.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::Sources(source.clone()), &true);
 
         env.events().publish(
             (Symbol::new(&env, "admin"), symbol_short!("init")),
@@ -102,7 +104,11 @@ impl LeaderboardContract {
     pub fn remove_source(env: Env, source: Address, caller: Address) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
 
-        if !env.storage().instance().has(&DataKey::Sources(source.clone())) {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Sources(source.clone()))
+        {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().remove(&DataKey::Sources(source));
@@ -136,7 +142,10 @@ impl LeaderboardContract {
 
     /// Return whether result recording is paused.
     pub fn is_paused(env: &Env) -> bool {
-        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Record the outcome of one completed match.
@@ -164,7 +173,11 @@ impl LeaderboardContract {
         token: Address,
         caller: Address,
     ) -> Result<(), Error> {
-        if !env.storage().instance().has(&DataKey::Sources(caller.clone())) {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Sources(caller.clone()))
+        {
             return Err(Error::Unauthorized);
         }
         if Self::is_paused(&env) {
@@ -198,7 +211,8 @@ impl LeaderboardContract {
                 while asset_index < w_stats.earnings_by_asset.len() {
                     let mut earnings = w_stats.earnings_by_asset.get(asset_index).unwrap();
                     if earnings.token == token {
-                        earnings.amount = earnings.amount.checked_add(payout).ok_or(Error::Overflow)?;
+                        earnings.amount =
+                            earnings.amount.checked_add(payout).ok_or(Error::Overflow)?;
                         w_stats.earnings_by_asset.set(asset_index, earnings);
                         asset_found = true;
                         break;
@@ -233,7 +247,11 @@ impl LeaderboardContract {
         Self::add_to_roster(&env, &player1);
         Self::add_to_roster(&env, &player2);
 
-        let count: u32 = env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ResultCount)
+            .unwrap_or(0);
         env.storage()
             .instance()
             .set(&DataKey::ResultCount, &count.saturating_add(1));
@@ -252,7 +270,10 @@ impl LeaderboardContract {
 
     /// Return how many results have been recorded.
     pub fn result_count(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::ResultCount)
+            .unwrap_or(0)
     }
 
     /// Read the admin address — used by off-chain tooling to build a
@@ -433,10 +454,7 @@ impl LeaderboardContract {
     /// players with identical records have no defined relative order, and
     /// `get_leaderboard` paging would show the same row twice across page
     /// boundaries and silently skip another.
-    fn ranks_after(
-        a: &(Address, PlayerStats),
-        b: &(Address, PlayerStats),
-    ) -> bool {
+    fn ranks_after(a: &(Address, PlayerStats), b: &(Address, PlayerStats)) -> bool {
         if a.1.wins != b.1.wins {
             return a.1.wins < b.1.wins;
         }
