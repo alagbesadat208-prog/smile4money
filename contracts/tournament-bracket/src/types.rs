@@ -28,12 +28,12 @@ pub enum TournamentState {
     /// Every entrant has paid, so the first round is under way.
     InProgress,
 
-    /// The final has been decided and the prize pool has been paid to the
-    /// champion. **Terminal.**
+    /// The final has been decided and the prize is allocated to the champion.
+    /// Claims may remain outstanding. **Terminal for bracket progression.**
     Completed,
 
     /// The tournament was abandoned before a champion emerged. Every funded
-    /// entrant has been refunded. **Terminal.**
+    /// entrant may claim their refund. **Terminal for bracket progression.**
     Cancelled,
 }
 
@@ -80,7 +80,7 @@ pub struct Tournament {
     /// The fee each entrant pays, in the smallest unit of [`token`](Tournament::token).
     ///
     /// The total prize pool is `entry_fee × player_count`. It is paid to the
-    /// champion in one transfer when the final is decided — no per-match payouts
+    /// champion in one claim after the final is decided — no per-match payouts
     /// happen during the tournament, because paying each match's winner
     /// `2 × entry_fee` would drain the whole pot in the first round.
     pub entry_fee: i128,
@@ -95,7 +95,8 @@ pub struct Tournament {
 
     /// How many entrants have paid their entry fee so far. Reaches
     /// `player_count` when the tournament moves to
-    /// [`InProgress`](TournamentState::InProgress).
+    /// [`InProgress`](TournamentState::InProgress). After cancellation, counts
+    /// funded entrants whose refund has not yet been claimed.
     pub funded_count: u32,
 
     /// The current lifecycle state. See [`TournamentState`].
@@ -189,4 +190,20 @@ pub enum DataKey {
 
     /// The SEP-41 token address configured at `initialize` time.
     Token,
+
+    /// Allocation totals and resumable claim progress.
+    Settlement(u64),
+}
+
+/// Allocation created exactly once when a tournament becomes terminal. The
+/// claimed bitmap shares this record's lifetime: no individual claim marker can
+/// expire while funds remain claimable. Refund bit 2*i is node i's first player;
+/// bit 2*i+1 is its second player (round zero).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Settlement {
+    pub total: i128,
+    pub remaining: i128,
+    pub unclaimed: u32,
+    pub claimed: u64,
 }

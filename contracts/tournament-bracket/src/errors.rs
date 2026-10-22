@@ -38,6 +38,9 @@ pub use smile4money_common::SharedError;
 /// | 36   | TournamentInProgress  | At least one match has been decided                           |
 /// | 37   | TournamentFinished    | Tournament is completed or cancelled                          |
 /// | 38   | TimeoutNotReached     | `TIMEOUT_LEDGERS` have not yet elapsed                        |
+/// | 39 | SettlementNotFound | No deferred allocation exists (including legacy paid records) |
+/// | 40 | NothingToClaim | Entrant has no funded entitlement |
+/// | 41 | AlreadyClaimed | This entitlement has already been paid |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -111,6 +114,12 @@ pub enum Error {
 
     /// [E038] `TIMEOUT_LEDGERS` have not elapsed since the tournament was created.
     TimeoutNotReached = 38,
+    /// No allocation exists, including already-paid legacy records.
+    SettlementNotFound = 39,
+    /// The entrant did not fund the tournament or has no allocation.
+    NothingToClaim = 40,
+    /// This allocation has already been paid.
+    AlreadyClaimed = 41,
 }
 
 /// Convert a [`SharedError`] into a tournament [`Error`].
