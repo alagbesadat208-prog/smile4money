@@ -192,22 +192,22 @@ impl LeaderboardContract {
         match (winner, loser) {
             (Some(w), Some(l)) => {
                 let mut w_stats = Self::load_stats(&env, w);
-                w_stats.wins += 1;
-                w_stats.earnings += payout;
+                w_stats.wins = w_stats.wins.checked_add(1).ok_or(Error::Overflow)?;
+                w_stats.earnings = w_stats.earnings.checked_add(payout).ok_or(Error::Overflow)?;
                 w_stats.token = token.clone();
                 Self::store_stats(&env, w, &w_stats);
 
                 let mut l_stats = Self::load_stats(&env, l);
-                l_stats.losses += 1;
+                l_stats.losses = l_stats.losses.checked_add(1).ok_or(Error::Overflow)?;
                 Self::store_stats(&env, l, &l_stats);
             }
             _ => {
                 let mut p1 = Self::load_stats(&env, &player1);
-                p1.draws += 1;
+                p1.draws = p1.draws.checked_add(1).ok_or(Error::Overflow)?;
                 Self::store_stats(&env, &player1, &p1);
 
                 let mut p2 = Self::load_stats(&env, &player2);
-                p2.draws += 1;
+                p2.draws = p2.draws.checked_add(1).ok_or(Error::Overflow)?;
                 Self::store_stats(&env, &player2, &p2);
             }
         }
@@ -218,9 +218,8 @@ impl LeaderboardContract {
         Self::add_to_roster(&env, &player2);
 
         let count: u32 = env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::ResultCount, &count.saturating_add(1));
+        let next_count = count.checked_add(1).ok_or(Error::Overflow)?;
+        env.storage().instance().set(&DataKey::ResultCount, &next_count);
 
         env.events().publish(
             (Symbol::new(&env, "result"), symbol_short!("recorded")),
@@ -307,7 +306,7 @@ impl LeaderboardContract {
         while idx < roster_len {
             let player = roster.get(idx).unwrap();
             let stats = Self::load_stats(&env, &player);
-            if stats.matches_played() > 0 {
+            if stats.matches_played().ok_or(Error::Overflow)? > 0 {
                 ranked.push_back((player, stats));
             }
             idx += 1;
@@ -403,7 +402,7 @@ impl LeaderboardContract {
         let len = roster.len();
         let mut i = 0u32;
         while i < len {
-            if roster.get(i) == *player {
+            if roster.get(i).unwrap() == *player {
                 return;
             }
             i += 1;
