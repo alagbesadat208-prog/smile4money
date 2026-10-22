@@ -1,5 +1,13 @@
-import { useEffect, useState } from 'react';
-import { Account, Networks, Operation, TransactionBuilder, nativeToScVal, rpc, scValToNative } from '@stellar/stellar-sdk';
+import { Fragment, useEffect, useState } from 'react';
+import {
+  Account,
+  Networks,
+  Operation,
+  TransactionBuilder,
+  nativeToScVal,
+  rpc,
+  scValToNative,
+} from '@stellar/stellar-sdk';
 
 /**
  * Leaderboard page â€” issue #124 / #1803.
@@ -41,12 +49,22 @@ export interface LeaderboardEntry {
   stats: LeaderboardStats;
 }
 
+export interface AssetBreakdownEntry {
+  token: string;
+  wins: number;
+  losses: number;
+  draws: number;
+  earnings: string;
+}
+
 interface LeaderboardProps {
   contractId: string;
   rpcUrl?: string;
   networkPassphrase?: string;
   /** Injectable for tests; defaults to a real Soroban RPC simulation. */
   fetchPage?: (limit: number, offset: number) => Promise<LeaderboardEntry[]>;
+  /** Injectable for tests; defaults to a read of get_asset_breakdown. */
+  fetchAssets?: (player: string) => Promise<AssetBreakdownEntry[]>;
 }
 
 type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
@@ -121,6 +139,46 @@ export async function fetchLeaderboardPage(
   return decodeEntries(sim.result.retval);
 }
 
+export function decodeAssetBreakdown(retval: unknown): AssetBreakdownEntry[] {
+  const raw = scValToNative(retval as never) as unknown;
+  if (!Array.isArray(raw))
+    throw new Error('Unexpected response from LeaderboardContract.get_asset_breakdown');
+  return raw.map((value) => {
+    const row = value as Record<string, unknown>;
+    return {
+      token: String(row.token ?? ''),
+      wins: Number(row.wins ?? 0),
+      losses: Number(row.losses ?? 0),
+      draws: Number(row.draws ?? 0),
+      earnings: String(row.earnings ?? '0'),
+    };
+  });
+}
+
+export async function fetchPlayerAssets(
+  contractId: string,
+  player: string,
+  rpcUrl: string,
+  networkPassphrase: string,
+): Promise<AssetBreakdownEntry[]> {
+  const server = new rpc.Server(rpcUrl);
+  const tx = new TransactionBuilder(new Account(contractId, '0'), { fee: '100', networkPassphrase })
+    .addOperation(
+      Operation.invokeContractFunction({
+        contract: contractId,
+        function: 'get_asset_breakdown',
+        args: [nativeToScVal(player, { type: 'address' })],
+      }),
+    )
+    .setTimeout(30)
+    .build();
+  const sim = await server.simulateTransaction(tx);
+  if ('error' in sim) throw new Error(`Could not load asset breakdown: ${sim.error}`);
+  if (!sim.result?.retval)
+    throw new Error('Could not load asset breakdown: the RPC server returned no result');
+  return decodeAssetBreakdown(sim.result.retval);
+}
+
 /** Shorten an address for display, e.g. `GABCâ€¦WXYZ`. */
 function shortAddress(address: string): string {
   return address.length > 12 ? `${address.slice(0, 4)}â€¦${address.slice(-4)}` : address;
@@ -140,6 +198,7 @@ export function Leaderboard({
   rpcUrl = DEFAULT_RPC_URL,
   networkPassphrase = Networks.TESTNET,
   fetchPage,
+  fetchAssets,
 }: LeaderboardProps) {
   const [page, setPage] = useState(0);
   // Results and errors are stored together with the request that produced
@@ -148,6 +207,9 @@ export function Leaderboard({
   // page-2 heading.
   const [loaded, setLoaded] = useState<{ key: string; rows: LeaderboardEntry[] } | null>(null);
   const [failed, setFailed] = useState<{ key: string; message: string } | null>(null);
+  const [assetPlayer, setAssetPlayer] = useState<string | null>(null);
+  const [assetRows, setAssetRows] = useState<AssetBreakdownEntry[] | null>(null);
+  const [assetError, setAssetError] = useState<string | null>(null);
 
   const offset = page * PAGE_SIZE;
   const requestKey = `${contractId}|${rpcUrl}|${networkPassphrase}|${offset}`;
@@ -201,6 +263,24 @@ export function Leaderboard({
   // inviting a click that would come back as an InvalidRange error.
   const isLastPage = entries.length < PAGE_SIZE;
 
+  async function toggleAssets(player: string) {
+    if (assetPlayer === player) {
+      setAssetPlayer(null);
+      return;
+    }
+    setAssetPlayer(player);
+    setAssetRows(null);
+    setAssetError(null);
+    try {
+      const rows = fetchAssets
+        ? await fetchAssets(player)
+        : await fetchPlayerAssets(contractId, player, rpcUrl, networkPassphrase);
+      setAssetRows(rows);
+    } catch (err) {
+      setAssetError(err instanceof Error ? err.message : 'Could not load asset breakdown');
+    }
+  }
+
   return (
     <section className="leaderboard" data-testid="leaderboard">
       <h2 className="leaderboard-title">Leaderboard</h2>
@@ -242,26 +322,72 @@ export function Leaderboard({
               </thead>
               <tbody>
                 {entries.map((entry, index) => (
-                  <tr key={entry.player} data-testid="leaderboard-row">
-                    <td>{page * PAGE_SIZE + index + 1}</td>
-                    <td>
-                      <span className="address" title={entry.player}>
-                        {shortAddress(entry.player)}
-                      </span>
-                    </td>
-                    <td>{entry.stats.wins}</td>
-                    <td>{entry.stats.losses}</td>
-                    <td>{entry.stats.draws}</td>
-                    <td>
-                      {formatAmount(entry.stats.earnings)}
-                      {entry.stats.token && (
-                        <span className="address-small">
-                          {' '}
-                          {shortAddress(entry.stats.token)}
+                  <Fragment key={entry.player}>
+                    <tr key={entry.player} data-testid="leaderboard-row">
+                      <td>{page * PAGE_SIZE + index + 1}</td>
+                      <td>
+                        <span className="address" title={entry.player}>
+                          {shortAddress(entry.player)}
                         </span>
-                      )}
-                    </td>
-                  </tr>
+                        <button
+                          type="button"
+                          onClick={() => void toggleAssets(entry.player)}
+                          aria-expanded={assetPlayer === entry.player}
+                        >
+                          {assetPlayer === entry.player ? 'Hide assets' : 'Asset details'}
+                        </button>
+                      </td>
+                      <td>{entry.stats.wins}</td>
+                      <td>{entry.stats.losses}</td>
+                      <td>{entry.stats.draws}</td>
+                      <td>
+                        {formatAmount(entry.stats.earnings)}
+                        {entry.stats.token && (
+                          <span className="address-small"> {shortAddress(entry.stats.token)}</span>
+                        )}
+                      </td>
+                    </tr>
+                    {assetPlayer === entry.player && (
+                      <tr key={`${entry.player}-assets`} data-testid="leaderboard-assets">
+                        <td colSpan={6}>
+                          {assetError ? (
+                            <p role="alert">{assetError}</p>
+                          ) : assetRows === null ? (
+                            <p>Loading asset breakdown…</p>
+                          ) : assetRows.length === 0 ? (
+                            <p>No recorded asset results.</p>
+                          ) : (
+                            <table>
+                              <caption>
+                                Asset breakdown for {shortAddress(entry.player)}; earnings are in
+                                each token’s smallest unit.
+                              </caption>
+                              <thead>
+                                <tr>
+                                  <th>Token</th>
+                                  <th>W</th>
+                                  <th>L</th>
+                                  <th>D</th>
+                                  <th>Earnings</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {assetRows.map((asset) => (
+                                  <tr key={asset.token}>
+                                    <td title={asset.token}>{shortAddress(asset.token)}</td>
+                                    <td>{asset.wins}</td>
+                                    <td>{asset.losses}</td>
+                                    <td>{asset.draws}</td>
+                                    <td>{formatAmount(asset.earnings)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>

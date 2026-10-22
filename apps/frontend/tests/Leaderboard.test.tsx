@@ -15,9 +15,15 @@ vi.mock('@stellar/stellar-sdk', () => ({
   Networks: { TESTNET: 'Test SDF Network ; September 2015' },
   Operation: { invokeContractFunction: vi.fn() },
   TransactionBuilder: class {
-    addOperation() { return this; }
-    setTimeout() { return this; }
-    build() { return {}; }
+    addOperation() {
+      return this;
+    }
+    setTimeout() {
+      return this;
+    }
+    build() {
+      return {};
+    }
   },
   nativeToScVal: vi.fn(),
   rpc: { Server: vi.fn() },
@@ -72,6 +78,25 @@ describe('Leaderboard â€” rendering', () => {
     render(<Leaderboard contractId={CONTRACT} fetchPage={vi.fn().mockResolvedValue([])} />);
     expect(await screen.findByTestId('leaderboard-empty')).toBeInTheDocument();
     expect(screen.queryByTestId('leaderboard-table')).not.toBeInTheDocument();
+  });
+
+  it('lets a player open the per-token settlement breakdown', async () => {
+    const user = userEvent.setup();
+    const fetchAssets = vi.fn().mockResolvedValue([
+      { token: 'CTOKENONE', wins: 2, losses: 1, draws: 0, earnings: '2500' },
+      { token: 'CTOKENTWO', wins: 0, losses: 0, draws: 1, earnings: '0' },
+    ]);
+    render(
+      <Leaderboard
+        contractId={CONTRACT}
+        fetchPage={vi.fn().mockResolvedValue([entry('GPLAYER', 2, '2500')])}
+        fetchAssets={fetchAssets}
+      />,
+    );
+    await user.click(await screen.findByRole('button', { name: 'Asset details' }));
+    expect(await screen.findByTestId('leaderboard-assets')).toHaveTextContent('CTOKENONE');
+    expect(screen.getByTestId('leaderboard-assets')).toHaveTextContent('CTOKENTWO');
+    expect(fetchAssets).toHaveBeenCalledWith('GPLAYER');
   });
 
   it('surfaces a fetch failure as an alert', async () => {
@@ -130,10 +155,7 @@ describe('Leaderboard — pagination', () => {
 
   it('requests the next page with an offset', async () => {
     // A full page first, then a short one, so Next stays enabled after page 1.
-    const fetchPage = vi
-      .fn()
-      .mockResolvedValueOnce(rows(PAGE_SIZE))
-      .mockResolvedValueOnce(rows(3));
+    const fetchPage = vi.fn().mockResolvedValueOnce(rows(PAGE_SIZE)).mockResolvedValueOnce(rows(3));
     render(<Leaderboard contractId={CONTRACT} fetchPage={fetchPage} />);
     await screen.findByTestId('leaderboard-table');
 
@@ -146,10 +168,7 @@ describe('Leaderboard — pagination', () => {
   });
 
   it('numbers rows continuously across pages', async () => {
-    const fetchPage = vi
-      .fn()
-      .mockResolvedValueOnce(rows(PAGE_SIZE))
-      .mockResolvedValueOnce(rows(2))
+    const fetchPage = vi.fn().mockResolvedValueOnce(rows(PAGE_SIZE)).mockResolvedValueOnce(rows(2));
     render(<Leaderboard contractId={CONTRACT} fetchPage={fetchPage} />);
     await screen.findByTestId('leaderboard-table');
 
@@ -177,9 +196,7 @@ describe('Leaderboard — pagination', () => {
     await waitFor(() => expect(fetchPage).toHaveBeenCalledTimes(3));
     // Paging back re-requests offset 0 rather than reusing cached rows.
     expect(fetchPage.mock.calls[2]).toEqual([PAGE_SIZE, 0]);
-    await waitFor(() =>
-      expect(screen.getAllByTestId('leaderboard-row')).toHaveLength(PAGE_SIZE),
-    );
+    await waitFor(() => expect(screen.getAllByTestId('leaderboard-row')).toHaveLength(PAGE_SIZE));
   });
 
   it('keeps the rows the contract returned, in the order it returned them', async () => {

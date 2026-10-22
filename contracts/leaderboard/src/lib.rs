@@ -69,7 +69,9 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::ResultCount, &0u32);
-        env.storage().instance().set(&DataKey::Sources(source.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::Sources(source.clone()), &true);
 
         env.events().publish(
             (Symbol::new(&env, "admin"), symbol_short!("init")),
@@ -102,13 +104,17 @@ impl LeaderboardContract {
     pub fn remove_source(env: Env, source: Address, caller: Address) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
 
-        if !env.storage().instance().has(&DataKey::Sources(source.clone())) {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Sources(source.clone()))
+        {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().remove(&DataKey::Sources(source));
         env.events().publish(
             (Symbol::new(&env, "admin"), symbol_short!("src_del")),
-            (caller),
+            caller,
         );
         Ok(())
     }
@@ -136,7 +142,10 @@ impl LeaderboardContract {
 
     /// Return whether result recording is paused.
     pub fn is_paused(env: Env) -> bool {
-        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Record the outcome of one completed match.
@@ -155,6 +164,7 @@ impl LeaderboardContract {
     /// * [`Error::Unauthorized`] — caller is not a registered data source.
     /// * [`Error::ContractPaused`] — recording is paused.
     /// * [`Error::InvalidResult`] — `player1 == player2`.
+    /// * [`Error::CollectionLimitReached`] — a player's token asset limit is full.
     pub fn record_result(
         env: Env,
         player1: Address,
@@ -164,10 +174,14 @@ impl LeaderboardContract {
         token: Address,
         caller: Address,
     ) -> Result<(), Error> {
-        if !env.storage().instance().has(&DataKey::Sources(caller.clone())) {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Sources(caller.clone()))
+        {
             return Err(Error::Unauthorized);
         }
-        if Self::is_paused(&env) {
+        if Self::is_paused(env.clone()) {
             return Err(Error::ContractPaused);
         }
         // A self-match would credit a player a win and a loss at once, and
@@ -179,6 +193,12 @@ impl LeaderboardContract {
             return Err(Error::InvalidResult);
         }
         caller.require_auth();
+
+        // Check capacity for both players before changing any state. Soroban
+        // also rolls a failed invocation back, but preflight keeps this helper
+        // safe if its storage work is later reused.
+        Self::ensure_asset_capacity(&env, &player1, &token)?;
+        Self::ensure_asset_capacity(&env, &player2, &token)?;
 
         // `MatchOutcome` is not `Copy`, so the outcome is matched once to decide
         // which side is credited, rather than compared and matched separately.
@@ -212,12 +232,19 @@ impl LeaderboardContract {
             }
         }
 
+        Self::update_asset(&env, &player1, &token, &outcome, payout, &player1);
+        Self::update_asset(&env, &player2, &token, &outcome, payout, &player1);
+
         // Both sides are added unconditionally: even a player who only ever
         // loses or draws needs a roster entry to be ranked.
         Self::add_to_roster(&env, &player1);
         Self::add_to_roster(&env, &player2);
 
-        let count: u32 = env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ResultCount)
+            .unwrap_or(0);
         env.storage()
             .instance()
             .set(&DataKey::ResultCount, &count.saturating_add(1));
@@ -229,6 +256,102 @@ impl LeaderboardContract {
         Ok(())
     }
 
+    /// Record a result in lifetime totals and the explicitly identified season.
+    /// Season identifiers are caller-defined and immutable once written.
+    pub fn record_season_result(
+        env: Env,
+        season_id: u32,
+        player1: Address,
+        player2: Address,
+        outcome: MatchOutcome,
+        payout: i128,
+        token: Address,
+        caller: Address,
+    ) -> Result<(), Error> {
+        Self::ensure_season_capacity(&env, &player1, season_id)?;
+        Self::ensure_season_capacity(&env, &player2, season_id)?;
+        Self::record_result(
+            env.clone(),
+            player1.clone(),
+            player2.clone(),
+            outcome.clone(),
+            payout,
+            token.clone(),
+            caller,
+        )?;
+
+        for (player, won, lost, drawn) in [
+            (
+                player1.clone(),
+                matches!(&outcome, MatchOutcome::Player1Won),
+                matches!(&outcome, MatchOutcome::Player2Won),
+                matches!(&outcome, MatchOutcome::Draw),
+            ),
+            (
+                player2.clone(),
+                matches!(&outcome, MatchOutcome::Player2Won),
+                matches!(&outcome, MatchOutcome::Player1Won),
+                matches!(&outcome, MatchOutcome::Draw),
+            ),
+        ] {
+            let key = DataKey::SeasonStats(player.clone(), season_id);
+            let mut stats: PlayerStats = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| PlayerStats::empty(&token));
+            if won {
+                stats.wins += 1;
+                stats.earnings += payout;
+                stats.token = token.clone();
+            }
+            if lost {
+                stats.losses += 1;
+            }
+            if drawn {
+                stats.draws += 1;
+            }
+            env.storage().persistent().set(&key, &stats);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, STATS_TTL_LEDGERS, STATS_TTL_LEDGERS);
+            Self::add_to_season_roster(&env, season_id, &player);
+            Self::add_season_id(&env, &player, season_id);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "season"), symbol_short!("recorded")),
+            (season_id, player1, player2, outcome, payout, token),
+        );
+        Ok(())
+    }
+
+    /// Read one player's totals for a season, or a zeroed record if unseen.
+    pub fn get_season_stats(env: Env, player: Address, season_id: u32) -> PlayerStats {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SeasonStats(player.clone(), season_id))
+            .unwrap_or_else(|| PlayerStats::empty(&player))
+    }
+
+    /// Return the bounded per-token lifetime breakdown. Earnings use each
+    /// token's smallest unit and must only be compared within the same token.
+    pub fn get_asset_breakdown(env: Env, player: Address) -> Vec<AssetStats> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Assets(player))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return a page of one season's leaderboard.
+    pub fn get_season_leaderboard(
+        env: Env,
+        season_id: u32,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<LeaderboardEntry>, Error> {
+        Self::get_ranked_roster(&env, season_id, limit, offset)
+    }
+
     /// Read one player's record. Returns zeros for a player never seen.
     pub fn get_stats(env: Env, player: Address) -> PlayerStats {
         Self::load_stats(&env, &player)
@@ -236,7 +359,10 @@ impl LeaderboardContract {
 
     /// Return how many results have been recorded.
     pub fn result_count(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::ResultCount)
+            .unwrap_or(0)
     }
 
     /// Read the admin address — used by off-chain tooling to build a
@@ -305,7 +431,7 @@ impl LeaderboardContract {
         let roster_len = roster.len();
         let mut idx = 0u32;
         while idx < roster_len {
-            let player = roster.get(idx);
+            let player = roster.get(idx).unwrap();
             let stats = Self::load_stats(&env, &player);
             if stats.matches_played() > 0 {
                 ranked.push_back((player, stats));
@@ -326,9 +452,14 @@ impl LeaderboardContract {
         let len = ranked.len();
         for i in 1..len {
             let mut j = i;
-            while j > 0 && Self::ranks_after(&ranked.get(j - 1), &ranked.get(j)) {
-                let prev = ranked.get(j - 1);
-                let cur = ranked.get(j);
+            while j > 0
+                && Self::ranks_after(
+                    ranked.get(j - 1).as_ref().unwrap(),
+                    ranked.get(j).as_ref().unwrap(),
+                )
+            {
+                let prev = ranked.get(j - 1).unwrap();
+                let cur = ranked.get(j).unwrap();
                 ranked.set(j, prev);
                 ranked.set(j - 1, cur);
                 j -= 1;
@@ -339,11 +470,66 @@ impl LeaderboardContract {
             return Err(Error::InvalidRange);
         }
 
-        let end = core::cmp::min(ranked.len(), offset.saturating_add(limit) as usize);
+        let end = core::cmp::min(ranked.len(), offset.saturating_add(limit));
         let mut out: Vec<LeaderboardEntry> = Vec::new(&env);
-        let mut i = offset as usize;
+        let mut i = offset;
         while i < end {
-            let (player, stats) = ranked.get(i);
+            let (player, stats) = ranked.get(i).unwrap();
+            out.push_back(LeaderboardEntry { player, stats });
+            i += 1;
+        }
+        Ok(out)
+    }
+
+    fn get_ranked_roster(
+        env: &Env,
+        season_id: u32,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<LeaderboardEntry>, Error> {
+        if limit == 0 {
+            return Err(Error::InvalidRange);
+        }
+        let limit = core::cmp::min(limit, MAX_PAGE_SIZE);
+        let roster: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SeasonRoster(season_id))
+            .unwrap_or_else(|| Vec::new(env));
+        let mut ranked: Vec<(Address, PlayerStats)> = Vec::new(env);
+        for player in roster.iter() {
+            let stats: PlayerStats = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SeasonStats(player.clone(), season_id))
+                .unwrap_or_else(|| PlayerStats::empty(&player));
+            if stats.matches_played() > 0 {
+                ranked.push_back((player, stats));
+            }
+        }
+        for i in 1..ranked.len() {
+            let mut j = i;
+            while j > 0
+                && Self::ranks_after(
+                    ranked.get(j - 1).as_ref().unwrap(),
+                    ranked.get(j).as_ref().unwrap(),
+                )
+            {
+                let prev = ranked.get(j - 1).unwrap();
+                let cur = ranked.get(j).unwrap();
+                ranked.set(j, prev);
+                ranked.set(j - 1, cur);
+                j -= 1;
+            }
+        }
+        if offset > 0 && offset as u64 >= ranked.len() as u64 {
+            return Err(Error::InvalidRange);
+        }
+        let end = core::cmp::min(ranked.len(), offset.saturating_add(limit));
+        let mut out = Vec::new(env);
+        let mut i = offset;
+        while i < end {
+            let (player, stats) = ranked.get(i).unwrap();
             out.push_back(LeaderboardEntry { player, stats });
             i += 1;
         }
@@ -384,6 +570,115 @@ impl LeaderboardContract {
         );
     }
 
+    fn ensure_asset_capacity(env: &Env, player: &Address, token: &Address) -> Result<(), Error> {
+        let assets: Vec<AssetStats> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Assets(player.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if assets.iter().any(|a| a.token == *token) || assets.len() < MAX_ASSETS_PER_PLAYER {
+            Ok(())
+        } else {
+            Err(Error::CollectionLimitReached)
+        }
+    }
+
+    fn update_asset(
+        env: &Env,
+        player: &Address,
+        token: &Address,
+        outcome: &MatchOutcome,
+        payout: i128,
+        player1: &Address,
+    ) {
+        let key = DataKey::Assets(player.clone());
+        let mut assets: Vec<AssetStats> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut found = None;
+        for i in 0..assets.len() {
+            if assets.get(i).unwrap().token == *token {
+                found = Some(i);
+                break;
+            }
+        }
+        let index = match found {
+            Some(i) => i,
+            None => {
+                assets.push_back(AssetStats {
+                    token: token.clone(),
+                    wins: 0,
+                    losses: 0,
+                    draws: 0,
+                    earnings: 0,
+                });
+                assets.len() - 1
+            }
+        };
+        let mut stats = assets.get(index).unwrap();
+        match outcome {
+            MatchOutcome::Player1Won if player == player1 => {
+                stats.wins += 1;
+                stats.earnings += payout;
+            }
+            MatchOutcome::Player2Won if player != player1 => {
+                stats.wins += 1;
+                stats.earnings += payout;
+            }
+            MatchOutcome::Player1Won | MatchOutcome::Player2Won => stats.losses += 1,
+            MatchOutcome::Draw => stats.draws += 1,
+        }
+        assets.set(index, stats);
+        env.storage().persistent().set(&key, &assets);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, STATS_TTL_LEDGERS, STATS_TTL_LEDGERS);
+    }
+
+    fn ensure_season_capacity(env: &Env, player: &Address, season_id: u32) -> Result<(), Error> {
+        let seasons: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Seasons(player.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if seasons.contains(season_id) || seasons.len() < MAX_SEASONS_PER_PLAYER {
+            Ok(())
+        } else {
+            Err(Error::CollectionLimitReached)
+        }
+    }
+
+    fn add_season_id(env: &Env, player: &Address, season_id: u32) {
+        let key = DataKey::Seasons(player.clone());
+        let mut seasons: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if !seasons.contains(season_id) {
+            seasons.push_back(season_id);
+        }
+        env.storage().persistent().set(&key, &seasons);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, STATS_TTL_LEDGERS, STATS_TTL_LEDGERS);
+    }
+
+    fn add_to_season_roster(env: &Env, season_id: u32, player: &Address) {
+        let key = DataKey::SeasonRoster(season_id);
+        let mut roster: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if !roster.contains(player) {
+            roster.push_back(player.clone());
+            env.storage().instance().set(&key, &roster);
+        }
+    }
+
     /// Add `player` to the roster if they are not on it yet.
     ///
     /// The roster is a `Vec`, so membership is a linear scan. That is fine
@@ -400,7 +695,7 @@ impl LeaderboardContract {
         let len = roster.len();
         let mut i = 0u32;
         while i < len {
-            if roster.get(i) == *player {
+            if roster.get(i).unwrap() == *player {
                 return;
             }
             i += 1;
@@ -417,10 +712,7 @@ impl LeaderboardContract {
     /// players with identical records have no defined relative order, and
     /// `get_leaderboard` paging would show the same row twice across page
     /// boundaries and silently skip another.
-    fn ranks_after(
-        a: &(Address, PlayerStats),
-        b: &(Address, PlayerStats),
-    ) -> bool {
+    fn ranks_after(a: &(Address, PlayerStats), b: &(Address, PlayerStats)) -> bool {
         if a.1.wins != b.1.wins {
             return a.1.wins < b.1.wins;
         }

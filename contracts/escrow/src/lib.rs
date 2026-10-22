@@ -785,7 +785,14 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Admin overrides an oracle result during the dispute window.
+    /// Admin corrects an oracle result during the dispute window.
+    ///
+    /// This is the only correction window: every change emits an immutable
+    /// `("oracle", "overridn")` audit event carrying the prior and replacement
+    /// outcomes. After `finalize_result` pays the settlement, the match is
+    /// terminal and its outcome cannot be refunded or rewritten. A leaderboard
+    /// should record only the `match/completed` settlement event; provisional
+    /// submissions and corrections do not affect statistics.
     ///
     /// Can only be called while the match is in `PendingResult` state and before
     /// `DISPUTE_WINDOW_LEDGERS` have elapsed since the result was submitted.

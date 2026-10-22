@@ -45,12 +45,26 @@ Player1 + Player2 agree on a stake
         │
    deposit() x2   ──► Active
         │
-  submit_result() ──► Completed  (winner gets 2× stake, or draw refunds both)
+  submit_result() ──► PendingResult  (dispute window; admin may correct)
+        │
+  finalize_result() ──► Completed  (winner gets 2× stake, or draw refunds both)
         │
    cancel_match() ──► Cancelled  (refunds any deposits already made)
 ```
 
 The contract is initialized once with an **admin** and an **oracle** address. The admin controls administrative operations (pause/unpause, oracle rotation). The oracle is the only address authorized to submit match results.
+
+### Settlement finality and leaderboard accounting
+
+`submit_result` creates a provisional result. During the dispute window,
+`override_result` can replace it, and its audit event records both the prior
+and replacement winner. `finalize_result` pays the current winner and moves the
+match to terminal `Completed` state. Leaderboard relayers should record only
+the `match/completed` event; provisional results, corrections, and cancelled
+matches do not count. A finalized payout cannot be refunded or rewritten by
+this contract, so leaderboard totals are immutable after finalization. Any
+future protocol that supports post-final refunds must introduce an explicit
+compensating accounting entry rather than deleting the original result.
 
 ---
 
@@ -62,7 +76,8 @@ The contract is initialized once with an **admin** and an **oracle** address. Th
 pub enum MatchState {
     Pending,    // Created, awaiting both deposits
     Active,     // Both players deposited; game in progress
-    Completed,  // Result submitted; payout executed
+    PendingResult, // Result submitted; dispute window is open
+    Completed,  // Result finalized; payout executed
     Cancelled,  // Cancelled before activation
 }
 ```
