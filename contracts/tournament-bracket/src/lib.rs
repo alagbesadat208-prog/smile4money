@@ -132,6 +132,11 @@ impl TournamentBracket {
         Ok(t.entry_fee * t.player_count as i128)
     }
 
+    /// The immutable prize schedule recorded at creation time.
+    pub fn get_prize_schedule(env: &Env, tournament_id: u64) -> Result<Vec<i128>, Error> {
+        Ok(Self::load_tournament(env, tournament_id)?.prize_schedule)
+    }
+
     /// How many entrants have paid their entry fee so far.
     pub fn get_funded_count(env: &Env, tournament_id: u64) -> Result<u32, Error> {
         let t = Self::load_tournament(env, tournament_id)?;
@@ -218,6 +223,29 @@ impl TournamentBracket {
         entry_fee: i128,
         players: Vec<Address>,
     ) -> Result<u64, Error> {
+        // Default rules: winner takes the whole pool.
+        let mut schedule: Vec<i128> = Vec::new(&env);
+        let n = players.len() as i128;
+        schedule.push_back(entry_fee.checked_mul(n).ok_or(Error::InvalidAmount)?);
+        Self::create_tournament_with_prizes(env, entry_fee, players, schedule)
+    }
+
+    /// Like [`create_tournament`](Self::create_tournament) but records an explicit
+    /// prize schedule (`prize_schedule[i]` is the prize for place `i + 1`) with the
+    /// tournament. The schedule and token are immutable and readable through
+    /// `get_prize_schedule` / `get_tournament`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidPrizeSchedule`] if the schedule is empty, has a non-positive
+    /// entry, has more places than entrants, or its total exceeds
+    /// `entry_fee x players.len()`. Also all errors of `create_tournament`.
+    pub fn create_tournament_with_prizes(
+        env: Env,
+        entry_fee: i128,
+        players: Vec<Address>,
+        prize_schedule: Vec<i128>,
+    ) -> Result<u64, Error> {
         let admin: Address = env
             .storage()
             .instance()
@@ -248,6 +276,20 @@ impl TournamentBracket {
             .ok_or(Error::InvalidAmount)?;
         if prize_pool > MAX_PRIZE_POOL {
             return Err(Error::StakeTooHigh);
+        }
+
+        if prize_schedule.is_empty() || prize_schedule.len() > n {
+            return Err(Error::InvalidPrizeSchedule);
+        }
+        let mut total: i128 = 0;
+        for p in prize_schedule.iter() {
+            if p <= 0 {
+                return Err(Error::InvalidPrizeSchedule);
+            }
+            total = total.checked_add(p).ok_or(Error::InvalidPrizeSchedule)?;
+        }
+        if total > prize_pool {
+            return Err(Error::InvalidPrizeSchedule);
         }
 
         // Reject zero and duplicate entrants before anything is written.
@@ -281,6 +323,7 @@ impl TournamentBracket {
             champion: None,
             created_ledger: env.ledger().sequence(),
             completed_ledger: None,
+            prize_schedule,
         };
         Self::save_tournament(&env, &t);
 

@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, Vec};
 
 /// Lifecycle of a tournament.
 ///
@@ -112,6 +112,11 @@ pub struct Tournament {
     /// The ledger at which the tournament reached a terminal state.
     /// `None` while it is still running.
     pub completed_ledger: Option<u32>,
+
+    /// Prize allocation fixed at creation time: `prize_schedule[i]` is the amount
+    /// for finishing in place `i + 1`. Immutable; its total never exceeds
+    /// `entry_fee × player_count`, the funds deposited by the entrants.
+    pub prize_schedule: Vec<i128>,
 }
 
 /// One match in the bracket: a node in the single-elimination tree.

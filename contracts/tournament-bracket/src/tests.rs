@@ -714,3 +714,34 @@ fn tournaments_are_isolated_from_one_another() {
         TournamentState::InProgress
     );
 }
+
+#[test]
+fn prize_schedule_default_and_custom() {
+    let f = Fixture::with_field(4);
+    let id = f.client.create_tournament(&FEE, &f.players);
+    assert_eq!(f.client.get_prize_schedule(&id), vec![&f.env, FEE * 4]);
+    assert_eq!(f.client.get_tournament(&id).token, f.token);
+
+    let sched = vec![&f.env, 250i128, 100i128];
+    let id2 = f
+        .client
+        .create_tournament_with_prizes(&FEE, &f.players, &sched);
+    assert_eq!(f.client.get_prize_schedule(&id2), sched);
+}
+
+#[test]
+fn prize_schedule_rejects_invalid() {
+    let f = Fixture::with_field(4);
+    for bad in [
+        vec![&f.env, 401i128],
+        vec![&f.env],
+        vec![&f.env, 100i128, 0i128],
+        vec![&f.env, 1i128, 1i128, 1i128, 1i128, 1i128],
+    ] {
+        assert_eq!(
+            f.client
+                .try_create_tournament_with_prizes(&FEE, &f.players, &bad),
+            Err(Ok(Error::InvalidPrizeSchedule))
+        );
+    }
+}
