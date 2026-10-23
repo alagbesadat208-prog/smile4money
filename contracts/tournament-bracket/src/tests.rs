@@ -7,20 +7,25 @@ use soroban_sdk::{
     contracttype, vec, Address, Env, String, Vec,
 };
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct LegacyTournament {
-    id: u64,
-    admin: Address,
-    token: Address,
-    entry_fee: i128,
-    player_count: u32,
-    rounds: u32,
-    funded_count: u32,
-    state: TournamentState,
-    champion: Option<Address>,
-    created_ledger: u32,
-    completed_ledger: Option<u32>,
+mod legacy {
+    use super::{Address, TournamentState};
+    use soroban_sdk::contracttype;
+
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct Tournament {
+        pub id: u64,
+        pub admin: Address,
+        pub token: Address,
+        pub entry_fee: i128,
+        pub player_count: u32,
+        pub rounds: u32,
+        pub funded_count: u32,
+        pub state: TournamentState,
+        pub champion: Option<Address>,
+        pub created_ledger: u32,
+        pub completed_ledger: Option<u32>,
+    }
 }
 
 /// Entry fee used throughout: large enough to be visible in balance assertions.
@@ -253,7 +258,7 @@ fn legacy_tournament_records_are_rejected_explicitly() {
     let f = Fixture::four_players();
     let id = f.client.create_tournament(&FEE, &f.players);
     let tournament = f.client.get_tournament(&id);
-    let legacy = LegacyTournament {
+    let legacy = legacy::Tournament {
         id: tournament.id,
         admin: tournament.admin,
         token: tournament.token,
