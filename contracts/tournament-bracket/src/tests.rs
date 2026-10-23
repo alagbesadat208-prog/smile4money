@@ -4,8 +4,24 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Env, String, Vec,
+    contracttype, vec, Address, Env, String, Vec,
 };
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LegacyTournament {
+    id: u64,
+    admin: Address,
+    token: Address,
+    entry_fee: i128,
+    player_count: u32,
+    rounds: u32,
+    funded_count: u32,
+    state: TournamentState,
+    champion: Option<Address>,
+    created_ledger: u32,
+    completed_ledger: Option<u32>,
+}
 
 /// Entry fee used throughout: large enough to be visible in balance assertions.
 const FEE: i128 = 100;
@@ -114,6 +130,7 @@ fn four_player_tournament_progresses_to_a_paid_champion() {
     let t = f.client.get_tournament(&id);
     assert_eq!(t.player_count, 4);
     assert_eq!(t.rounds, 2);
+    assert_eq!(t.schema_version, TOURNAMENT_SCHEMA_VERSION);
     assert_eq!(t.state, TournamentState::Registration);
     assert_eq!(t.funded_count, 0);
     assert_eq!(f.client.get_prize_pool(&id), FEE * 4);
@@ -211,6 +228,53 @@ fn four_player_tournament_progresses_to_a_paid_champion() {
     assert_eq!(t.state, TournamentState::Completed);
     assert_eq!(t.champion, Some(s0));
     assert!(t.completed_ledger.is_some());
+}
+
+#[test]
+fn unsupported_tournament_schema_versions_are_rejected() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    let mut tournament = f.client.get_tournament(&id);
+
+    tournament.schema_version = TOURNAMENT_SCHEMA_VERSION + 1;
+    f.env
+        .storage()
+        .persistent()
+        .set(&types::DataKey::Tournament(id), &tournament);
+
+    assert_eq!(
+        f.client.try_get_tournament(&id),
+        Err(Ok(Error::UnsupportedTournamentVersion))
+    );
+}
+
+#[test]
+fn legacy_tournament_records_are_rejected_explicitly() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    let tournament = f.client.get_tournament(&id);
+    let legacy = LegacyTournament {
+        id: tournament.id,
+        admin: tournament.admin,
+        token: tournament.token,
+        entry_fee: tournament.entry_fee,
+        player_count: tournament.player_count,
+        rounds: tournament.rounds,
+        funded_count: tournament.funded_count,
+        state: tournament.state,
+        champion: tournament.champion,
+        created_ledger: tournament.created_ledger,
+        completed_ledger: tournament.completed_ledger,
+    };
+    f.env
+        .storage()
+        .persistent()
+        .set(&types::DataKey::Tournament(id), &legacy);
+
+    assert_eq!(
+        f.client.try_get_tournament(&id),
+        Err(Ok(Error::UnsupportedTournamentVersion))
+    );
 }
 
 /// A 2-player tournament is a bracket with a single match, and the loser of that

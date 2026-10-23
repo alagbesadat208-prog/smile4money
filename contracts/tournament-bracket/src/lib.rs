@@ -45,7 +45,9 @@ use errors::Error;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Env, String, Symbol, TryFromVal, Vec,
 };
-use types::{DataKey, MatchNode, NodeStatus, Tournament, TournamentState};
+use types::{
+    DataKey, MatchNode, NodeStatus, Tournament, TournamentState, TOURNAMENT_SCHEMA_VERSION,
+};
 
 /// Return `true` if `addr` is the all-zeros Stellar account key.
 ///
@@ -281,6 +283,7 @@ impl TournamentBracket {
             champion: None,
             created_ledger: env.ledger().sequence(),
             completed_ledger: None,
+            schema_version: TOURNAMENT_SCHEMA_VERSION,
         };
         Self::save_tournament(&env, &t);
 
@@ -708,10 +711,16 @@ impl TournamentBracket {
         if tournament_id >= Self::tournament_count(env) {
             return Err(Error::TournamentNotFound);
         }
-        env.storage()
+        let key = DataKey::Tournament(tournament_id);
+        match env
+            .storage()
             .persistent()
-            .get::<DataKey, Tournament>(&DataKey::Tournament(tournament_id))
-            .ok_or(Error::TournamentNotFound)
+            .try_get::<DataKey, Tournament>(&key)
+        {
+            Ok(Some(t)) if t.schema_version == TOURNAMENT_SCHEMA_VERSION => Ok(t),
+            Ok(Some(_)) | Err(_) => Err(Error::UnsupportedTournamentVersion),
+            Ok(None) => Err(Error::TournamentNotFound),
+        }
     }
 
     fn load_node(

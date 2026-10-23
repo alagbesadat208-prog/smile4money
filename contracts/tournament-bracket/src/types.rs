@@ -1,5 +1,8 @@
 use soroban_sdk::{contracttype, Address};
 
+/// Schema version written to every newly created tournament record.
+pub const TOURNAMENT_SCHEMA_VERSION: u32 = 1;
+
 /// Lifecycle of a tournament.
 ///
 /// ```text
@@ -112,6 +115,9 @@ pub struct Tournament {
     /// The ledger at which the tournament reached a terminal state.
     /// `None` while it is still running.
     pub completed_ledger: Option<u32>,
+
+    /// Stored schema version. Readers reject records with an unknown version.
+    pub schema_version: u32,
 }
 
 /// One match in the bracket: a node in the single-elimination tree.

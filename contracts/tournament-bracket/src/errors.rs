@@ -38,6 +38,7 @@ pub use smile4money_common::SharedError;
 /// | 36   | TournamentInProgress  | At least one match has been decided                           |
 /// | 37   | TournamentFinished    | Tournament is completed or cancelled                          |
 /// | 38   | TimeoutNotReached     | `TIMEOUT_LEDGERS` have not yet elapsed                        |
+/// | 39   | UnsupportedTournamentVersion | Stored tournament schema version is unsupported       |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -111,6 +112,9 @@ pub enum Error {
 
     /// [E038] `TIMEOUT_LEDGERS` have not elapsed since the tournament was created.
     TimeoutNotReached = 38,
+
+    /// [E039] The stored tournament record uses an unsupported schema version.
+    UnsupportedTournamentVersion = 39,
 }
 
 /// Convert a [`SharedError`] into a tournament [`Error`].
