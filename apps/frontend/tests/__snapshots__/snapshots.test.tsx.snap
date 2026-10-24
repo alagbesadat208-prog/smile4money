@@ -1207,7 +1207,7 @@ exports[`MatchStatus — snapshots > matches snapshot: pending state 1`] = `
             Player 1:
           </span>
            
-          ✓
+          ○
            
           <span
             class="address-small"
@@ -1237,7 +1237,7 @@ exports[`MatchStatus — snapshots > matches snapshot: pending state 1`] = `
             2XYZ
             )
           </span>
-          ✓
+          ○
         </span>
       </div>
     </div>
