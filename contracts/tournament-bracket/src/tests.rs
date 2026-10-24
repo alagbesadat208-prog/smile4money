@@ -73,7 +73,7 @@ impl<'a> Fixture<'a> {
     }
 
     fn balance(&self, who: &Address) -> i128 {
-        asset(&self.env, &self.token).balance(who)
+        TokenClient::new(&self.env, &self.token).balance(who)
     }
 
     fn seed(&self, i: u32) -> Address {
@@ -90,12 +90,12 @@ impl<'a> Fixture<'a> {
     }
 }
 
-fn asset(env: &Env, token: &Address) -> StellarAssetClient {
+fn asset<'a>(env: &'a Env, token: &'a Address) -> StellarAssetClient<'a> {
     StellarAssetClient::new(env, token)
 }
 
 fn game_id(env: &Env, n: u32) -> String {
-    String::from_str(env, &format!("game-{}", n))
+    String::from_str(env, &std::format!("game-{}", n))
 }
 
 // ----------------------- full bracket progression -----------------------
