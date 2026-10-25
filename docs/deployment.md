@@ -295,6 +295,13 @@ Mainnet deployment follows the same steps but with additional precautions becaus
 
 ### Pre-deploy review checklist
 
+Mainnet launches are gated by the measurable go/no-go thresholds in
+[runbook.md §8 Production Readiness Gates](runbook.md#8-production-readiness-gates). This checklist
+covers the mechanics; the gates decide whether the release is good enough.
+
+- [ ] A release review record exists at `docs/release-reviews/<tag>.md` with every gate G1–G8
+      recorded, and its decision is **GO** (`python scripts/check_release_review.py <record>`
+      passes). The `Deploy to Mainnet` workflow checks this and stops if it fails.
 - [ ] All CI jobs pass on the commit being deployed (test, clippy, fmt, build).
 - [ ] Security audit (`cargo audit`) reports zero unresolved advisories.
 - [ ] Contracts have been live on testnet for at least one full test cycle.

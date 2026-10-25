@@ -6,6 +6,7 @@ import validateGameRouter from './routes/validate-game.js';
 import oracleRouter from './routes/oracle.js';
 import { errorToHttpStatus } from './errors/errorToHttpStatus.js';
 import { requestLogging } from './middleware/request-logging.js';
+import { traceContext } from './middleware/trace-context.js';
 
 /**
  * Parse the ALLOWED_ORIGINS environment variable into an array of origin strings.
@@ -25,6 +26,10 @@ function getAllowedOrigins(): string[] {
 
 export const app = express();
 
+// #123 — first, so every later middleware and log line runs inside the
+// request's W3C trace context.
+app.use(traceContext());
+
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -37,7 +42,8 @@ app.use(
       }
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'traceparent', 'tracestate'],
+    exposedHeaders: ['traceparent'],
     credentials: true,
   })
 );

@@ -1,6 +1,7 @@
 import React, { useState, useCallback } from 'react';
 import { Address, Networks } from '@stellar/stellar-sdk';
 import { validateAndConvertXlmToStroops, countDecimalPlaces } from '../utils/xlm-precision';
+import { createTraceparent } from '../utils/trace-context';
 
 type Platform = 'lichess' | 'chesscom';
 type TokenType = 'xlm' | 'usdc';
@@ -149,6 +150,8 @@ async function validateGameOnPlatform(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      // #123 — starts the trace the backend carries through oracle jobs.
+      traceparent: createTraceparent(),
     },
     body: JSON.stringify(payload),
   });

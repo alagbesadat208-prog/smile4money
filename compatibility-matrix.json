@@ -1,0 +1,49 @@
+{
+  "$comment": "Source of truth for supported Stellar protocol / SDK / wallet combinations (issue #124). docs/compatibility.md renders it; scripts/check_compat_matrix.py keeps the repo's pins in sync with `supported`; .github/workflows/compatibility.yml tests `supported` and every candidate on a schedule.",
+  "schema": 1,
+  "supported": {
+    "id": "current",
+    "status": "supported",
+    "stellar_protocol": 22,
+    "rust": "1.88.0",
+    "soroban_sdk": "22.0.11",
+    "stellar_cli": "22.0.1",
+    "js_stellar_sdk": "16.0.1",
+    "node": "20",
+    "wallets": [
+      {
+        "name": "Freighter",
+        "api": "window.freighterApi.signTransaction(xdr, { networkPassphrase }) -> { signedTxXdr }"
+      }
+    ]
+  },
+  "candidates": [
+    {
+      "id": "js-sdk-16-latest",
+      "purpose": "Minor and patch releases of the supported @stellar/stellar-sdk major",
+      "required": true,
+      "stellar_protocol": 22,
+      "rust": "1.88.0",
+      "soroban_sdk": "22.0.11",
+      "js_stellar_sdk": "16.3.1"
+    },
+    {
+      "id": "protocol-23",
+      "purpose": "Planned upgrade path: soroban-sdk 23 (protocol 23 host) for the contracts",
+      "required": false,
+      "stellar_protocol": 23,
+      "rust": "1.88.0",
+      "soroban_sdk": "23.5.3",
+      "js_stellar_sdk": "16.3.1"
+    },
+    {
+      "id": "latest",
+      "purpose": "Early warning: newest stable releases, resolved when the build runs",
+      "required": false,
+      "stellar_protocol": "latest",
+      "rust": "stable",
+      "soroban_sdk": "latest",
+      "js_stellar_sdk": "latest"
+    }
+  ]
+}

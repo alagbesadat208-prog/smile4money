@@ -2,6 +2,10 @@ name: Deploy to Mainnet
 
 on:
   workflow_dispatch:
+    inputs:
+      release_review:
+        description: 'Path to the release review record (docs/release-reviews/<release>.md), see docs/runbook.md §8'
+        required: true
   push:
     tags:
       - 'v*.*.*'
@@ -13,6 +17,13 @@ jobs:
     environment: production
     steps:
       - uses: actions/checkout@v4
+
+      # Issue #125: no mainnet deploy without a release review that records
+      # every readiness gate and a GO decision (docs/runbook.md §8).
+      - name: Release review is GO
+        env:
+          REVIEW: ${{ github.event_name == 'push' && format('docs/release-reviews/{0}.md', github.ref_name) || github.event.inputs.release_review }}
+        run: python3 scripts/check_release_review.py "$REVIEW"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master

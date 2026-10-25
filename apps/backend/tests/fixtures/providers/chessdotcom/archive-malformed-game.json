@@ -1,0 +1,51 @@
+{
+  "games": [
+    {
+      "url": "https://www.chess.com/game/live/100000031",
+      "pgn": "[Event \"Live Chess\"]\n[Site \"Chess.com\"]\n[White \"fixture-white\"]\n[Black \"fixture-black\"]\n[Result \"*\"]\n\n1. e4 e5 *",
+      "time_control": "600",
+      "end_time": 1767226200,
+      "rated": true,
+      "uuid": "00000000-0000-4000-8000-000100000031",
+      "initial_setup": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      "fen": "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+      "time_class": "rapid",
+      "rules": "chess",
+      "white": {
+        "rating": 1500,
+        "result": "win",
+        "@id": "https://api.chess.com/pub/player/fixture-white",
+        "username": "fixture-white",
+        "uuid": "00000000-0000-4000-8000-0000000000a1"
+      }
+    },
+    {
+      "url": "https://www.chess.com/game/live/100000032",
+      "pgn": "[Event \"Live Chess\"]\n[Site \"Chess.com\"]\n[White \"fixture-white\"]\n[Black \"fixture-black\"]\n[Result \"*\"]\n\n1. e4 e5 *",
+      "time_control": "600",
+      "end_time": 1767226200,
+      "rated": true,
+      "uuid": "00000000-0000-4000-8000-000100000032",
+      "initial_setup": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      "fen": "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+      "time_class": "rapid",
+      "rules": "chess",
+      "white": {
+        "rating": 1500,
+        "result": "win",
+        "@id": "https://api.chess.com/pub/player/fixture-white",
+        "username": "fixture-white",
+        "uuid": "00000000-0000-4000-8000-0000000000a1"
+      },
+      "black": {
+        "rating": 1500,
+        "result": "resigned",
+        "@id": "https://api.chess.com/pub/player/fixture-black",
+        "username": "fixture-black",
+        "uuid": "00000000-0000-4000-8000-0000000000b1"
+      }
+    },
+    "not-a-game",
+    null
+  ]
+}

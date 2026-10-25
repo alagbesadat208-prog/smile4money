@@ -14,6 +14,7 @@
 5. [Unpausing the Contract](#5-unpausing-the-contract)
 6. [Post-Incident Report Template](#6-post-incident-report-template)
 7. [Contact Escalation List](#7-contact-escalation-list)
+8. [Production Readiness Gates](#8-production-readiness-gates)
 
 ---
 
@@ -496,6 +497,90 @@ Copy this template and fill it in for every incident, regardless of severity.
 2. On-call backup — if primary unreachable (15–30 min)
 3. Contract admin keyholder — required for pause/drain/oracle rotation
 4. All team leads — severity Critical only
+
+---
+
+## 8. Production Readiness Gates
+
+> **When:** before the first mainnet wagering launch, and before every later mainnet release that
+> changes a contract, the oracle service, or a version in [compatibility.md](compatibility.md).
+> **Rule:** launch is **GO** only when every gate below is recorded **PASS**, or **WAIVED** where a
+> waiver is allowed, in a release review record. The `Deploy to Mainnet` workflow checks the record
+> and refuses to start without it (see [§8.4](#84-release-review-record)).
+
+A checklist of tasks says what was done. These gates say whether it was done *well enough to
+take real money*. Every threshold is a number someone can measure and someone owns.
+
+### 8.1 Gates
+
+Measurements come from the **testnet soak**: the release candidate running unchanged on testnet
+for at least 14 consecutive days, the frontend and backend pointed at it, with real Lichess and
+Chess.com games. Logs and traces (`trace_id`, see [infrastructure.md §8.1](infrastructure.md#81-trace-context-propagation))
+are the primary evidence.
+
+| Gate | Area | GO threshold (all must hold) | How it is measured | Evidence owner | Waivable |
+|---|---|---|---|---|---|
+| **G1** | Settlement correctness | ≥ 200 matches settled end to end during the soak, at least 50 from each provider and at least 20 draws. **0** settlements that disagree with the provider's result. **0** double payouts. **0** settlements from a `ProviderSchemaError` payload. | A reconciliation of every soak match (match id → provider result → `submit_result` tx → payout tx). The provider fixture suite (`tests/fetchers/provider-fixtures.test.ts`) is green. | Oracle service owner | No |
+| **G2** | Settlement latency | From game end to a confirmed `submit_result`: **p95 ≤ 10 min**, **p99 ≤ 60 min**, **max ≤ 24 h**. Every match settles inside `DISPUTE_WINDOW_LEDGERS` + `TIMEOUT_LEDGERS`, so no player needs `claim_timeout` because the oracle was late. | `game_completed` → `submit_result` confirmation timestamps from the logs, joined on `trace_id`, over all soak matches. | Oracle service owner | No |
+| **G3** | Queued-work recovery | DLQ depth **0** at the end of the soak. Every DLQ entry written during the soak resolved within **24 h**. **0** entries removed by TTL eviction. Alerts fire within **5 min** for: oracle `/health` down, DLQ depth > 0 for 1 h, and a G2 p95 breach over 1 h. | `oracle_dlq_depth` metric history, `oracle_dlq:` log lines, and an alert test (stop the oracle on testnet, confirm the page arrives). | Oracle service owner | No |
+| **G4** | Incident recovery | Drills run on testnet within the last **30 days**, timed from page to verified outcome: emergency pause ([§1](#1-emergency-contract-pause)) **≤ 15 min**; oracle key rotation ([§2](#2-oracle-signing-key-rotation)) **≤ 60 min**; rollback rehearsal ([deployment.md](deployment.md#testnet-rollback-rehearsal)) **≤ 2 h**. | A drill log with UTC timestamps and tx hashes for each step. | On-call engineer (primary) | No |
+| **G5** | Data durability | DLQ SQLite store on a persistent volume, backed up at least every **15 min** (RPO ≤ 15 min). A restore from backup was tested in the last **30 days** and completed in **≤ 1 h** (RTO). The service restarted with no DLQ entries lost. | Backup schedule config, a restore drill log, and the DLQ entry count before and after the restart. | Backend owner | Yes, ≤ 14 days |
+| **G6** | Capacity | At **3×** the launch plan's expected peak of concurrently active matches (minimum **500** polling jobs), sustained for **1 h**: API **p95 ≤ 500 ms**, **5xx < 0.5 %**, each polling cycle finishes inside `POLLING_INTERVAL_MS`, provider **429s < 1 %** of calls, and Stellar RPC errors **< 1 %**. | A load test report against testnet, with the job count, latency histogram and error counts. | Backend owner | Yes, ≤ 14 days |
+| **G7** | Build, security and compatibility | The release commit has every CI job green, including the **Compatibility Matrix** job. `cargo audit` reports **0** unresolved advisories. The latest scheduled **Compatibility** run shows no new failure in a *required* row ([compatibility.md](compatibility.md)). The deployed WASM hash equals the CI artifact hash ([deployment.md](deployment.md#verify-deployment--wasm-hash-check)). | Links to the CI run, the audit output, the compatibility run, and the hash comparison. | Release manager | No |
+| **G8** | User support | Support channel staffed, with first response **≤ 4 h** during announced support hours and **≤ 24 h** otherwise. A dry run of **10** scripted tickets (stuck match, wrong result claim, how to dispute, how to `claim_timeout`, lost-deposit scare, …) is **10/10** answered correctly within target. A user-facing guide for disputes and `claim_timeout` is published. [§7](#7-contact-escalation-list) has **no** `[Name]` placeholders left. A status page and the incident notice template ([deployment.md](deployment.md#1-declare-the-incident-and-freeze-writes)) are ready. | The dry-run ticket log with timestamps, links to the guide and status page, and the filled-in §7. | Support lead | Yes, ≤ 14 days |
+
+A gate with no evidence linked is a **FAIL**, not a PASS.
+
+### 8.2 Waivers
+
+Only gates marked *Waivable* can be waived, and only when **two** people approve it in the release
+review: the release manager **and** the contract admin keyholder. A waiver records the reason,
+the mitigation in place, and an expiry no more than 14 days after launch. If the gate still isn't
+PASS on the expiry date, that triggers a rollback decision (§8.3). Settlement gates (G1–G4) and
+G7 can never be waived.
+
+### 8.3 Rollback authority
+
+**Before launch.** The release review decides GO or NO-GO. The release manager chairs it but
+**cannot** overrule a FAIL. Any evidence owner may call NO-GO for their own gate.
+
+**During the 30-day launch watch** (and for any later release, the 7 days after it):
+
+| Trigger (any one) | Who may act without asking | What they do |
+|---|---|---|
+| A settlement disagrees with the provider's result, or a double payout | On-call engineer (primary or backup) | Pause immediately ([§1](#1-emergency-contract-pause)), then page the keyholder |
+| Settlement p95 > 30 min for 2 consecutive hours, or any DLQ entry older than 24 h | On-call engineer | Stop accepting new matches (frontend/oracle writes); page the oracle service owner |
+| Oracle unavailable > 30 min with active matches | On-call engineer | Pause ([§1](#1-emergency-contract-pause)) |
+| A waiver expires with its gate not PASS | Release manager | Calls the rollback decision meeting within 24 h |
+
+**Rolling back** a release ([deployment.md → Rollback Procedure](deployment.md#rollback-procedure-mainnet))
+needs the **contract admin keyholder** to execute it and the **oracle service owner** to agree.
+Either of them can start it. If the two disagree, the contract stays **paused** until they agree,
+because pausing is always safe and a rollback is not reversible. Unpausing after any trigger
+follows [§5](#5-unpausing-the-contract), and the same two people sign it off.
+
+### 8.4 Release review record
+
+Each mainnet release has a record at `docs/release-reviews/<release>.md`, where `<release>` is the
+tag being deployed, such as `v1.0.0`. Copy it from
+[`docs/release-reviews/TEMPLATE.md`](release-reviews/TEMPLATE.md). For every gate it records:
+
+- the measured value
+- PASS, FAIL or WAIVED
+- an evidence link
+- the evidence owner's name
+
+It also records the decision and both sign-offs.
+
+`python scripts/check_release_review.py docs/release-reviews/<release>.md` validates the record.
+It fails when:
+
+- a gate is missing, or has no evidence or no owner
+- a non-waivable gate is waived, or a waiver lacks both approvals or an expiry
+- the decision is GO while any gate is FAIL
+
+`Deploy to Mainnet` runs this check first. A tag push checks the record named after the tag; a
+manual run asks for the record's path. Merge the record (and so the decision) before deploying.
 
 ---
 
