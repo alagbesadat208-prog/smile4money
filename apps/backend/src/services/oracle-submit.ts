@@ -128,8 +128,24 @@ export async function submitWithRetry(
     }
   }
 
-  // All retries exhausted — write to DLQ
-  const dlqEntry = writeToDlq(submission, lastError?.message ?? 'Unknown error');
+  // All retries exhausted — write to DLQ. Awaited (#122): if the store itself
+  // fails, the caller must see that the submission was NOT persisted, instead
+  // of an unhandled rejection and a silently lost settlement.
+  let dlqEntry: DlqEntry;
+  try {
+    dlqEntry = await writeToDlq(submission, lastError?.message ?? 'Unknown error');
+  } catch (storeErr) {
+    logger.error(
+      {
+        matchId: submission.matchId,
+        gameId: submission.gameId,
+        lastError: lastError?.message,
+        storeError: storeErr instanceof Error ? storeErr.message : String(storeErr),
+      },
+      'oracle_submit: exhausted retries AND the DLQ write failed; submission is not persisted'
+    );
+    throw storeErr;
+  }
   logger.error(
     {
       matchId: submission.matchId,
@@ -175,6 +191,51 @@ export async function retryDlqEntry(
     );
     return false;
   }
+}
+
+/**
+ * Reprocess one DLQ entry: a single attempt, for the DLQ retry worker.
+ *
+ * Throws on any failure so the worker keeps the entry and records the attempt
+ * (`attempts`, `lastAttemptAt`), which is what an operator reads to decide
+ * whether to intervene. It never re-enters `submitWithRetry`: that ran a full
+ * backoff loop inside the worker and then wrote a *new* DLQ entry and returned
+ * normally, so the worker deleted the original and the attempt count restarted
+ * at 0 every cycle (#122).
+ *
+ * The on-chain existence check is fail-closed here: if it cannot be answered,
+ * nothing is submitted this cycle. The entry already failed once, and the
+ * transaction may have landed without being confirmed, so guessing "not there"
+ * risks a second submission.
+ */
+export async function retryDlqSubmission(
+  entry: DlqEntry,
+  handler: (sub: OracleSubmission) => Promise<void>,
+  existenceChecker: ExistenceChecker
+): Promise<'submitted' | 'already-on-chain'> {
+  const submission = entry.payload as OracleSubmission;
+  if (!submission || typeof submission !== 'object' || typeof submission.matchId !== 'number') {
+    throw new Error(`Invalid DLQ entry payload: expected OracleSubmission, got ${typeof entry.payload}`);
+  }
+
+  let exists: boolean;
+  try {
+    exists = await existenceChecker(submission.matchId);
+  } catch (err) {
+    throw new Error(
+      `existence check failed, not resubmitting this cycle: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (exists) {
+    logger.info(
+      { dlqId: entry.id, matchId: submission.matchId },
+      'oracle_dlq: result already on-chain, resolving entry without resubmitting'
+    );
+    return 'already-on-chain';
+  }
+
+  await handler(submission);
+  return 'submitted';
 }
 
 /**

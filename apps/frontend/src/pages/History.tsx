@@ -5,8 +5,10 @@ import {
   getHistoryCacheEntry,
   setHistoryCacheEntry,
 } from './history-cache';
+import { APP_NETWORK_CONFIG } from '../config/network';
 
-const HORIZON_URL = 'https://horizon-testnet.stellar.org';
+// The app's own network (#118); History has no wallet-network prop.
+const HORIZON_URL = APP_NETWORK_CONFIG.horizonUrl;
 const PAGE_SIZE = 20;
 
 interface HistoryProps {

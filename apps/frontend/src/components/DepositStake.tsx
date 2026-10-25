@@ -2,7 +2,6 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   Account,
   Asset,
-  Networks,
   Operation,
   TransactionBuilder,
   nativeToScVal,
@@ -11,6 +10,8 @@ import {
 } from '@stellar/stellar-sdk';
 import type { xdr } from '@stellar/stellar-sdk';
 import { TransactionStatus } from './TransactionStatus';
+import { APP_NETWORK_CONFIG } from '../config/network';
+import { EligibilityNotice } from './EligibilityNotice';
 
 type DepositStatus = 'idle' | 'loading' | 'pending' | 'success' | 'error' | 'approving';
 type AllowanceStatus = 'unknown' | 'checking' | 'sufficient' | 'insufficient';
@@ -187,8 +188,8 @@ export function DepositStake({
   matchId,
   playerAddress,
   contractId,
-  networkPassphrase = Networks.TESTNET,
-  rpcUrl = 'https://soroban-testnet.stellar.org',
+  networkPassphrase = APP_NETWORK_CONFIG.networkPassphrase,
+  rpcUrl = APP_NETWORK_CONFIG.rpcUrl,
   onDeposit,
   onApprove,
   allowanceSufficient = null,
@@ -385,6 +386,7 @@ export function DepositStake({
   return (
     <div className="deposit-stake" data-testid="deposit-stake">
       <h3 className="deposit-title">Deposit Stake</h3>
+      <EligibilityNotice />
 
       {matchDetails && (
         <div className="match-info" data-testid="match-info">

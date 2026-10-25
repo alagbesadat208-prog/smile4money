@@ -32,6 +32,34 @@ Environments are defined in `environments.toml`. Four environments are recognize
 | `futurenet` | Preview of upcoming Stellar features | `https://rpc-futurenet.stellar.org` |
 | `mainnet` | Production | `https://soroban-mainnet.stellar.org` |
 
+### Single source of truth for network and contract metadata
+
+`environments.toml` is the only place a network's identity is defined: its name, passphrase,
+Soroban RPC and Horizon endpoints, friendbot, and deployed contract ids (`[<env>.contracts]`).
+Every other consumer is generated from it or checked against it by `scripts/network_config.py`.
+The **Validate Environments** workflow runs `--check` on every change to a consumer.
+
+| Consumer | How it stays in sync |
+|---|---|
+| `apps/frontend/src/config/networks.generated.ts` | Generated (`python scripts/network_config.py --write`). Components read it through `src/config/network.ts` (`APP_NETWORK_CONFIG`, `configForWallet`) |
+| `apps/backend/src/config/networks.generated.ts` | Generated. `src/config/network.ts` resolves `STELLAR_NETWORK` against it and `server.ts` calls it at startup |
+| `.env.example` | Checked: `STELLAR_NETWORK` / `VITE_STELLAR_NETWORK` must exist and agree, each `*_RPC_URL` must be that network's endpoint, and non-placeholder `CONTRACT_*` values must match the table |
+| `scripts/deploy_testnet.sh`, `scripts/deploy_mainnet.sh` | Checked: `RPC_URL` and `NETWORK_PASSPHRASE` must match the table |
+| Any other file in `apps/*/src` | Checked: hard-coding an RPC/Horizon URL or passphrase, or using `Networks.TESTNET`/`PUBLIC`, fails |
+
+Conflicting identities are rejected in two places:
+
+- **In the table itself.** A passphrase can't be listed under the wrong network name, and a local
+  network can't claim a public passphrase. No two environments may share an endpoint or a
+  contract id, and an RPC URL can't name another network.
+- **At backend startup.** For example, `STELLAR_NETWORK=mainnet` with the testnet RPC URL, a
+  passphrase from another network, or another network's contract id all fail.
+
+An operator can still point `STELLAR_RPC_URL` at a private node for the *same* network.
+
+To deploy a contract or add a network, edit `environments.toml`, run
+`python scripts/network_config.py --write`, and commit the regenerated files with it.
+
 ### Environment promotion path
 
 ```

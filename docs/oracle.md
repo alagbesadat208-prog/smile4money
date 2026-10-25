@@ -229,6 +229,41 @@ MongoDB support (`mongodb-queue-store.ts`) exists in the codebase but is not cur
 the `mongoose` package is not an installed dependency, so selecting it falls back to SQLite rather
 than crashing the process on a missing module.
 
+## Settlement Boundaries
+
+A settlement crosses these boundaries, in order. A failure can happen at any of them, and
+`apps/backend/tests/fault-injection/settlement-boundaries.test.ts` injects one at each. Every case
+asserts the same three things:
+
+- the match stays **recoverable**;
+- it is **paid out at most once**;
+- an operator can see **what happened and what to do**.
+
+| # | Boundary | Failure injected | Expected behaviour | What the operator sees |
+|---|----------|------------------|--------------------|------------------------|
+| B1 | Match store read (`verifyGameResult`) | store throws (e.g. `SQLITE_BUSY`) | Request fails before any provider call. Nothing is written, and the same request succeeds once the store recovers | 5xx from `/api/oracle/submit-result` with the store error |
+| B2 | Provider lookup (Lichess / Chess.com) | 429; outage; repeated failure | 429 → poll stays `in_progress` and is retried next cycle. Outage → poll `failed` with a reason, and nothing is settled. Past `MAX_POLLING_ATTEMPTS` → the job is written to the DLQ | `game_poll_*` logs; a DLQ entry `{ job }` with its reason |
+| B3 | Signing | key unavailable, transient or persistent | Retried with backoff. A persistent failure never reaches the chain and is queued | DLQ entry with `signing failed …` |
+| B4 | RPC submission | `sendTransaction` fails | Chain untouched, result queued. The DLQ worker settles it once the RPC is back. While the RPC stays down, **one** entry accumulates `attempts` | DLQ entry; `attempts` / `lastAttemptAt` rising |
+| B5 | Confirmation | tx landed, confirmation lost | Later attempts are rejected by the contract (one result per match), so there is no second payout. The DLQ retry asks the chain first (`checkResultExistsOnChain`) and resolves the entry **without resubmitting**. If that check itself fails, nothing is resubmitted that cycle (fail-closed) | DLQ entry with `ResultAlreadySubmitted`, then resolved |
+| B6 | DLQ write | queue store unavailable | `submitWithRetry` rejects and logs `the DLQ write failed; submission is not persisted`. It does not drop the submission silently | An `error` log line with `matchId` / `gameId` |
+| B7 | DLQ retry of a malformed entry | payload isn't an `OracleSubmission` | That entry is kept and its attempt is recorded. Other entries are still processed | Entry with `attempts` rising and the payload to inspect |
+| B8 | Process restart between stages | crash after queuing | The SQLite DLQ keeps the entry (and its attempt count). It is settled once after restart, and a duplicate delivery is a no-op | Entry present after restart, then resolved |
+
+Two behaviours these tests pinned down:
+
+- **A DLQ retry is one attempt** (`retryDlqSubmission`). It used to run the whole backoff loop
+  inside the worker and then write a *new* DLQ entry and return success. The worker then deleted
+  the original, so the attempt count reset to 0 every cycle and the operator could never see how
+  long a settlement had been stuck.
+- **The DLQ write is awaited.** It wasn't before, so a failing store produced an unhandled
+  rejection and the settlement vanished without an error.
+
+The escrow contract's own end-to-end tests (`contracts/escrow/src/tests_e2e.rs`) don't currently
+compile on `master`, so the contract-side guarantee in B5 (one result per match) is modelled in
+these tests rather than exercised against the contract. Add the matching on-chain case there once
+the escrow crate builds.
+
 ## DLQ TTL Eviction
 
 DLQ entries are not cleaned up automatically by writing or reading them — without eviction they

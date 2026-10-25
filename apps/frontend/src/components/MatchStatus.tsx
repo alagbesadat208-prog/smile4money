@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Networks, rpc } from '@stellar/stellar-sdk';
+import { rpc } from '@stellar/stellar-sdk';
 import { DISPUTE_WINDOW_LEDGERS, SECONDS_PER_LEDGER } from '../constants';
+import { APP_NETWORK_CONFIG } from '../config/network';
 
 type MatchState = 'Pending' | 'Active' | 'PendingResult' | 'Completed' | 'Cancelled';
 
@@ -80,16 +81,11 @@ function formatDuration(totalSeconds: number): string {
   return parts.join(' ');
 }
 
-const NETWORK_PASSPHRASES: Record<string, string> = {
-  testnet: Networks.TESTNET,
-  mainnet: Networks.PUBLIC,
-};
-
 export function MatchStatus({
   matchId,
   contractId,
-  rpcUrl = 'https://soroban-testnet.stellar.org',
-  networkPassphrase = Networks.TESTNET,
+  rpcUrl = APP_NETWORK_CONFIG.rpcUrl,
+  networkPassphrase = APP_NETWORK_CONFIG.networkPassphrase,
   onFetchMatch,
 }: MatchStatusProps) {
   const [matchData, setMatchData] = useState<MatchData | null>(null);

@@ -562,6 +562,30 @@ exports[`CreateMatch — snapshots > matches snapshot: Chess.com platform select
     >
       Create New Match
     </h2>
+    <aside
+      aria-label="Wagering eligibility"
+      class="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
+      data-testid="eligibility-notice"
+      role="note"
+    >
+      <p>
+        <strong>
+          Real-money wagering is restricted.
+        </strong>
+         It is only for people aged 
+        18
+        + (or older where local law requires) who are located in a jurisdiction where it is legal and that this service supports.
+         
+        This deployment has not published a list of supported jurisdictions, so do not wager real funds.
+         
+        You are responsible for checking that wagering is legal where you are.
+      </p>
+      <p
+        class="mt-1"
+      >
+        You are on a test network: stakes use test tokens with no real value.
+      </p>
+    </aside>
     <form
       data-testid="create-match-form"
       novalidate=""
@@ -700,6 +724,30 @@ exports[`CreateMatch — snapshots > matches snapshot: USDC token selected 1`] =
     >
       Create New Match
     </h2>
+    <aside
+      aria-label="Wagering eligibility"
+      class="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
+      data-testid="eligibility-notice"
+      role="note"
+    >
+      <p>
+        <strong>
+          Real-money wagering is restricted.
+        </strong>
+         It is only for people aged 
+        18
+        + (or older where local law requires) who are located in a jurisdiction where it is legal and that this service supports.
+         
+        This deployment has not published a list of supported jurisdictions, so do not wager real funds.
+         
+        You are responsible for checking that wagering is legal where you are.
+      </p>
+      <p
+        class="mt-1"
+      >
+        You are on a test network: stakes use test tokens with no real value.
+      </p>
+    </aside>
     <form
       data-testid="create-match-form"
       novalidate=""
@@ -838,6 +886,30 @@ exports[`CreateMatch — snapshots > matches snapshot: default state (XLM / Lich
     >
       Create New Match
     </h2>
+    <aside
+      aria-label="Wagering eligibility"
+      class="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
+      data-testid="eligibility-notice"
+      role="note"
+    >
+      <p>
+        <strong>
+          Real-money wagering is restricted.
+        </strong>
+         It is only for people aged 
+        18
+        + (or older where local law requires) who are located in a jurisdiction where it is legal and that this service supports.
+         
+        This deployment has not published a list of supported jurisdictions, so do not wager real funds.
+         
+        You are responsible for checking that wagering is legal where you are.
+      </p>
+      <p
+        class="mt-1"
+      >
+        You are on a test network: stakes use test tokens with no real value.
+      </p>
+    </aside>
     <form
       data-testid="create-match-form"
       novalidate=""

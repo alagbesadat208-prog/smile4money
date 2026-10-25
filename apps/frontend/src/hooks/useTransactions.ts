@@ -1,13 +1,6 @@
-import { Networks, Transaction, rpc } from '@stellar/stellar-sdk';
+import { Transaction, rpc } from '@stellar/stellar-sdk';
 import type { Network } from '../types';
-
-const RPC_URL = 'https://soroban-testnet.stellar.org';
-
-const NETWORK_PASSPHRASES: Record<Network, string> = {
-  testnet: Networks.TESTNET,
-  mainnet: Networks.PUBLIC,
-  unknown: Networks.TESTNET,
-};
+import { configForWallet } from '../config/network';
 
 export interface CreateMatchInput {
   player2: string;
@@ -19,8 +12,14 @@ export interface CreateMatchInput {
 
 type ClaimBurnMode = 'claim' | 'burn';
 
+// RPC endpoint and passphrase come from the same canonical record (#118):
+// a mainnet passphrase used to be paired with the hard-coded testnet RPC URL.
 function getNetworkPassphrase(network: Network): string {
-  return NETWORK_PASSPHRASES[network] ?? Networks.TESTNET;
+  return configForWallet(network).networkPassphrase;
+}
+
+function getRpcUrl(network: Network): string {
+  return configForWallet(network).rpcUrl;
 }
 
 /**
@@ -28,7 +27,7 @@ function getNetworkPassphrase(network: Network): string {
  * Returns the transaction hash so callers can surface a receipt link.
  */
 async function signAndSubmitTransaction(xdr: string, network: Network): Promise<string> {
-  const server = new rpc.Server(RPC_URL);
+  const server = new rpc.Server(getRpcUrl(network));
   const networkPassphrase = getNetworkPassphrase(network);
 
   if (!window.freighterApi?.signTransaction) {
@@ -76,7 +75,7 @@ export function useTransactions(address: string | null, network: Network) {
     requireWallet();
     const mockTxXdr = `AAAA...${mode}.${amount}`;
     const networkPassphrase = getNetworkPassphrase(network);
-    const server = new rpc.Server(RPC_URL);
+    const server = new rpc.Server(getRpcUrl(network));
     const transaction = new Transaction(mockTxXdr, networkPassphrase);
     const result = await server.simulateTransaction(transaction);
 

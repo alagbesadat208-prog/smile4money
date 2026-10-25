@@ -366,6 +366,54 @@ The oracle service validates all required environment variables at startup and e
 
 **Production guidance**: Store `ORACLE_SECRET_KEY` in a secrets manager (e.g., AWS Secrets Manager, HashiCorp Vault) and inject it at runtime. Rotate the key via `update_oracle` on the escrow contract after rotation.
 
+## Wagering Eligibility Policy
+
+**Status:** Adopted by engineering. **Legal review: pending.** Mainnet wagering must not launch
+until the review record below is completed (issue #113).
+
+smile4money lets people stake real funds on the outcome of chess games. Who may do that, and where,
+is a legal question the code can't answer on its own. This section states the policy, and
+[deployment.md → Eligibility Enforcement](deployment.md#eligibility-enforcement) assigns who
+enforces each part of it.
+
+### Policy
+
+1. **Minimum age: 18**, or the higher age a supported jurisdiction requires (for example 21). Nobody
+   under that age may wager. A deployment may raise the age (`VITE_MIN_WAGERING_AGE`) but never
+   lower it below 18; the frontend ignores lower values.
+2. **Jurisdictions: default deny.** Real-money wagering is offered only in jurisdictions listed,
+   after legal review, in the deployment's supported list (`VITE_SUPPORTED_JURISDICTIONS`).
+   Everywhere else is unsupported, including places where the law is unclear. An empty list means
+   *no* jurisdiction is supported for real-money play.
+3. **No claim of universal availability.** No user-facing copy may say or suggest that the service
+   is legal or available to everyone or everywhere. The frontend shows an eligibility notice
+   wherever money moves (the home page, match creation and stake deposit). It names the age limit
+   and the supported jurisdictions, or says that none are published. A test fails the build if
+   wording such as "available worldwide" appears in the app.
+4. **Testnet is not wagering.** Test networks use tokens with no value, and the notice says so. The
+   policy applies to real funds, on mainnet.
+5. **The contracts can't enforce eligibility.** Soroban contracts can't see a user's age or
+   location, and wallet addresses are pseudonymous. Enforcement therefore sits with the operator,
+   at the edges the operator controls (see the deployment responsibilities). It never relies on the
+   contract.
+6. **Self-attestation is not verification.** Wherever a supported jurisdiction's law requires
+   identity or age verification (KYC), the operator must use a verification provider before
+   allowing deposits. A "tick to confirm you are 18" box doesn't meet that requirement.
+
+### Review record
+
+| Item | Owner | Status |
+|---|---|---|
+| Minimum age per supported jurisdiction confirmed | Legal counsel | Pending |
+| Supported jurisdiction list approved, and the reasoning for each excluded one recorded | Legal counsel + operator | Pending |
+| KYC / age-verification requirement decided per jurisdiction | Legal counsel + operator | Pending |
+| User-facing eligibility terms published (`VITE_ELIGIBILITY_TERMS_URL`) | Operator | Pending |
+| Policy re-reviewed (at least yearly, and before adding a jurisdiction) | Legal counsel | Pending |
+
+Update a row with a date, the reviewer and a link to the evidence when it is done. The review is
+complete only when every row is done. Until then the deployment must keep
+`VITE_SUPPORTED_JURISDICTIONS` empty, and the UI then tells users not to wager real funds.
+
 ## Reporting Vulnerabilities
 
 Open a GitHub issue with the label `security`. For critical vulnerabilities, contact the maintainers directly before public disclosure.

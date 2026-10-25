@@ -279,7 +279,18 @@ Flag any result where the recorded winner does not match the actual game outcome
 
 #### 3.4 For fraudulent results, call `override_result` during the dispute window
 
-If any `submit_result` calls were fraudulent, override them before the dispute window expires:
+If any `submit_result` calls were fraudulent, override them before the dispute window expires.
+
+Before each override, export that match's evidence bundle and keep it with the incident record.
+It shows the provider's result, the oracle's attempts and the on-chain references, and it contains
+no keys or usernames. The same procedure handles ordinary player disputes; see
+[dispute-evidence.md](dispute-evidence.md#retrieval-procedure):
+
+```bash
+cd apps/backend && npm run --silent evidence -- --game-id "$GAME_ID" --match-id "$AFFECTED_MATCH_ID" > "evidence-$AFFECTED_MATCH_ID.json"
+```
+
+Then override:
 
 ```bash
 stellar contract invoke \

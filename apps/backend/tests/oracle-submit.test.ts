@@ -8,17 +8,20 @@ import {
   type RetryConfig,
   type OracleSubmission,
 } from '../src/services/oracle-submit.js';
-import { listDlqEntries, removeDlqEntry } from '../src/queue.js';
+import { initializeQueue, listDlqEntries, removeDlqEntry } from '../src/queue.js';
 
-// Clear DLQ between tests
-function clearDlq() {
-  for (const entry of listDlqEntries()) {
-    removeDlqEntry(entry.id);
+// The queue API became async with the persistent stores; initialise the
+// in-memory store and clear it between tests.
+async function clearDlq() {
+  for (const entry of await listDlqEntries()) {
+    await removeDlqEntry(entry.id);
   }
 }
 
-beforeEach(() => {
-  clearDlq();
+beforeEach(async () => {
+  process.env.QUEUE_STORE = 'memory';
+  await initializeQueue();
+  await clearDlq();
   vi.useFakeTimers();
 });
 
