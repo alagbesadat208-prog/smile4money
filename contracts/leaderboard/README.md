@@ -1,8 +1,8 @@
 # Leaderboard Contract
 
 Tracks lifetime win / loss / draw records and total earnings per Stellar
-address, so a frontend can render a ranked leaderboard without replaying the
-escrow's entire history off-chain.
+address, with immutable lifetime totals and separately keyed season totals,
+so a frontend can render ranked competitions without replaying escrow history.
 
 - [How results get in](#how-results-get-in)
 - [Identity and edge cases](#identity-and-edge-cases)
@@ -43,6 +43,21 @@ sides are the same address is rejected rather than counted, because it would
 hand one player a win and a loss simultaneously and inflate `matches_played`.
 
 ## Public functions
+
+### Seasons and collection limits
+
+`record_season_result(season_id, ...)` records the same settled match in both
+lifetime totals and the named season. Season identifiers are caller-defined
+`u32` values; creating another season never resets or changes earlier totals.
+`get_season_stats(player, season_id)` and
+`get_season_leaderboard(season_id, limit, offset)` read only that season.
+Each player can have at most 16 distinct seasons and 16 distinct token assets.
+When a new value would exceed either limit, the entire invocation fails with
+`CollectionLimitReached` before any accounting is retained.
+
+`get_asset_breakdown(player)` returns one row per token used in lifetime
+settlements. Earnings are denominated in that token's smallest unit; rows for
+different token addresses cannot be added or compared as if they shared units.
 
 ### `initialize`
 
@@ -173,6 +188,7 @@ rebuilding state.
 | 4 | `InvalidResult` | Same player on both sides, or negative payout |
 | 5 | `InvalidRange` | `limit` is zero, or `offset` is past the end |
 | 6 | `ContractPaused` | Result recording is paused |
+| 7 | `CollectionLimitReached` | A player's asset or season limit was reached |
 
 ## Events
 
@@ -183,6 +199,7 @@ rebuilding state.
 | `("admin", "src_del")` | `(caller)` |
 | `("admin", "pause_set")` | `(paused, caller)` |
 | `("result", "recorded")` | `(player1, player2, outcome, payout, token, result_count)` |
+| `("season", "recorded")` | `(season_id, player1, player2, outcome, payout, token)` |
 
 ## Security notes
 

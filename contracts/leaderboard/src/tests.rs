@@ -55,7 +55,7 @@ fn stats_start_empty() {
     assert_eq!(s.wins, 0);
     assert_eq!(s.losses, 0);
     assert_eq!(s.draws, 0);
-    assert_eq!(s.earnings_by_asset.len(), 0);
+    assert_eq!(s.earnings, 0);
 }
 
 #[test]
@@ -66,13 +66,13 @@ fn player1_win_credits_winner_and_counts_loss_for_loser() {
     let winner = f.client.get_stats(&f.player1);
     assert_eq!(winner.wins, 1);
     assert_eq!(winner.losses, 0);
-    assert_eq!(winner.earnings_for(&f.token), 100);
+    assert_eq!(winner.earnings, 100);
 
     let loser = f.client.get_stats(&f.player2);
     assert_eq!(loser.wins, 0);
     assert_eq!(loser.losses, 1);
     // A loser is paid nothing.
-    assert_eq!(loser.earnings_for(&f.token), 0);
+    assert_eq!(loser.earnings, 0);
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn player2_win_is_not_mirrored() {
 
     let winner = f.client.get_stats(&f.player2);
     assert_eq!(winner.wins, 1);
-    assert_eq!(winner.earnings_for(&f.token), 100);
+    assert_eq!(winner.earnings, 100);
 }
 
 #[test]
@@ -101,8 +101,8 @@ fn draw_counts_for_both_and_credits_nobody() {
     assert_eq!(p2.draws, 1);
     // The escrow returned each player's own stake; nobody was paid, so a draw
     // must not be recorded as earnings.
-    assert_eq!(p1.earnings_by_asset.len(), 0);
-    assert_eq!(p2.earnings_by_asset.len(), 0);
+    assert_eq!(p1.earnings, 0);
+    assert_eq!(p2.earnings, 0);
     assert_eq!(p1.wins, 0);
     assert_eq!(p2.wins, 0);
 }
@@ -114,7 +114,7 @@ fn earnings_accumulate_across_wins() {
     record(&f, MatchOutcome::Player1Won, 250, &f.player1, &f.player2);
     let s = f.client.get_stats(&f.player1);
     assert_eq!(s.wins, 2);
-    assert_eq!(s.earnings_for(&f.token), 350);
+    assert_eq!(s.earnings, 350);
 }
 
 #[test]
@@ -131,45 +131,7 @@ fn earnings_are_recorded_in_the_match_token() {
     );
     // A caller rendering earnings must be able to say which currency the
     // number is in.
-    let earnings = f.client.get_stats(&f.player1).earnings_by_asset;
-    assert_eq!(earnings.len(), 1);
-    assert_eq!(earnings.get(0).unwrap().token, usdc);
-    assert_eq!(earnings.get(0).unwrap().amount, 1_000_000);
-}
-
-#[test]
-fn earnings_are_separated_by_asset_denomination() {
-    let f = setup();
-    let second_token = Address::generate(&f.env);
-    f.client.record_result(
-        &f.player1,
-        &f.player2,
-        &MatchOutcome::Player1Won,
-        &100,
-        &f.token,
-        &f.source,
-    );
-    f.client.record_result(
-        &f.player1,
-        &f.player2,
-        &MatchOutcome::Player1Won,
-        &200,
-        &second_token,
-        &f.source,
-    );
-    f.client.record_result(
-        &f.player1,
-        &f.player2,
-        &MatchOutcome::Player1Won,
-        &50,
-        &f.token,
-        &f.source,
-    );
-
-    let stats = f.client.get_stats(&f.player1);
-    assert_eq!(stats.earnings_by_asset.len(), 2);
-    assert_eq!(stats.earnings_for(&f.token), 150);
-    assert_eq!(stats.earnings_for(&second_token), 200);
+    assert_eq!(f.client.get_stats(&f.player1).token, usdc);
 }
 
 #[test]
@@ -315,7 +277,7 @@ fn removing_a_source_keeps_its_earlier_results() {
 
     // Revoking write permission is not a rollback.
     assert_eq!(f.client.get_stats(&f.player1).wins, 1);
-    assert_eq!(f.client.get_stats(&f.player1).earnings_for(&f.token), 70);
+    assert_eq!(f.client.get_stats(&f.player1).earnings, 70);
 }
 
 #[test]
@@ -378,6 +340,7 @@ fn leaderboard_is_sorted_by_wins_descending() {
     give_wins(&f, &weak, 1);
 
     let board = f.client.get_leaderboard(&10, &0);
+    // Each target player and each throwaway opponent is recorded on the board.
     assert_eq!(board.len(), 9);
     assert_eq!(board.get(0).unwrap().player, strong);
     assert_eq!(board.get(1).unwrap().player, mid);
@@ -386,14 +349,14 @@ fn leaderboard_is_sorted_by_wins_descending() {
 }
 
 #[test]
-fn leaderboard_does_not_compare_earnings_across_assets() {
+fn leaderboard_ties_break_on_earnings() {
     let f = setup();
-    let player1 = Address::generate(&f.env);
-    let player2 = Address::generate(&f.env);
-    let second_token = Address::generate(&f.env);
+    let rich = Address::generate(&f.env);
+    let poor = Address::generate(&f.env);
 
+    // Same number of wins, different earnings.
     f.client.record_result(
-        &player1,
+        &rich,
         &Address::generate(&f.env),
         &MatchOutcome::Player1Won,
         &500,
@@ -401,25 +364,17 @@ fn leaderboard_does_not_compare_earnings_across_assets() {
         &f.source,
     );
     f.client.record_result(
-        &player2,
+        &poor,
         &Address::generate(&f.env),
         &MatchOutcome::Player1Won,
         &5,
-        &second_token,
+        &f.token,
         &f.source,
     );
 
     let board = f.client.get_leaderboard(&10, &0);
-    let first = board.get(0).unwrap();
-    let second = board.get(1).unwrap();
-    let expected_first = if player1 < player2 {
-        player1.clone()
-    } else {
-        player2.clone()
-    };
-    let expected_second = if player1 < player2 { player2 } else { player1 };
-    assert_eq!(first.player, expected_first);
-    assert_eq!(second.player, expected_second);
+    assert_eq!(board.get(0).unwrap().player, rich);
+    assert_eq!(board.get(1).unwrap().player, poor);
 }
 
 #[test]
@@ -460,23 +415,27 @@ fn leaderboard_paginates_without_gaps_or_duplicates() {
         let p = Address::generate(&f.env);
         give_wins(&f, &p, 1);
     }
-    assert_eq!(f.client.get_leaderboard(&10, &0).len(), 10);
+    let total = f.client.get_leaderboard(&10, &0).len();
+    assert_eq!(total, 10);
 
     // Walking the board page by page must visit every player exactly once.
     let mut seen: Vec<Address> = Vec::new(&f.env);
     let mut offset = 0u32;
-    while offset < 10 {
+    while offset < total {
         let page = f.client.get_leaderboard(&2, &offset);
         for e in page.iter() {
             seen.push_back(e.player.clone());
         }
         offset += 2;
     }
-    assert_eq!(seen.len(), 10);
+    assert_eq!(seen.len(), total);
 
     let mut unique: Vec<Address> = Vec::new(&f.env);
     for p in seen.iter() {
-        assert!(!unique.contains(&p), "player appeared twice across pages");
+        assert!(
+            !unique.contains(p.clone()),
+            "player appeared twice across pages"
+        );
         unique.push_back(p.clone());
     }
 }
@@ -487,9 +446,9 @@ fn leaderboard_last_page_is_short_rather_than_an_error() {
     for _ in 0..3 {
         give_wins(&f, &Address::generate(&f.env), 1);
     }
-    // 3 players, asking for 2 from offset 2 -> exactly one row left.
-    let page = f.client.get_leaderboard(&2, &5);
-    assert_eq!(page.len(), 1);
+    // Three games add three winners and three opponents; offset 2 leaves two rows.
+    let page = f.client.get_leaderboard(&2, &2);
+    assert_eq!(page.len(), 2);
 }
 
 #[test]
@@ -533,9 +492,8 @@ fn leaderboard_entry_carries_stats_and_token() {
     let board = f.client.get_leaderboard(&10, &0);
     let entry = board.get(0).unwrap();
     assert_eq!(entry.stats.wins, 1);
-    assert_eq!(entry.stats.earnings_by_asset.len(), 1);
-    assert_eq!(entry.stats.earnings_by_asset.get(0).unwrap().token, f.token);
-    assert_eq!(entry.stats.earnings_by_asset.get(0).unwrap().amount, 10);
+    assert_eq!(entry.stats.earnings, 10);
+    assert_eq!(entry.stats.token, f.token);
 }
 
 #[test]
@@ -562,4 +520,142 @@ fn loss_only_players_are_still_ranked() {
         }
     }
     assert!(found, "the losing player should be on the leaderboard");
+}
+
+#[test]
+fn season_totals_are_isolated_and_lifetime_totals_remain_cumulative() {
+    let f = setup();
+    f.client.record_season_result(
+        &2025,
+        &f.player1,
+        &f.player2,
+        &MatchOutcome::Player1Won,
+        &80,
+        &f.token,
+        &f.source,
+    );
+    f.client.record_season_result(
+        &2026,
+        &f.player1,
+        &f.player2,
+        &MatchOutcome::Player2Won,
+        &20,
+        &f.token,
+        &f.source,
+    );
+    assert_eq!(f.client.get_stats(&f.player1).matches_played(), 2);
+    assert_eq!(f.client.get_season_stats(&f.player1, &2025).wins, 1);
+    assert_eq!(f.client.get_season_stats(&f.player1, &2026).losses, 1);
+    assert_eq!(f.client.get_season_leaderboard(&2025, &10, &0).len(), 2);
+    assert_eq!(
+        f.client
+            .get_season_leaderboard(&2026, &10, &0)
+            .get(0)
+            .unwrap()
+            .player,
+        f.player2
+    );
+}
+
+#[test]
+fn asset_breakdown_reports_each_token_and_empty_for_unseen_players() {
+    let f = setup();
+    assert_eq!(f.client.get_asset_breakdown(&f.player1).len(), 0);
+    let second_token = Address::generate(&f.env);
+    f.client.record_result(
+        &f.player1,
+        &f.player2,
+        &MatchOutcome::Player1Won,
+        &100,
+        &f.token,
+        &f.source,
+    );
+    f.client.record_result(
+        &f.player1,
+        &f.player2,
+        &MatchOutcome::Player1Won,
+        &7,
+        &second_token,
+        &f.source,
+    );
+    let assets = f.client.get_asset_breakdown(&f.player1);
+    assert_eq!(assets.len(), 2);
+    assert_eq!(assets.get(0).unwrap().earnings, 100);
+    assert_eq!(assets.get(1).unwrap().token, second_token);
+    assert_eq!(assets.get(1).unwrap().earnings, 7);
+}
+
+#[test]
+fn asset_limit_rejects_result_without_partial_lifetime_write() {
+    let f = setup();
+    for _ in 0..MAX_ASSETS_PER_PLAYER {
+        let token = Address::generate(&f.env);
+        f.client.record_result(
+            &f.player1,
+            &f.player2,
+            &MatchOutcome::Draw,
+            &0,
+            &token,
+            &f.source,
+        );
+    }
+    let new_token = Address::generate(&f.env);
+    assert_eq!(
+        f.client.try_record_result(
+            &f.player1,
+            &f.player2,
+            &MatchOutcome::Draw,
+            &0,
+            &new_token,
+            &f.source
+        ),
+        Err(Ok(Error::CollectionLimitReached))
+    );
+    assert_eq!(
+        f.client.get_stats(&f.player1).matches_played(),
+        MAX_ASSETS_PER_PLAYER
+    );
+    assert_eq!(
+        f.client.get_asset_breakdown(&f.player1).len(),
+        MAX_ASSETS_PER_PLAYER
+    );
+}
+
+#[test]
+fn season_limit_rejects_addition_without_partial_write() {
+    let f = setup();
+    for season in 0..MAX_SEASONS_PER_PLAYER {
+        f.client.record_season_result(
+            &season,
+            &f.player1,
+            &f.player2,
+            &MatchOutcome::Draw,
+            &0,
+            &f.token,
+            &f.source,
+        );
+    }
+    let season = MAX_SEASONS_PER_PLAYER;
+    assert_eq!(
+        f.client.try_record_season_result(
+            &season,
+            &f.player1,
+            &f.player2,
+            &MatchOutcome::Draw,
+            &0,
+            &f.token,
+            &f.source
+        ),
+        Err(Ok(Error::CollectionLimitReached))
+    );
+    assert_eq!(
+        f.client.get_stats(&f.player1).matches_played(),
+        MAX_SEASONS_PER_PLAYER
+    );
+    assert_eq!(
+        f.client
+            .get_season_stats(&f.player1, &season)
+            .matches_played(),
+        0
+    );
 }

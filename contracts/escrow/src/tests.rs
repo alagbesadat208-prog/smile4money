@@ -4853,3 +4853,60 @@ fn test_submit_result_mismatched_game_id_returns_game_id_mismatch() {
         Err(Ok(Error::GameIdMismatch))
     );
 }
+
+#[test]
+fn result_correction_keeps_original_submission_in_audit_events() {
+    let (env, contract_id, oracle, player1, player2, token, _admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let game_id = String::from_str(&env, "audit_correction");
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(token),
+        &game_id,
+        &Platform::Lichess,
+    );
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+    client.submit_result(&id, &game_id, &Winner::Player1, &oracle);
+    client.override_result(&id, &Winner::Player2);
+
+    let events = env.events().all();
+    let pending_topics = vec![
+        &env,
+        Symbol::new(&env, "oracle").into_val(&env),
+        symbol_short!("pending").into_val(&env),
+    ];
+    let correction_topics = vec![
+        &env,
+        Symbol::new(&env, "oracle").into_val(&env),
+        symbol_short!("overridn").into_val(&env),
+    ];
+    let pending = events
+        .iter()
+        .find(|(_, topics, _)| *topics == pending_topics)
+        .expect("original submission event retained");
+    let correction = events
+        .iter()
+        .find(|(_, topics, _)| *topics == correction_topics)
+        .expect("correction event emitted");
+    let (pending_id, original, _): (u64, Winner, Option<u32>) =
+        TryFromVal::try_from_val(&env, &pending.2).unwrap();
+    let (corrected_id, previous, replacement): (u64, OptionalWinner, Winner) =
+        TryFromVal::try_from_val(&env, &correction.2).unwrap();
+    assert_eq!(pending_id, id);
+    assert_eq!(original, Winner::Player1);
+    assert_eq!(corrected_id, id);
+    assert_eq!(previous, OptionalWinner::Some(Winner::Player1));
+    assert_eq!(replacement, Winner::Player2);
+
+    env.ledger().set_sequence_number(
+        env.ledger().sequence() + crate::DISPUTE_WINDOW_LEDGERS + 1,
+    );
+    client.finalize_result(&id, &player1);
+    assert_eq!(
+        client.try_override_result(&id, &Winner::Player1),
+        Err(Ok(Error::InvalidState))
+    );
+}

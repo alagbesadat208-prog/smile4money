@@ -85,6 +85,25 @@ describe('Leaderboard â€” rendering', () => {
     expect(screen.queryByTestId('leaderboard-table')).not.toBeInTheDocument();
   });
 
+  it('lets a player open the per-token settlement breakdown', async () => {
+    const user = userEvent.setup();
+    const fetchAssets = vi.fn().mockResolvedValue([
+      { token: 'CTOKENONE', wins: 2, losses: 1, draws: 0, earnings: '2500' },
+      { token: 'CTOKENTWO', wins: 0, losses: 0, draws: 1, earnings: '0' },
+    ]);
+    render(
+      <Leaderboard
+        contractId={CONTRACT}
+        fetchPage={vi.fn().mockResolvedValue([entry('GPLAYER', 2, '2500')])}
+        fetchAssets={fetchAssets}
+      />,
+    );
+    await user.click(await screen.findByRole('button', { name: 'Asset details' }));
+    expect(await screen.findByTestId('leaderboard-assets')).toHaveTextContent('CTOKENONE');
+    expect(screen.getByTestId('leaderboard-assets')).toHaveTextContent('CTOKENTWO');
+    expect(fetchAssets).toHaveBeenCalledWith('GPLAYER');
+  });
+
   it('surfaces a fetch failure as an alert', async () => {
     const fetchPage = vi.fn().mockRejectedValue(new Error('RPC unavailable'));
     render(<Leaderboard contractId={CONTRACT} fetchPage={fetchPage} />);

@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address, Env, Vec};
+use soroban_sdk::{contracterror, contracttype, Address};
 
 /// Errors returned by the leaderboard contract.
 ///
@@ -10,7 +10,7 @@ use soroban_sdk::{contracterror, contracttype, Address, Env, Vec};
 /// |  4   | InvalidResult    | Result is not a recognised variant             |
 /// |  5   | InvalidRange     | `limit` is zero or the page offset is past the end |
 /// |  6   | ContractPaused   | Result recording is paused                     |
-/// |  7   | Overflow         | An earnings amount exceeds its integer range   |
+/// |  7   | CollectionLimitReached | A player's asset or season limit was reached |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -31,9 +31,8 @@ pub enum Error {
 
     /// [E006] Result recording is paused.
     ContractPaused = 6,
-
-    /// [E007] An earnings amount exceeds its integer range.
-    Overflow = 7,
+    /// [E007] A player's asset or season limit has been reached.
+    CollectionLimitReached = 7,
 }
 
 /// The outcome of a single match, as reported by the escrow contract.
@@ -51,7 +50,10 @@ pub enum MatchOutcome {
 /// A player's lifetime record.
 ///
 /// `wins + losses + draws` is the number of completed matches that player has
-/// taken part in. Earnings are grouped by token denomination.
+/// taken part in. `earnings` is in the token's smallest unit and is therefore
+/// **not** comparable across tokens — a player who only staked USDC and a
+/// player who only staked XLM produce numbers on different scales. The
+/// leaderboard surfaces the token alongside the figure for this reason.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlayerStats {
@@ -61,40 +63,48 @@ pub struct PlayerStats {
     pub losses: u32,
     /// Completed matches drawn.
     pub draws: u32,
-    /// Amounts won, grouped by token denomination.
-    pub earnings_by_asset: Vec<AssetEarnings>,
+    /// Total amount won, in the token's smallest unit.
+    pub earnings: i128,
+    /// Address of the token `earnings` is denominated in.
+    pub token: Address,
 }
 
+/// Per-token contribution to a player's lifetime totals. Amounts are in the
+/// token's smallest unit; values from different token addresses must not be added.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AssetEarnings {
-    /// Address of the token this amount is denominated in.
+pub struct AssetStats {
+    /// Token contract address identifying the asset and its units.
     pub token: Address,
-    /// Total amount won in the token's smallest unit.
-    pub amount: i128,
+    /// Matches won using this token.
+    pub wins: u32,
+    /// Matches lost using this token.
+    pub losses: u32,
+    /// Matches drawn using this token.
+    pub draws: u32,
+    /// Total winnings in this token's smallest unit.
+    pub earnings: i128,
 }
+
+/// Maximum distinct token assets retained for one player.
+pub const MAX_ASSETS_PER_PLAYER: u32 = 16;
+/// Maximum distinct season identifiers retained for one player.
+pub const MAX_SEASONS_PER_PLAYER: u32 = 16;
 
 impl PlayerStats {
     /// A zeroed record for a player who has not been seen.
-    pub fn empty(env: &Env) -> Self {
+    ///
+    /// Written by hand rather than derived from `Default` because `Address` has
+    /// no `Default` impl. Returning a zeroed record (rather than `None`) keeps
+    /// `get_stats` total — a caller never has to handle an absent player.
+    pub fn empty(token: &Address) -> Self {
         PlayerStats {
             wins: 0,
             losses: 0,
             draws: 0,
-            earnings_by_asset: Vec::new(env),
+            earnings: 0,
+            token: token.clone(),
         }
-    }
-
-    pub fn earnings_for(&self, token: &Address) -> i128 {
-        let mut index = 0;
-        while index < self.earnings_by_asset.len() {
-            let asset = self.earnings_by_asset.get(index).unwrap();
-            if asset.token == *token {
-                return asset.amount;
-            }
-            index += 1;
-        }
-        0
     }
 
     /// Total completed matches this player took part in.
@@ -112,7 +122,7 @@ impl PlayerStats {
 pub struct LeaderboardEntry {
     /// The player's Stellar address.
     pub player: Address,
-    /// The player's lifetime record.
+    /// The player's lifetime or requested-season record.
     pub stats: PlayerStats,
 }
 
@@ -123,9 +133,13 @@ pub struct LeaderboardEntry {
 /// | `Admin`              | Instance   | Address permitted to pause and re-key |
 /// | `Paused`             | Instance   | Whether recording results is blocked  |
 /// | `Stats(Address)`     | Persistent | [`PlayerStats`] for one address       |
+/// | `SeasonStats(Address, u32)` | Persistent | One player's totals in one season |
+/// | `Assets(Address)`    | Persistent | Bounded per-token lifetime totals      |
+/// | `Seasons(Address)`   | Persistent | Bounded season IDs seen by one player  |
 /// | `ResultCount`        | Instance   | Number of results recorded so far     |
 /// | `Sources(Address)`   | Instance   | Whether an address may submit results |
 /// | `Roster`             | Instance   | Every address that has a stats entry  |
+/// | `SeasonRoster(u32)`  | Instance   | Addresses with results in a season     |
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -135,6 +149,12 @@ pub enum DataKey {
     Paused,
     /// A player's [`PlayerStats`].
     Stats(Address),
+    /// A player's stats for one season.
+    SeasonStats(Address, u32),
+    /// All asset contributions for one player.
+    Assets(Address),
+    /// Season identifiers in which a player has recorded a result.
+    Seasons(Address),
     /// How many results have been recorded, used to bound the leaderboard.
     ResultCount,
     /// Whether `Address` is authorised to submit results.
@@ -145,6 +165,8 @@ pub enum DataKey {
     /// has no other way to discover which players exist. This is the index that
     /// makes the leaderboard readable.
     Roster,
+    /// Addresses with a result in a season.
+    SeasonRoster(u32),
 }
 
 /// Maximum number of rows a single `get_leaderboard` call may return.
