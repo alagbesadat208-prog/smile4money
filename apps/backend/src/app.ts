@@ -64,4 +64,9 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
   res.status(status).json({ error: message });
 });
 
+// Public service status (#115). Mounted here, after the other routes, so the
+// route list above stays untouched; the handler never throws.
+import statusRouter from './routes/status.js';
+app.use('/status', statusRouter);
+
 export default app;

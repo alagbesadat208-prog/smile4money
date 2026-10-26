@@ -1,0 +1,806 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "smile4money backend API",
+    "version": "1.0.0",
+    "description": "Contract for frontend and third-party consumers. Versioning and deprecation rules: docs/api-compatibility.md. Breaking changes to this file fail CI unless info.version's major number is raised (apps/backend/src/contract/openapi-compat.ts)."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:4000"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Liveness, with an optional deep Stellar RPC check",
+        "responses": {
+          "200": {
+            "description": "Healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthOk"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A dependency is unreachable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/matches": {
+      "post": {
+        "operationId": "createMatch",
+        "summary": "Create a match for the authenticated player (player1)",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateMatchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Match created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Match"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A match already exists for this game",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/validate-game": {
+      "post": {
+        "operationId": "validateGame",
+        "summary": "Check a game exists and is eligible",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValidateGameRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Game exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidateGameResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Game not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidateGameFailure"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidateGameFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/oracle/submit-result": {
+      "post": {
+        "operationId": "submitResult",
+        "summary": "Verify a finished game's result for on-chain submission",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitResultRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Result verified",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubmitResultResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Match or game not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "operationId": "getStatus",
+        "summary": "Public component-level service status and incidents (no authentication)",
+        "responses": {
+          "200": {
+            "description": "Current status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "ErrorCode": {
+        "type": "string",
+        "enum": [
+          "VALIDATION_ERROR",
+          "UNAUTHORIZED",
+          "NOT_FOUND",
+          "CONFLICT",
+          "RATE_LIMITED",
+          "INTERNAL_ERROR"
+        ]
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "$ref": "#/components/schemas/ErrorCode"
+              },
+              "message": {
+                "type": "string"
+              },
+              "hint": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "Platform": {
+        "type": "string",
+        "enum": [
+          "lichess",
+          "chessdotcom"
+        ]
+      },
+      "MatchResult": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "Player1Wins",
+          "Player2Wins",
+          "Draw",
+          null
+        ]
+      },
+      "HealthOk": {
+        "type": "object",
+        "required": [
+          "status",
+          "uptime",
+          "version"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ]
+          },
+          "uptime": {
+            "type": "number"
+          },
+          "version": {
+            "type": "string"
+          },
+          "dependencies": {
+            "type": "object",
+            "properties": {
+              "stellar_rpc": {
+                "type": "string",
+                "enum": [
+                  "ok"
+                ]
+              }
+            }
+          },
+          "limiters": {
+            "type": "object"
+          }
+        }
+      },
+      "HealthError": {
+        "type": "object",
+        "required": [
+          "status",
+          "uptime",
+          "version",
+          "error",
+          "dependencies"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "error"
+            ]
+          },
+          "uptime": {
+            "type": "number"
+          },
+          "version": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "dependencies": {
+            "type": "object",
+            "properties": {
+              "stellar_rpc": {
+                "type": "string",
+                "enum": [
+                  "unreachable"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "CreateMatchRequest": {
+        "type": "object",
+        "required": [
+          "player2",
+          "stakeAmount",
+          "token",
+          "gameId",
+          "platform"
+        ],
+        "properties": {
+          "player2": {
+            "type": "string"
+          },
+          "stakeAmount": {
+            "type": "integer",
+            "description": "Stake in stroops"
+          },
+          "token": {
+            "type": "string"
+          },
+          "gameId": {
+            "type": "string",
+            "maxLength": 511
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "username": {
+            "type": "string"
+          }
+        }
+      },
+      "Match": {
+        "type": "object",
+        "required": [
+          "matchId",
+          "player1",
+          "player2",
+          "stakeAmount",
+          "token",
+          "gameId",
+          "platform",
+          "state"
+        ],
+        "properties": {
+          "matchId": {
+            "type": "integer"
+          },
+          "player1": {
+            "type": "string"
+          },
+          "player2": {
+            "type": "string"
+          },
+          "player1Username": {
+            "type": "string"
+          },
+          "player2Username": {
+            "type": "string"
+          },
+          "stakeAmount": {
+            "type": "number"
+          },
+          "token": {
+            "type": "string"
+          },
+          "gameId": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "Pending"
+            ]
+          },
+          "identityHash": {
+            "type": "string"
+          }
+        }
+      },
+      "ValidateGameRequest": {
+        "type": "object",
+        "required": [
+          "gameId",
+          "platform"
+        ],
+        "properties": {
+          "gameId": {
+            "type": "string",
+            "maxLength": 511
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "username": {
+            "type": "string",
+            "description": "Required for chessdotcom"
+          }
+        }
+      },
+      "ValidateGameResponse": {
+        "type": "object",
+        "required": [
+          "valid",
+          "platform",
+          "gameId"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "gameId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "whitePlayer": {
+            "type": "string"
+          },
+          "blackPlayer": {
+            "type": "string"
+          },
+          "result": {
+            "$ref": "#/components/schemas/MatchResult"
+          }
+        }
+      },
+      "ValidateGameFailure": {
+        "type": "object",
+        "required": [
+          "valid",
+          "error"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "platform": {
+            "type": "string"
+          },
+          "gameId": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "$ref": "#/components/schemas/ErrorCode"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "SubmitResultRequest": {
+        "type": "object",
+        "required": [
+          "matchId",
+          "gameId",
+          "platform"
+        ],
+        "properties": {
+          "matchId": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "gameId": {
+            "type": "string"
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "username": {
+            "type": "string",
+            "description": "Required for chessdotcom"
+          }
+        }
+      },
+      "SubmitResultResponse": {
+        "type": "object",
+        "required": [
+          "verified",
+          "matchId",
+          "gameId",
+          "result"
+        ],
+        "properties": {
+          "verified": {
+            "type": "boolean"
+          },
+          "matchId": {
+            "type": "integer"
+          },
+          "gameId": {
+            "type": "string"
+          },
+          "result": {
+            "$ref": "#/components/schemas/MatchResult"
+          },
+          "whitePlayer": {
+            "type": "string"
+          },
+          "blackPlayer": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "ComponentStatus": {
+        "type": "string",
+        "enum": [
+          "operational",
+          "degraded",
+          "outage",
+          "unknown"
+        ]
+      },
+      "Incident": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "stage",
+          "impact",
+          "components",
+          "startedAt",
+          "updates"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "investigating",
+              "identified",
+              "monitoring",
+              "resolved"
+            ]
+          },
+          "impact": {
+            "type": "string",
+            "enum": [
+              "degraded",
+              "outage"
+            ]
+          },
+          "components": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "at",
+                "message"
+              ],
+              "properties": {
+                "at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "PublicStatus": {
+        "type": "object",
+        "required": [
+          "updatedAt",
+          "overall",
+          "components",
+          "activeIncidents",
+          "recentIncidents"
+        ],
+        "properties": {
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "overall": {
+            "$ref": "#/components/schemas/ComponentStatus"
+          },
+          "components": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name",
+                "status",
+                "detail"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/components/schemas/ComponentStatus"
+                },
+                "detail": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "activeIncidents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Incident"
+            }
+          },
+          "recentIncidents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Incident"
+            }
+          }
+        }
+      }
+    }
+  }
+}

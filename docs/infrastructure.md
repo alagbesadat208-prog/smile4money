@@ -136,6 +136,13 @@ Before any mainnet deployment:
 
 ---
 
+### 4.4 Storage, status and API contract
+
+- **Storage capacity:** database size and free-space alarms, thresholds and safe cleanup are in [storage-capacity.md](storage-capacity.md).
+- **Live restore:** restoring the queue database while the worker runs is in [live-restore.md](live-restore.md).
+- **Status page:** the public `GET /status` endpoint, its components and the incident update procedure are in [status-page.md](status-page.md).
+- **API contract:** the OpenAPI contract, versioning and deprecation rules, and the CI breaking-change check are in [api-compatibility.md](api-compatibility.md).
+
 ## 5. Security Scanning
 
 **File:** `.github/workflows/audit.yml`  

@@ -61,6 +61,18 @@ export function resolveQueueStoreType(
  * NODE_ENV=production silently requesting it is auto-corrected to SQLite
  * (see docs/oracle.md#queue-store-persistence).
  */
+// Maintenance gate for live restores (#108); see store/maintenance-gate.ts.
+import { MaintainableQueueStore } from "./store/maintenance-gate.js";
+
+/**
+ * The active queue store's maintenance gate, or null before initializeQueue().
+ * Used by the live-restore procedure (store/live-restore.ts) to hold queue
+ * access while the database file is replaced.
+ */
+export function getMaintainableQueueStore(): MaintainableQueueStore | null {
+  return queueStore instanceof MaintainableQueueStore ? queueStore : null;
+}
+
 export async function initializeQueue(): Promise<void> {
   const rawQueueStore = process.env.QUEUE_STORE;
   const nodeEnv = process.env.NODE_ENV;
@@ -81,8 +93,10 @@ export async function initializeQueue(): Promise<void> {
     );
   }
 
-  queueStore =
-    resolved === "memory" ? new InMemoryQueueStore() : new SQLiteQueueStore();
+  // Wrapped so a live restore can quiesce every queue read/write (#108).
+  queueStore = new MaintainableQueueStore(
+    resolved === "memory" ? new InMemoryQueueStore() : new SQLiteQueueStore(),
+  );
 
   await queueStore.initialize();
 

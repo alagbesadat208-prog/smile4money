@@ -188,6 +188,17 @@ async function main() {
 
     process.on('SIGTERM', () => void shutdown('SIGTERM'));
     process.on('SIGINT', () => void shutdown('SIGINT'));
+
+    // Storage capacity alarms (#105) and the live database restore trigger
+    // (#108); see maintenance.ts.
+    const { installMaintenance } = await import('./maintenance.js');
+    installMaintenance({
+      logger,
+      isSettled: async (entry) => {
+        const matchId = (entry.payload as { matchId?: unknown } | null)?.matchId;
+        return typeof matchId === 'number' ? checkResultExistsOnChain(matchId) : false;
+      },
+    });
   } catch (error) {
     logger.error({ error }, 'Failed to start server');
     process.exit(1);

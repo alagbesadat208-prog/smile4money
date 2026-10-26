@@ -330,6 +330,10 @@ See [§5 Unpausing the Contract](#5-unpausing-the-contract) for the unpause comm
 
 ---
 
+> **Related procedures:** [publish incident updates on the status page](status-page.md#owner-and-update-procedure) during any incident; [respond to storage alarms](storage-capacity.md#responding-to-an-alarm); [restore the queue database without stopping the backend](live-restore.md).
+
+---
+
 ## 4. Emergency Fund Drain
 
 **When to use:** Active exploit with no time for match-by-match resolution. Transfers the

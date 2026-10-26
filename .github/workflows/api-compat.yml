@@ -1,0 +1,46 @@
+# Fail a pull request that changes the backend API contract in a way that
+# breaks existing consumers without a major version bump (#117).
+# Policy: docs/api-compatibility.md. Checker: apps/backend/src/contract/openapi-compat.ts.
+
+name: API compatibility
+
+on:
+  pull_request:
+    paths:
+      - "apps/backend/**"
+      - ".github/workflows/api-compat.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  openapi-compat:
+    name: OpenAPI breaking-change check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/backend
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/backend/package-lock.json
+
+      - run: npm ci
+
+      - name: Contract from the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # Empty when the contract is new on this branch; the checker then passes.
+          git show "origin/${BASE_REF}:apps/backend/openapi.json" > "$RUNNER_TEMP/base-openapi.json" 2>/dev/null \
+            || : > "$RUNNER_TEMP/base-openapi.json"
+
+      - name: Compare
+        run: npx tsx src/cli/openapi-compat.ts "$RUNNER_TEMP/base-openapi.json" openapi.json
