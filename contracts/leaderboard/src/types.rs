@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address, String};
 
 /// Errors returned by the leaderboard contract.
 ///
@@ -116,6 +116,7 @@ pub struct LeaderboardEntry {
 /// | `Paused`             | Instance   | Whether recording results is blocked  |
 /// | `Stats(Address)`     | Persistent | [`PlayerStats`] for one address       |
 /// | `ResultCount`        | Instance   | Number of results recorded so far     |
+/// | `SettlementId(String)` | Persistent | Whether a settlement ID was processed |
 /// | `Sources(Address)`   | Instance   | Whether an address may submit results |
 /// | `Roster`             | Instance   | Every address that has a stats entry  |
 /// | `RankedRoster`       | Instance   | Global rank-ordered address index     |
@@ -133,6 +134,8 @@ pub enum DataKey {
     AssetStats(Address, Address),
     /// How many results have been recorded, used to bound the leaderboard.
     ResultCount,
+    /// Whether this settlement identifier has been processed.
+    SettlementId(String),
     /// Whether `Address` is authorised to submit results.
     Sources(Address),
     /// Every address that has a [`PlayerStats`] entry.

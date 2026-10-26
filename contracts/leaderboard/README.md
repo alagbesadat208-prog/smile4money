@@ -7,7 +7,6 @@ escrow's entire history off-chain.
 - [How results get in](#how-results-get-in)
 - [Identity and edge cases](#identity-and-edge-cases)
 - [Public functions](#public-functions)
-- [Asset-denominated rankings](#asset-denominated-rankings)
 - [Errors](#errors)
 - [Events](#events)
 - [Security notes](#security-notes)
@@ -68,6 +67,7 @@ pub fn record_result(
     outcome: MatchOutcome,
     payout: i128,
     token: Address,
+    settlement_id: String,
     caller: Address,
 ) -> Result<(), Error>
 ```
@@ -78,21 +78,23 @@ draw and **nobody is credited** — the escrow returned each player's own stake,
 so no one was paid, and counting a refund as earnings would inflate the board
 for players who draw often.
 
-`earnings` in the global player record is denominated in `token` and resets if
-that player later wins in a different token. The per-asset leaderboard keeps
-separate counters and earnings for each token. Amounts in different tokens are
-never converted or compared across asset rankings.
+`earnings` is stored in the token's smallest unit, so the `token` address is
+recorded alongside it. Amounts in different tokens are **not** comparable
+numbers, and a caller that sums them without grouping by currency would be
+adding unlike units.
 
 Emits `("result", "recorded")`.
 
 **Authorization:** only a registered data source (`caller`).
 
+`settlement_id` is required and acts as an idempotency key. A retry with the
+same ID is a no-op. Use the escrow settlement identifier consistently across
+retries; settlement IDs are retained for the same ledger TTL as player stats.
+
 **Errors:**
 - `Unauthorized` — caller is not a registered source
 - `ContractPaused` — recording is paused
-- `InvalidResult` — `player1 == player2`, or `payout` is negative
-- `InvalidAsset` — `token` does not implement the token contract interface
-- `TooManyPlayers` — the index has reached `MAX_PLAYERS` (256)
+- `InvalidResult` — players are identical, payout is negative, or settlement ID is empty
 
 ---
 
@@ -106,9 +108,8 @@ Returns a page of the leaderboard. `limit` is capped at `MAX_PAGE_SIZE` (50), so
 a caller asking for more gets one full page rather than a response too large to
 return in a single transaction.
 
-**Ordering:** wins descending, then address ascending. The global index is
-maintained on writes, and reads load stats only for the requested page. The
-index is capped at 256 distinct players.
+**Ordering:** wins descending, then `earnings` descending, then address
+ascending.
 
 The address tie-break is **not cosmetic**. Without it two players with
 identical records have no defined relative order, and paging would show the
@@ -123,22 +124,6 @@ results" signal for a paginated read.
 
 ---
 
-### `get_asset_leaderboard`
-
-```rust
-pub fn get_asset_leaderboard(
-    env: Env, asset: Address, limit: u32, offset: u32
-) -> Result<Vec<LeaderboardEntry>, Error>
-```
-
-Returns a separate ranking for one asset, ordered by wins descending, earnings
-in that asset's smallest unit descending, then player address ascending. Equal
-records therefore have a stable address order. No exchange rate is applied;
-rankings from different assets must remain separate. Page size and offsets
-follow `get_leaderboard`.
-
----
-
 ### `get_stats`
 
 ```rust
@@ -147,8 +132,6 @@ pub fn get_stats(env: Env, player: Address) -> PlayerStats
 
 One player's record. Returns a **zeroed record** rather than an error for a
 player who has never played, so callers never have to handle an absent player.
-Its `earnings` and `token` fields describe only the current denomination; use
-`get_asset_leaderboard` for complete per-token history.
 
 ---
 
@@ -185,10 +168,6 @@ rebuilding state.
 | `result_count(env) -> u32` | Results recorded so far |
 | `get_admin(env) -> Result<Address, Error>` | The configured admin |
 
-Every successful mutating call bumps instance storage TTL. Player records and
-asset indexes use persistent storage and receive the same 518,400 ledger TTL
-when updated.
-
 ## Errors
 
 | Code | Variant | Meaning |
@@ -199,8 +178,6 @@ when updated.
 | 4 | `InvalidResult` | Same player on both sides, or negative payout |
 | 5 | `InvalidRange` | `limit` is zero, or `offset` is past the end |
 | 6 | `ContractPaused` | Result recording is paused |
-| 7 | `InvalidAsset` | Asset is not a token contract |
-| 8 | `TooManyPlayers` | The 256 player index limit was reached |
 
 ## Events
 
@@ -222,6 +199,8 @@ when updated.
 - **No admin backdoor to rewrite history.** The admin can pause recording and
   manage sources; it cannot edit or delete a recorded result. Correcting a bad
   result means recording the truth and reconciling off-chain.
-- **Population is bounded at 256.** Rank indexes are maintained during writes;
-  leaderboard reads fetch only the requested page's player records. Writes
-  reorder the bounded index, while reads do no roster-wide sorting.
+- **Unbounded roster growth is the known scaling limit.** `get_leaderboard`
+  sorts on every read with insertion sort, which is `O(n^2)` in the roster size
+  — adequate while the board is small, and the first thing to revisit if it is
+  not. The alternative (a maintained on-chain sorted index) costs far more per
+  write, which is the wrong trade for a display contract.

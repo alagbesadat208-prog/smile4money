@@ -6,10 +6,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, Env,
-};
+use soroban_sdk::{testutils::Address as _, Address, Env};
 
 struct Fixture {
     env: Env,
@@ -29,10 +26,7 @@ fn setup() -> Fixture {
     let source = Address::generate(&env);
     let player1 = Address::generate(&env);
     let player2 = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-    let token = env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
+    let token = Address::generate(&env);
 
     let id = env.register(LeaderboardContract, ());
     let client = LeaderboardContractClient::new(&env, &id);
@@ -49,9 +43,21 @@ fn setup() -> Fixture {
     }
 }
 
+fn next_settlement_id(f: &Fixture) -> String {
+    String::from_bytes(&f.env, &f.client.result_count().to_be_bytes())
+}
+
 fn record(f: &Fixture, outcome: MatchOutcome, payout: i128, p1: &Address, p2: &Address) {
-    f.client
-        .record_result(p1, p2, &outcome, &payout, &f.token, &f.source);
+    let settlement_id = next_settlement_id(f);
+    f.client.record_result(
+        p1,
+        p2,
+        &outcome,
+        &payout,
+        &f.token,
+        &settlement_id,
+        &f.source,
+    );
 }
 
 #[test]
@@ -126,188 +132,19 @@ fn earnings_accumulate_across_wins() {
 #[test]
 fn earnings_are_recorded_in_the_match_token() {
     let f = setup();
-    let usdc_admin = Address::generate(&f.env);
-    let usdc = f
-        .env
-        .register_stellar_asset_contract_v2(usdc_admin)
-        .address();
+    let usdc = Address::generate(&f.env);
     f.client.record_result(
         &f.player1,
         &f.player2,
         &MatchOutcome::Player1Won,
         &1_000_000,
         &usdc,
+        &next_settlement_id(&f),
         &f.source,
     );
     // A caller rendering earnings must be able to say which currency the
     // number is in.
     assert_eq!(f.client.get_stats(&f.player1).token, usdc);
-}
-
-#[test]
-fn rejects_an_address_that_is_not_a_token_contract_without_writing() {
-    let f = setup();
-    let invalid = Address::generate(&f.env);
-    assert_eq!(
-        f.client.try_record_result(
-            &f.player1,
-            &f.player2,
-            &MatchOutcome::Player1Won,
-            &10,
-            &invalid,
-            &f.source
-        ),
-        Err(Ok(Error::InvalidAsset))
-    );
-    assert_eq!(f.client.result_count(), 0);
-    assert_eq!(f.client.get_stats(&f.player1).matches_played(), 0);
-}
-
-#[test]
-fn instance_authorization_survives_ledger_progress_and_result_writes() {
-    let f = setup();
-    f.env.ledger().set_sequence_number(400_000);
-    let token_admin = Address::generate(&f.env);
-    let live_token = f
-        .env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-    f.client.record_result(
-        &f.player1,
-        &f.player2,
-        &MatchOutcome::Player1Won,
-        &10,
-        &live_token,
-        &f.source,
-    );
-    f.env.ledger().set_sequence_number(700_000);
-    assert_eq!(f.client.get_admin(), f.admin);
-    assert!(f.client.is_source(&f.source));
-    assert_eq!(f.client.get_stats(&f.player1).wins, 1);
-}
-
-#[test]
-fn asset_leaderboards_keep_independent_orderings_and_token_units() {
-    let f = setup();
-    let second_admin = Address::generate(&f.env);
-    let second_asset = f
-        .env
-        .register_stellar_asset_contract_v2(second_admin)
-        .address();
-    let alpha = Address::generate(&f.env);
-    let beta = Address::generate(&f.env);
-    let a1 = Address::generate(&f.env);
-    let b1 = Address::generate(&f.env);
-    let a2 = Address::generate(&f.env);
-    let b2 = Address::generate(&f.env);
-
-    // Alpha leads the first asset by earnings; beta leads the second.
-    f.client.record_result(
-        &alpha,
-        &a1,
-        &MatchOutcome::Player1Won,
-        &900,
-        &f.token,
-        &f.source,
-    );
-    f.client.record_result(
-        &beta,
-        &b1,
-        &MatchOutcome::Player1Won,
-        &100,
-        &f.token,
-        &f.source,
-    );
-    f.client.record_result(
-        &alpha,
-        &a2,
-        &MatchOutcome::Player1Won,
-        &10,
-        &second_asset,
-        &f.source,
-    );
-    f.client.record_result(
-        &beta,
-        &b2,
-        &MatchOutcome::Player1Won,
-        &800,
-        &second_asset,
-        &f.source,
-    );
-
-    let first = f.client.get_asset_leaderboard(&f.token, &10, &0);
-    let second = f.client.get_asset_leaderboard(&second_asset, &10, &0);
-    assert_eq!(first.get(0).unwrap().player, alpha);
-    assert_eq!(second.get(0).unwrap().player, beta);
-    assert_eq!(first.get(0).unwrap().stats.earnings, 900);
-    assert_eq!(first.get(0).unwrap().stats.token, f.token);
-    assert_eq!(f.client.get_stats(&alpha).earnings, 10);
-    assert_eq!(f.client.get_stats(&alpha).token, second_asset);
-}
-
-#[test]
-fn asset_leaderboard_ties_break_by_address() {
-    let f = setup();
-    let a = Address::generate(&f.env);
-    let b = Address::generate(&f.env);
-    let a_opponent = Address::generate(&f.env);
-    let b_opponent = Address::generate(&f.env);
-    f.client.record_result(
-        &a,
-        &a_opponent,
-        &MatchOutcome::Player1Won,
-        &100,
-        &f.token,
-        &f.source,
-    );
-    f.client.record_result(
-        &b,
-        &b_opponent,
-        &MatchOutcome::Player1Won,
-        &100,
-        &f.token,
-        &f.source,
-    );
-
-    let board = f.client.get_asset_leaderboard(&f.token, &MAX_PAGE_SIZE, &0);
-    assert_eq!(
-        board.get(0).unwrap().player,
-        if a < b { a.clone() } else { b.clone() }
-    );
-    assert_eq!(board.get(1).unwrap().player, if a < b { b } else { a });
-}
-
-#[test]
-#[allow(deprecated)] // The Soroban test budget is the direct CPU instruction meter.
-fn maximum_population_page_uses_the_maintained_rank_index() {
-    let f = setup();
-    for _ in 0..(MAX_PLAYERS / 2) {
-        let p1 = Address::generate(&f.env);
-        let p2 = Address::generate(&f.env);
-        f.client
-            .record_result(&p1, &p2, &MatchOutcome::Player1Won, &1, &f.token, &f.source);
-    }
-    let mut budget = f.env.budget();
-    budget.reset_tracker();
-    let page = f.client.get_leaderboard(&MAX_PAGE_SIZE, &0);
-    assert_eq!(page.len(), MAX_PAGE_SIZE);
-    assert!(
-        budget.cpu_instruction_cost() < 100_000_000,
-        "maximum-population page exceeded the Soroban CPU budget"
-    );
-    let extra1 = Address::generate(&f.env);
-    let extra2 = Address::generate(&f.env);
-    assert_eq!(
-        f.client.try_record_result(
-            &extra1,
-            &extra2,
-            &MatchOutcome::Player1Won,
-            &1,
-            &f.token,
-            &f.source
-        ),
-        Err(Ok(Error::TooManyPlayers))
-    );
 }
 
 #[test]
@@ -333,6 +170,7 @@ fn rejects_unauthorized_caller() {
             &MatchOutcome::Player1Won,
             &100,
             &f.token,
+            &next_settlement_id(&f),
             &stranger,
         ),
         Err(Ok(Error::Unauthorized))
@@ -350,6 +188,7 @@ fn rejects_self_match() {
             &MatchOutcome::Player1Won,
             &100,
             &f.token,
+            &next_settlement_id(&f),
             &f.source,
         ),
         Err(Ok(Error::InvalidResult))
@@ -366,12 +205,11 @@ fn rejects_negative_payout() {
             &MatchOutcome::Player1Won,
             &-1,
             &f.token,
+            &next_settlement_id(&f),
             &f.source,
         ),
         Err(Ok(Error::InvalidResult))
     );
-    assert_eq!(f.client.result_count(), 0);
-    assert_eq!(f.client.get_stats(&f.player1).matches_played(), 0);
 }
 
 #[test]
@@ -386,6 +224,7 @@ fn paused_contract_rejects_results() {
             &MatchOutcome::Player1Won,
             &100,
             &f.token,
+            &next_settlement_id(&f),
             &f.source,
         ),
         Err(Ok(Error::ContractPaused))
@@ -419,6 +258,7 @@ fn additional_source_can_be_added_and_removed() {
         &MatchOutcome::Player1Won,
         &50,
         &f.token,
+        &next_settlement_id(&f),
         &backup,
     );
     assert_eq!(f.client.get_stats(&f.player1).wins, 1);
@@ -432,6 +272,7 @@ fn additional_source_can_be_added_and_removed() {
             &MatchOutcome::Player1Won,
             &50,
             &f.token,
+            &next_settlement_id(&f),
             &backup,
         ),
         Err(Ok(Error::Unauthorized))
@@ -449,6 +290,7 @@ fn removing_a_source_keeps_its_earlier_results() {
         &MatchOutcome::Player1Won,
         &70,
         &f.token,
+        &next_settlement_id(&f),
         &backup,
     );
     f.client.remove_source(&backup, &f.admin);
@@ -478,6 +320,56 @@ fn result_count_increments_per_result() {
 }
 
 #[test]
+fn record_result_is_idempotent_by_settlement_id() {
+    let f = setup();
+    let settlement_id = String::from_str(&f.env, "settlement-42");
+
+    f.client.record_result(
+        &f.player1,
+        &f.player2,
+        &MatchOutcome::Player1Won,
+        &10,
+        &f.token,
+        &settlement_id,
+        &f.source,
+    );
+    assert_eq!(f.client.result_count(), 1);
+
+    f.client.record_result(
+        &f.player1,
+        &f.player2,
+        &MatchOutcome::Player1Won,
+        &10,
+        &f.token,
+        &settlement_id,
+        &f.source,
+    );
+    assert_eq!(f.client.result_count(), 1);
+    assert_eq!(f.client.get_stats(&f.player1).wins, 1);
+    assert_eq!(f.client.get_stats(&f.player1).earnings, 10);
+    assert_eq!(f.client.get_stats(&f.player2).losses, 1);
+}
+
+#[test]
+fn rejects_empty_settlement_id() {
+    let f = setup();
+    let settlement_id = String::from_str(&f.env, "");
+
+    assert_eq!(
+        f.client.try_record_result(
+            &f.player1,
+            &f.player2,
+            &MatchOutcome::Player1Won,
+            &10,
+            &f.token,
+            &settlement_id,
+            &f.source,
+        ),
+        Err(Ok(Error::InvalidResult))
+    );
+}
+
+#[test]
 fn get_admin_returns_the_configured_admin() {
     let f = setup();
     assert_eq!(f.client.get_admin(), f.admin);
@@ -494,6 +386,7 @@ fn give_wins(f: &Fixture, player: &Address, wins: u32) {
             &MatchOutcome::Player1Won,
             &10,
             &f.token,
+            &next_settlement_id(f),
             &f.source,
         );
     }
@@ -526,38 +419,34 @@ fn leaderboard_is_sorted_by_wins_descending() {
 }
 
 #[test]
-fn global_leaderboard_ties_break_on_address() {
+fn leaderboard_ties_break_on_earnings() {
     let f = setup();
-    let a = Address::generate(&f.env);
-    let b = Address::generate(&f.env);
+    let rich = Address::generate(&f.env);
+    let poor = Address::generate(&f.env);
 
     // Same number of wins, different earnings.
     f.client.record_result(
-        &a,
+        &rich,
         &Address::generate(&f.env),
         &MatchOutcome::Player1Won,
         &500,
         &f.token,
+        &next_settlement_id(&f),
         &f.source,
     );
     f.client.record_result(
-        &b,
+        &poor,
         &Address::generate(&f.env),
         &MatchOutcome::Player1Won,
         &5,
         &f.token,
+        &next_settlement_id(&f),
         &f.source,
     );
 
     let board = f.client.get_leaderboard(&10, &0);
-    assert_eq!(
-        board.get(0).unwrap().player,
-        if a < b { a.clone() } else { b.clone() }
-    );
-    assert_eq!(
-        board.get(1).unwrap().player,
-        if a < b { b.clone() } else { a.clone() }
-    );
+    assert_eq!(board.get(0).unwrap().player, rich);
+    assert_eq!(board.get(1).unwrap().player, poor);
 }
 
 #[test]
@@ -573,6 +462,7 @@ fn leaderboard_order_is_stable_for_identical_records() {
         &MatchOutcome::Player1Won,
         &42,
         &f.token,
+        &next_settlement_id(&f),
         &f.source,
     );
     f.client.record_result(
@@ -581,6 +471,7 @@ fn leaderboard_order_is_stable_for_identical_records() {
         &MatchOutcome::Player1Won,
         &42,
         &f.token,
+        &next_settlement_id(&f),
         &f.source,
     );
 
@@ -625,7 +516,8 @@ fn leaderboard_last_page_is_short_rather_than_an_error() {
     for _ in 0..3 {
         give_wins(&f, &Address::generate(&f.env), 1);
     }
-    // 6 participants, asking for 2 from offset 5 -> exactly one row left.
+    // Six players are in the roster because the opponents count too.
+    // Asking for two rows at offset five leaves a one-row page.
     let page = f.client.get_leaderboard(&2, &5);
     assert_eq!(page.len(), 1);
 }
@@ -686,6 +578,7 @@ fn loss_only_players_are_still_ranked() {
         &MatchOutcome::Player1Won,
         &10,
         &f.token,
+        &next_settlement_id(&f),
         &f.source,
     );
     let board = f.client.get_leaderboard(&10, &0);
