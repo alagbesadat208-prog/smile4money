@@ -24,6 +24,7 @@ import type {
   PersistentQueueStore,
 } from "./persistent-queue-store.js";
 import logger from "../logger.js";
+import { applySqliteMigrations } from "./sqlite-migrations.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -115,21 +116,6 @@ export async function withRetry<T>(
   }
 }
 
-/**
- * Reads the stored trace context (#123). A NULL (pre-migration row) or
- * corrupted value yields no context, so the worker starts a fresh trace
- * instead of failing the retry.
- */
-function parseTraceContextColumn(raw: unknown): Pick<DlqEntry, "traceContext"> {
-  if (typeof raw !== "string" || raw === "") return {};
-  try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed.traceparent === "string" ? { traceContext: parsed } : {};
-  } catch {
-    return {};
-  }
-}
-
 export class SQLiteQueueStore implements PersistentQueueStore {
   private db: sqlite3.Database | null = null;
   private dbPath: string;
@@ -155,10 +141,6 @@ export class SQLiteQueueStore implements PersistentQueueStore {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    // Open the database, then run every setup step through withRetry. The
-    // steps used to sit in a nested callback that returned before this
-    // retried path ran, so lock contention at startup was never retried and
-    // nothing after table creation (like the #123 column migration) ran.
     await new Promise<void>((resolve, reject) => {
       this.db = new sqlite3.Database(this.dbPath, (err: Error | null) => {
         if (err) reject(err);
@@ -166,50 +148,58 @@ export class SQLiteQueueStore implements PersistentQueueStore {
       });
     });
 
-    // WAL allows readers to continue while writes are in progress.
     await withRetry<void>("initialize:walMode", (cb) =>
       this.getDb().run(`PRAGMA journal_mode=WAL`, (err: Error | null) => cb(err)),
     );
-
-    await withRetry<void>("initialize:createTable", (cb) =>
-      this.getDb().run(
-        `
-        CREATE TABLE IF NOT EXISTS oracle_dlq (
-          id TEXT PRIMARY KEY NOT NULL,
-          payload TEXT NOT NULL,
-          failureReason TEXT NOT NULL,
-          attempts INTEGER NOT NULL DEFAULT 0,
-          createdAt INTEGER NOT NULL,
-          lastAttemptAt INTEGER,
-          traceContext TEXT,
-          expireAt INTEGER NOT NULL,
-          CONSTRAINT expireAt_check CHECK (expireAt > 0)
-        )
-        `,
-        (err: Error | null) => cb(err),
-      ),
-    );
-
-    // #123 — databases created before trace propagation lack the column.
-    const columns = await withRetry<Array<{ name: string }>>("initialize:tableInfo", (cb) =>
-      this.getDb().all(`PRAGMA table_info(oracle_dlq)`, (err: Error | null, rows: Array<{ name: string }>) =>
-        cb(err, rows),
-      ),
-    );
-    if (!columns.some((c) => c.name === "traceContext")) {
-      await withRetry<void>("initialize:addTraceContextColumn", (cb) =>
-        this.getDb().run(`ALTER TABLE oracle_dlq ADD COLUMN traceContext TEXT`, (err: Error | null) => cb(err)),
-      );
-    }
-
-    await withRetry<void>("initialize:createIndex", (cb) =>
-      this.getDb().run(
-        `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_expireAt ON oracle_dlq(expireAt)`,
-        (err: Error | null) => cb(err),
-      ),
-    );
-
+    await applySqliteMigrations(this.getDb(), [
+      {
+        version: 1,
+        name: "create-dlq",
+        statements: [
+          `CREATE TABLE IF NOT EXISTS oracle_dlq (id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL, failureReason TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL, lastAttemptAt INTEGER, expireAt INTEGER NOT NULL, CONSTRAINT expireAt_check CHECK (expireAt > 0))`,
+          `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_expireAt ON oracle_dlq(expireAt)`,
+        ],
+      },
+      {
+        version: 2,
+        name: "dlq-retention-audit",
+        statements: [
+          `CREATE TABLE IF NOT EXISTS oracle_dlq_audit (id TEXT PRIMARY KEY NOT NULL, createdAt INTEGER NOT NULL, archivedAt INTEGER NOT NULL, reason TEXT NOT NULL)`,
+          `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_audit_archivedAt ON oracle_dlq_audit(archivedAt)`,
+        ],
+      },
+    ]);
     this.initialized = true;
+  }
+
+  private async cleanupTerminal(batchSize = 100): Promise<number> {
+    const now = Date.now();
+    let removed = 0;
+    for (;;) {
+      const rows = await withRetry<any[]>("cleanup:select", (cb) =>
+        this.getDb().all(
+          `SELECT id, createdAt FROM oracle_dlq WHERE expireAt < ? ORDER BY expireAt LIMIT ?`,
+          [now, batchSize],
+          (err: Error | null, result: any[]) => cb(err, result),
+        ),
+      );
+      if (!rows.length) return removed;
+      await withRetry<void>("cleanup:archive", (cb) =>
+        this.getDb().run(
+          `INSERT OR IGNORE INTO oracle_dlq_audit(id, createdAt, archivedAt, reason) SELECT id, createdAt, ?, 'retention-expired' FROM oracle_dlq WHERE id IN (${rows.map(() => "?").join(",")})`,
+          [now, ...rows.map((row) => row.id)],
+          (err: Error | null) => cb(err),
+        ),
+      );
+      await withRetry<void>("cleanup:delete", (cb) =>
+        this.getDb().run(
+          `DELETE FROM oracle_dlq WHERE id IN (${rows.map(() => "?").join(",")})`,
+          rows.map((row) => row.id),
+          (err: Error | null) => cb(err),
+        ),
+      );
+      removed += rows.length;
+    }
   }
 
   async add(entry: DlqEntry): Promise<void> {
@@ -217,8 +207,8 @@ export class SQLiteQueueStore implements PersistentQueueStore {
     await withRetry<void>("add", (cb) =>
       this.getDb().run(
         `
-        INSERT INTO oracle_dlq (id, payload, failureReason, attempts, createdAt, lastAttemptAt, traceContext, expireAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO oracle_dlq (id, payload, failureReason, attempts, createdAt, lastAttemptAt, expireAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         `,
         [
           entry.id,
@@ -227,22 +217,48 @@ export class SQLiteQueueStore implements PersistentQueueStore {
           entry.attempts,
           entry.createdAt,
           entry.lastAttemptAt,
-          entry.traceContext ? JSON.stringify(entry.traceContext) : null,
           expireAt,
         ],
         (err: Error | null) => cb(err),
       ),
     );
+    await this.cleanupTerminal();
+    const maxEntries = readPositiveInt(process.env.DLQ_MAX_ENTRIES, 10000);
+    let excess = Math.max(0, (await this.count()) - maxEntries);
+    while (excess > 0) {
+      const victims = await withRetry<any[]>("add:capacitySelect", (cb) =>
+        this.getDb().all(
+          `SELECT id, createdAt FROM oracle_dlq ORDER BY createdAt LIMIT ?`,
+          [Math.min(excess, 100)],
+          (err: Error | null, rows: any[]) => cb(err, rows),
+        ),
+      );
+      if (!victims.length) throw new Error(`DLQ capacity cannot be enforced (${maxEntries} entries)`);
+      const now = Date.now();
+      await withRetry<void>("add:capacityArchive", (cb) =>
+        this.getDb().run(
+          `INSERT OR IGNORE INTO oracle_dlq_audit(id, createdAt, archivedAt, reason) SELECT id, createdAt, ?, 'capacity' FROM oracle_dlq WHERE id IN (${victims.map(() => "?").join(",")})`,
+          [now, ...victims.map((row) => row.id)],
+          (err: Error | null) => cb(err),
+        ),
+      );
+      await withRetry<void>("add:capacityDelete", (cb) =>
+        this.getDb().run(
+          `DELETE FROM oracle_dlq WHERE id IN (${victims.map(() => "?").join(",")})`,
+          victims.map((row) => row.id),
+          (err: Error | null) => cb(err),
+        ),
+      );
+      excess = Math.max(0, (await this.count()) - maxEntries);
+    }
   }
 
   async getAll(): Promise<DlqEntry[]> {
     // Delete expired entries first.
-    await withRetry<void>("getAll:deleteExpired", (cb) =>
-      this.getDb().run(`DELETE FROM oracle_dlq WHERE expireAt < ?`, [Date.now()], (err: Error | null) => cb(err)),
-    );
+    await this.cleanupTerminal();
 
     const rows = await withRetry<any[]>("getAll:select", (cb) =>
-      this.getDb().all(`SELECT * FROM oracle_dlq ORDER BY createdAt ASC`, (err: Error | null, result: any[]) =>
+      this.getDb().all(`SELECT * FROM oracle_dlq WHERE expireAt >= ? ORDER BY createdAt ASC`, [Date.now()], (err: Error | null, result: any[]) =>
         cb(err, result),
       ),
     );
@@ -254,11 +270,18 @@ export class SQLiteQueueStore implements PersistentQueueStore {
       attempts: row.attempts,
       createdAt: row.createdAt,
       lastAttemptAt: row.lastAttemptAt || null,
-      ...parseTraceContextColumn(row.traceContext),
     }));
   }
 
   async remove(id: string): Promise<void> {
+    const now = Date.now();
+    await withRetry<void>("remove:archive", (cb) =>
+      this.getDb().run(
+        `INSERT OR IGNORE INTO oracle_dlq_audit(id, createdAt, archivedAt, reason) SELECT id, createdAt, ?, 'resolved-or-operator-removed' FROM oracle_dlq WHERE id = ?`,
+        [now, id],
+        (err: Error | null) => cb(err),
+      ),
+    );
     await withRetry<void>("remove", (cb) =>
       this.getDb().run(`DELETE FROM oracle_dlq WHERE id = ?`, [id], (err: Error | null) => cb(err)),
     );

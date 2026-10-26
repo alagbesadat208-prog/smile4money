@@ -6,3 +6,7 @@ export const matchStore = new SqliteMatchStore();
 export async function initializeMatchStore(): Promise<void> {
   await matchStore.initialize();
 }
+
+export async function closeMatchStore(): Promise<void> {
+  await matchStore.close();
+}
