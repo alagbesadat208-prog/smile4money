@@ -3,13 +3,14 @@ dotenv.config();
 
 import { app } from './app.js';
 import { initializeQueue, closeQueue, startRetryWorker, startDlqEvictionTask, listDlqEntries, writeToDlq, type DlqEntry } from './queue.js';
-import { initializeMatchStore, matchStore, evidenceStore } from './store/index.js';
+import { initializeMatchStore, matchStore } from './store/index.js';
 import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/circuit-breaker.js';
 import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
 import ChessPlatformPoller from './services/game-poller.js';
 import { getCurrentLedger } from './services/stellar.js';
-import { loadRetryConfig, submitWithIdempotence, type OracleSubmission } from './services/oracle-submit.js';
+import { retryDlqSubmission, type OracleSubmission } from './services/oracle-submit.js';
 import { createShutdownHandler } from './shutdown.js';
+import { resolveNetworkConfig } from './config/network.js';
 import logger from './logger.js';
 
 const port = Number(process.env.PORT || 4000);
@@ -41,39 +42,18 @@ async function checkResultExistsOnChain(matchId: number): Promise<boolean> {
 
 /**
  * Oracle retry handler for reprocessing DLQ entries.
- * 
- * Reconstructs the original OracleSubmission from the DLQ entry payload and attempts
- * to submit it to the blockchain with idempotence checks. If submission fails, the error
- * is thrown so the entry remains in the DLQ for the next retry cycle.
+ *
+ * One attempt per worker cycle via retryDlqSubmission (#122): a failure is
+ * re-thrown so the entry stays in the DLQ with its attempt count incremented;
+ * a result already on-chain resolves the entry without resubmitting.
  */
 async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
-  const submission = entry.payload as OracleSubmission;
-  
-  if (!submission || typeof submission !== 'object' || !('matchId' in submission)) {
-    throw new Error(`Invalid DLQ entry payload: expected OracleSubmission, got ${typeof entry.payload}`);
-  }
-
-  logger.debug(
-    { dlqId: entry.id, matchId: submission.matchId, gameId: submission.gameId },
-    'oracle_dlq: retrying oracle submission'
-  );
-
-  const config = loadRetryConfig();
-  
   try {
-    // Attempt submission with idempotence check
-    // If the result already exists on-chain, this returns cleanly
-    // If submission fails, the error is thrown and propagates to the caller
-    await submitWithIdempotence(
-      submission,
-      submitOracleResultToContract,
-      checkResultExistsOnChain,
-      config
-    );
+    await retryDlqSubmission(entry, submitOracleResultToContract, checkResultExistsOnChain);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.warn(
-      { dlqId: entry.id, matchId: submission.matchId, error: message },
+      { dlqId: entry.id, attempt: entry.attempts, error: message },
       'oracle_dlq: submission failed, entry will remain in DLQ'
     );
     throw err; // Re-throw so the entry stays in the DLQ
@@ -82,6 +62,14 @@ async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
 
 async function main() {
   try {
+    // #118 — fail fast on a network identity conflict (e.g. mainnet with the
+    // testnet RPC, or another network's contract id) before touching any store.
+    const network = resolveNetworkConfig(process.env);
+    logger.info(
+      { network: network.network, rpc_url_overridden: network.rpcUrlOverridden },
+      'stellar_network_resolved',
+    );
+
     // Initialize the persistent queue store
     await initializeQueue();
     logger.info('Queue store initialized');
@@ -95,6 +83,10 @@ async function main() {
     // while this process was down) before the retry worker starts using it.
     await initializeCircuitBreaker();
     logger.info('Circuit breaker initialized');
+
+    // Review-only monitor: compares settled outcomes with independent provider evidence.
+    // It never reverses or settles funds; it only logs and raises a review signal.
+    const outcomeMonitor = createOutcomeDisagreementServiceFromEnv();
 
     // Load any pending jobs from the queue on startup
     const pendingEntries = await listDlqEntries();
@@ -111,7 +103,7 @@ async function main() {
 
     // Set up the polling worker with DLQ wiring for max-attempts exceeded
     const pollingStore = new PollingJobStore();
-    const gamePoller = new ChessPlatformPoller(matchStore, evidenceStore);
+    const gamePoller = new ChessPlatformPoller();
     const pollingWorker = new PollingWorker(pollingStore, gamePoller, {
       pollingIntervalMs: parsePollingIntervalMs(process.env.POLLING_INTERVAL_MS),
       maxPollingAttempts: Number(process.env.MAX_POLLING_ATTEMPTS ?? 1440),
@@ -120,20 +112,38 @@ async function main() {
       // contract's on-chain timeout_ledgers window and move it to DLQ
       // instead of polling a match no payout can still reach.
       getCurrentLedger,
-      onGameCompleted: async (job, result, decisionId) => {
+      onGameCompleted: async (job, result) => {
         logger.info(
           {
             match_id: job.matchId,
             game_id: job.gameId,
             platform: job.platform,
             result,
-            decisionId,
             attempts: job.pollingAttempt,
           },
           'polling_job_game_completed_submitting_to_oracle',
         );
         // TODO: invoke the oracle submission pipeline here
         // e.g. await submitToOracle({ matchId: job.matchId, gameId: job.gameId, result })
+        if (outcomeMonitor) {
+          try {
+            const settledMatch = await matchStore.findByGameId(job.gameId);
+            if (settledMatch?.player1Username && settledMatch?.player2Username) {
+              outcomeMonitor.scheduleCheck({
+                matchId: job.matchId,
+                gameId: job.gameId,
+                platform: job.platform,
+                player1Username: settledMatch.player1Username,
+                player2Username: settledMatch.player2Username,
+              });
+            }
+          } catch (err) {
+            logger.warn(
+              { match_id: job.matchId, error: err instanceof Error ? err.message : String(err) },
+              'outcome_disagreement_schedule_failed',
+            );
+          }
+        }
       },
       onMaxAttemptsExceeded: async (job, reason) => {
         logger.error(
@@ -170,9 +180,7 @@ async function main() {
       stopPollingWorker,
       stopRetryWorker,
       stopDlqEviction,
-      closeQueue: async () => {
-        await Promise.all([closeQueue(), evidenceStore.close()]);
-      },
+      closeQueue,
       closeCircuitBreakerStore,
       logger,
       shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000),
