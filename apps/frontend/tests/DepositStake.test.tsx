@@ -44,8 +44,7 @@ vi.mock('@stellar/stellar-sdk', () => ({
   rpc: {
     Server: vi.fn().mockImplementation(() => ({
       simulateTransaction: vi.fn().mockImplementation(async () => getSimulateResponse()),
-      getAccount: vi.fn(async () => ({})),
-      getLatestLedger: vi.fn(async () => ({ sequence: 50000 })),
+      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 50000 }),
     })),
   },
   Account: class Account {
@@ -139,7 +138,11 @@ describe('DepositStake — match info display', () => {
 
     const player1Address = defaultMatch.player1;
     render(
-      <DepositStake matchId="123" playerAddress={player1Address} contractId="test-contract" />,
+      <DepositStake
+        matchId="123"
+        playerAddress={player1Address}
+        contractId="test-contract"
+      />,
     );
 
     await screen.findByTestId('match-info');
@@ -339,4 +342,62 @@ describe('DepositStake — countdown timer', () => {
     expect(countdown).toBeInTheDocument();
     expect(initialText).toBeTruthy();
   });
+});
+
+describe('DepositStake — contract lifecycle', () => {
+  it.each(['Active', 'PendingResult', 'Completed', 'Cancelled'])(
+    'disables deposits in %s even with no deposits recorded',
+    async (state) => {
+      const onDeposit = vi.fn();
+      setSimulateResponse({ result: { retval: { ...defaultMatch, state: [state] } } });
+      render(
+        <DepositStake
+          matchId="123"
+          playerAddress={defaultMatch.player1}
+          contractId="test-contract"
+          onDeposit={onDeposit}
+        />,
+      );
+      expect(await screen.findByTestId('deposit-state-reason')).toHaveTextContent(state);
+      expect(screen.getByTestId('deposit-btn')).toBeDisabled();
+      fireEvent.click(screen.getByTestId('deposit-btn'));
+      expect(onDeposit).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, ['Unknown']])('rejects an invalid contract state %s', async (state) => {
+    setSimulateResponse({ result: { retval: { ...defaultMatch, state } } });
+    render(
+      <DepositStake
+        matchId="123"
+        playerAddress={defaultMatch.player1}
+        contractId="test-contract"
+      />,
+    );
+    expect(await screen.findByTestId('deposit-error')).toHaveTextContent(
+      'Unexpected match lifecycle state',
+    );
+    expect(screen.queryByTestId('deposit-btn')).not.toBeInTheDocument();
+  });
+});
+
+it('allows a pending Soroban enum tuple and keeps the two deposit flags independent', async () => {
+  setSimulateResponse({
+    result: { retval: { ...defaultMatch, state: ['Pending'], player1_deposited: true } },
+  });
+  render(
+    <DepositStake matchId="123" playerAddress={defaultMatch.player2} contractId="test-contract" />,
+  );
+  await screen.findByTestId('match-info');
+  expect(screen.getByTestId('player1-status')).toHaveTextContent('Deposited');
+  expect(screen.getByTestId('player2-status')).toHaveTextContent('Pending');
+  expect(screen.getByTestId('deposit-btn')).toBeEnabled();
+});
+
+it('rejects missing deposit flags instead of treating them as false', async () => {
+  setSimulateResponse({ result: { retval: { ...defaultMatch, player1_deposited: undefined } } });
+  render(
+    <DepositStake matchId="123" playerAddress={defaultMatch.player1} contractId="test-contract" />,
+  );
+  expect(await screen.findByTestId('deposit-error')).toHaveTextContent('Unexpected response');
 });

@@ -1,27 +1,11 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Networks, rpc } from '@stellar/stellar-sdk';
+import type { MatchState } from '../types';
 import { DISPUTE_WINDOW_LEDGERS, SECONDS_PER_LEDGER } from '../constants';
-import { ChessGameLink } from './ChessGameLink';
-
-export type MatchState =
-  | 'Pending'
-  | 'Active'
-  | 'GameInProgress'
-  | 'Verifying'
-  | 'VerificationInProgress'
-  | 'PendingResult'
-  | 'SettlementPending'
-  | 'Completed'
-  | 'Settled'
-  | 'Cancelled'
-  | 'VerificationFailed'
-  | 'SettlementFailed'
-  | string;
 
 /** Reason a match entered the Cancelled terminal state. */
-export type CancellationReason = 'cancelled_by_player' | 'timed_out';
+type CancellationReason = 'cancelled_by_player' | 'timed_out';
 
-export interface MatchData {
+interface MatchData {
   id: string;
   state: MatchState;
   player1: string;
@@ -30,14 +14,6 @@ export interface MatchData {
   token: string;
   platform: 'lichess' | 'chesscom';
   gameId: string;
-  /** External URL for the chess game (validated before rendering). */
-  gameUrl?: string | null;
-  /** External game platform status (e.g. 'in_progress', 'completed', 'mate', 'resign'). */
-  gameStatus?: string | null;
-  /** Oracle verification state (e.g. 'in_progress', 'verifying', 'verified', 'failed'). */
-  verificationStatus?: string | null;
-  /** Settlement state (e.g. 'pending', 'settled', 'failed'). */
-  settlementStatus?: string | null;
   winner?: 'Player1' | 'Player2' | 'Draw';
   /** Which player cancelled the match (Stellar address), if applicable. */
   cancelledBy?: string;
@@ -59,23 +35,15 @@ export interface MatchData {
   currentLedger?: number;
 }
 
-export interface MatchStatusProps {
+interface MatchStatusProps {
   matchId: string;
-  contractId?: string;
-  rpcUrl?: string;
-  networkPassphrase?: string;
-  onFetchMatch?: (matchId: string) => Promise<MatchData | null>;
+  /** Required reader; configure its network and contract deployment at the call site. */
+  onFetchMatch: (matchId: string) => Promise<MatchData | null>;
 }
 
 type FetchStatus = 'idle' | 'loading' | 'error';
 
-const TERMINAL_STATES: string[] = [
-  'Completed',
-  'Settled',
-  'Cancelled',
-  'VerificationFailed',
-  'SettlementFailed',
-];
+const TERMINAL_STATES: MatchState[] = ['Completed', 'Cancelled'];
 
 /**
  * Compute how many seconds remain in the dispute window.
@@ -108,13 +76,7 @@ function formatDuration(totalSeconds: number): string {
   return parts.join(' ');
 }
 
-export function MatchStatus({
-  matchId,
-  contractId: _contractId,
-  rpcUrl: _rpcUrl = 'https://soroban-testnet.stellar.org',
-  networkPassphrase: _networkPassphrase = Networks.TESTNET,
-  onFetchMatch,
-}: MatchStatusProps) {
+export function MatchStatus({ matchId, onFetchMatch }: MatchStatusProps) {
   const [matchData, setMatchData] = useState<MatchData | null>(null);
   const [fetchStatus, setFetchStatus] = useState<FetchStatus>('loading');
   const [errorMessage, setErrorMessage] = useState('');
@@ -129,12 +91,19 @@ export function MatchStatus({
     if (!matchId) return;
 
     try {
-      const data = await onFetchMatch?.(matchId);
+      if (typeof onFetchMatch !== 'function') {
+        throw new Error(
+          'MatchStatus requires an onFetchMatch reader configured for the network and contract.',
+        );
+      }
+      const data = await onFetchMatch(matchId);
       if (data) {
         setMatchData(data);
         // Reset the elapsed-seconds counter whenever we get fresh data so the
         // countdown stays in sync with the on-chain ledger estimate.
         setElapsedSecs(0);
+      } else {
+        setMatchData(null);
       }
       setFetchStatus('idle');
     } catch (err) {
@@ -158,6 +127,8 @@ export function MatchStatus({
     fetchMatch();
 
     // Poll every 10 seconds; stop automatically when a terminal state is reached.
+    // The interval is intentionally NOT re-created when matchData changes — we
+    // read the latest value through matchDataRef inside the callback instead.
     const interval = setInterval(() => {
       if (
         matchDataRef.current &&
@@ -174,8 +145,10 @@ export function MatchStatus({
   }, [matchId, fetchMatch]);
 
   // Tick every second while in PendingResult to keep the countdown live.
+  // The ticker is intentionally separate from the polling interval so it can
+  // run at 1 s resolution without hammering the RPC every second.
   useEffect(() => {
-    if (matchData?.state !== 'PendingResult' && matchData?.state !== 'SettlementPending') return;
+    if (matchData?.state !== 'PendingResult') return;
     const ticker = setInterval(() => {
       setElapsedSecs((s) => s + 1);
     }, 1000);
@@ -219,7 +192,7 @@ export function MatchStatus({
         <button
           type="button"
           className="btn btn-retry"
-          onClick={() => setFetchStatus('loading')}
+          onClick={fetchMatch}
           data-testid="retry-match-btn"
         >
           Retry
@@ -239,89 +212,9 @@ export function MatchStatus({
     );
   }
 
-  const platformLabel = matchData.platform === 'lichess' ? 'Lichess' : 'Chess.com';
-
-  const renderGameLink = () => {
-    if (!matchData.gameUrl) return null;
-    return (
-      <div className="game-link-wrapper mt-2" data-testid="game-link-wrapper">
-        <ChessGameLink
-          url={matchData.gameUrl}
-          platform={matchData.platform}
-          gameId={matchData.gameId}
-          fallbackText={`Game ID: ${matchData.gameId}`}
-        >
-          View game on {platformLabel} ↗
-        </ChessGameLink>
-      </div>
-    );
-  };
-
   const renderStateContent = () => {
-    // 1. Failure states
-    if (
-      matchData.state === 'VerificationFailed' ||
-      matchData.state === 'SettlementFailed' ||
-      matchData.verificationStatus === 'failed' ||
-      matchData.settlementStatus === 'failed'
-    ) {
-      const isSettlement =
-        matchData.state === 'SettlementFailed' || matchData.settlementStatus === 'failed';
-      return (
-        <div className="state-content failure" data-testid="state-failed" role="alert">
-          <h3 className="state-title">{isSettlement ? 'Settlement Failed' : 'Verification Failed'}</h3>
-          <p className="state-description">
-            {isSettlement
-              ? 'Failed to settle match payout on-chain.'
-              : 'Oracle verification failed: player identities or game result could not be verified.'}
-          </p>
-          {renderGameLink()}
-        </div>
-      );
-    }
-
-    // 2. Oracle verification in progress
-    if (
-      matchData.state === 'Verifying' ||
-      matchData.state === 'VerificationInProgress' ||
-      matchData.verificationStatus === 'verifying' ||
-      matchData.verificationStatus === 'in_progress' ||
-      (matchData.state === 'Active' && matchData.gameStatus === 'completed')
-    ) {
-      return (
-        <div className="state-content verifying" data-testid="state-verifying" role="status">
-          <h3 className="state-title">Verification in Progress</h3>
-          <p className="state-description">
-            Game completed on {platformLabel}. Oracle verification is currently in progress…
-          </p>
-          <p className="waiting-oracle">Waiting for oracle to submit result…</p>
-          {renderGameLink()}
-        </div>
-      );
-    }
-
-    // 3. Game still being played
-    if (
-      matchData.state === 'GameInProgress' ||
-      (matchData.state === 'Active' &&
-        (matchData.gameStatus === 'in_progress' || matchData.gameStatus === 'playing'))
-    ) {
-      return (
-        <div className="state-content game-in-progress" data-testid="state-game-in-progress" role="status">
-          <h3 className="state-title">Game in Progress</h3>
-          <p className="state-description">
-            Game is in progress on {platformLabel}. Game ID: {matchData.gameId}
-          </p>
-          <p className="game-status-subtext">
-            Players are currently playing. Awaiting completion before oracle verification begins.
-          </p>
-          {renderGameLink()}
-        </div>
-      );
-    }
-
     switch (matchData.state) {
-      case 'Pending': {
+      case 'Pending':
         const p1Deposited = matchData.player1 ? '✓' : '○';
         const p2Deposited = matchData.player2 ? '✓' : '○';
         return (
@@ -347,25 +240,23 @@ export function MatchStatus({
                 {p2Deposited}
               </span>
             </div>
-            {renderGameLink()}
           </div>
         );
-      }
 
       case 'Active':
         return (
           <div className="state-content active" data-testid="state-active">
             <h3 className="state-title">Active</h3>
             <p className="state-description">
-              Game is in progress on {matchData.platform === 'lichess' ? 'Lichess' : 'Chess.com'}. Game ID: {matchData.gameId}
+              Game is in progress on {matchData.platform === 'lichess' ? 'Lichess' : 'Chess.com'}.
+              Game ID: {matchData.gameId}
             </p>
             <p className="waiting-oracle">Waiting for oracle to submit result…</p>
-            {renderGameLink()}
           </div>
         );
 
-      case 'SettlementPending':
       case 'PendingResult': {
+        // Compute dispute window countdown from on-chain ledger data when available.
         let countdownEl: React.ReactNode = null;
         if (
           matchData.pendingResultLedger !== undefined &&
@@ -418,19 +309,16 @@ export function MatchStatus({
               </p>
             )}
             {countdownEl}
-            {renderGameLink()}
           </div>
         );
       }
 
-      case 'Settled':
-      case 'Completed': {
+      case 'Completed':
         if (!matchData.winner) {
           return (
             <div className="state-content completed" data-testid="state-completed">
               <h3 className="state-title">Completed</h3>
               <p className="state-description">Match completed.</p>
-              {renderGameLink()}
             </div>
           );
         }
@@ -442,10 +330,8 @@ export function MatchStatus({
                 ? 'The match ended in a draw. Stakes have been returned to both players.'
                 : `Winner: ${matchData.winner === 'Player1' ? 'Player 1' : 'Player 2'}. Prize of ${matchData.stakeAmount} ${matchData.token.toUpperCase()} has been paid out.`}
             </p>
-            {renderGameLink()}
           </div>
         );
-      }
 
       case 'Cancelled': {
         const isTimedOut = matchData.cancellationReason === 'timed_out';
@@ -498,19 +384,9 @@ export function MatchStatus({
                 No stakes were deposited; no refunds were necessary.
               </p>
             )}
-            {renderGameLink()}
           </div>
         );
       }
-
-      default:
-        return (
-          <div className="state-content unknown" data-testid="state-unknown" role="status">
-            <h3 className="state-title">Status: {matchData.state || 'Unknown'}</h3>
-            <p className="state-description">The match is currently in an unrecognized state.</p>
-            {renderGameLink()}
-          </div>
-        );
     }
   };
 

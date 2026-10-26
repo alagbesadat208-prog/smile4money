@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
+  Account,
   Asset,
   Networks,
   Operation,
@@ -9,6 +10,7 @@ import {
   scValToNative,
 } from '@stellar/stellar-sdk';
 import type { xdr } from '@stellar/stellar-sdk';
+import { parseMatchState, type MatchDetails } from '../types';
 import { TransactionStatus } from './TransactionStatus';
 
 type DepositStatus = 'idle' | 'loading' | 'pending' | 'success' | 'error' | 'approving';
@@ -51,46 +53,32 @@ function formatDuration(totalSeconds: number): string {
   return parts.join(' ');
 }
 
-interface MatchDetails {
-  stakeAmount: string;
-  token: string;
-  player1: string;
-  player2: string;
-  player1Deposited: boolean;
-  player2Deposited: boolean;
-  createdLedger: number;
-  timeoutLedgers: number;
-  currentLedger: number;
-}
-
 /**
  * Fetch a match record from the deployed EscrowContract via Soroban RPC and
  * map it to the shape the UI renders.
  *
  * `get_match` is a read-only view, so we simulate the invocation — no wallet
  * signature or transaction submission is required. The simulation source only
- * needs to exist as an account on the ledger; use the connected player account.
+ * needs to exist as an account on the ledger; the deployed contract address is
+ * used so this works even before the user connects a wallet.
  */
 async function fetchMatchFromEscrow({
   matchId,
   contractId,
   rpcUrl,
   networkPassphrase,
-  playerAddress,
 }: {
   matchId: string;
   contractId: string;
   rpcUrl: string;
   networkPassphrase: string;
-  playerAddress: string | null;
 }): Promise<MatchDetails> {
   if (!/^\d+$/.test(matchId)) {
     throw new Error('Invalid match ID');
   }
 
   const server = new rpc.Server(rpcUrl);
-  if (!playerAddress) throw new Error('Connect wallet to load deposit details');
-  const source = await server.getAccount(playerAddress);
+  const source = new Account(contractId, '0');
 
   const tx = new TransactionBuilder(source, {
     fee: '100',
@@ -131,11 +119,14 @@ async function deserializeMatch(
   if (
     (typeof raw.stake_amount !== 'bigint' && typeof raw.stake_amount !== 'number') ||
     typeof raw.player1 !== 'string' ||
-    typeof raw.player2 !== 'string'
+    typeof raw.player2 !== 'string' ||
+    typeof raw.player1_deposited !== 'boolean' ||
+    typeof raw.player2_deposited !== 'boolean'
   ) {
     throw new Error('Unexpected response from EscrowContract.get_match');
   }
 
+  const state = parseMatchState(raw.state);
   const tokenAddress = typeof raw.token === 'string' ? raw.token : '';
   // The contract stores the native XLM asset as its Soroban contract address;
   // map it back to the symbol the UI already understands.
@@ -153,15 +144,17 @@ async function deserializeMatch(
 
   // Fetch current ledger height from RPC
   const server = new rpc.Server(rpcUrl);
-  const currentLedger = (await server.getLatestLedger()).sequence;
+  const ledgerResponse = await server.getLatestLedger();
+  const currentLedger = ledgerResponse.sequence;
 
   return {
+    state,
     stakeAmount: String(raw.stake_amount),
     token: tokenAddress === nativeTokenAddress ? 'xlm' : tokenAddress,
     player1: raw.player1,
     player2: raw.player2,
-    player1Deposited: Boolean(raw.player1_deposited),
-    player2Deposited: Boolean(raw.player2_deposited),
+    player1Deposited: raw.player1_deposited,
+    player2Deposited: raw.player2_deposited,
     createdLedger,
     timeoutLedgers,
     currentLedger,
@@ -230,7 +223,6 @@ export function DepositStake({
         contractId,
         rpcUrl,
         networkPassphrase,
-        playerAddress,
       });
       setMatchDetails(details);
       // Reset the elapsed-seconds counter whenever we get fresh data so the
@@ -241,7 +233,7 @@ export function DepositStake({
       setStatus('error');
       setErrorMsg(err instanceof Error ? err.message : 'Failed to fetch match details');
     }
-  }, [matchId, contractId, rpcUrl, networkPassphrase, playerAddress]);
+  }, [matchId, contractId, rpcUrl, networkPassphrase]);
 
   useEffect(() => {
     fetchMatchDetails();
@@ -346,8 +338,19 @@ export function DepositStake({
   // player already deposited, allowance is still being checked, allowance is
   // insufficient, or timeout has expired. The isPending guard is the critical one — without it the user
   // can click twice and submit duplicate transactions.
+  const stateReason =
+    matchDetails && matchDetails.state !== 'Pending'
+      ? `Deposits are unavailable: contract state is ${matchDetails.state}.`
+      : null;
   const isDisabled =
-    isLoading || isPending || hasDeposited(matchDetails) || isCheckingAllowance || needsApproval || isExpired;
+    !matchDetails ||
+    Boolean(stateReason) ||
+    isLoading ||
+    isPending ||
+    hasDeposited(matchDetails) ||
+    isCheckingAllowance ||
+    needsApproval ||
+    isExpired;
 
   // Loading state
   if (isLoading && !matchDetails) {
@@ -439,7 +442,7 @@ export function DepositStake({
       )}
 
       {/* Approve button — shown when the escrow contract lacks spending permission */}
-      {needsApproval && !hasDeposited(matchDetails) && (
+      {needsApproval && !stateReason && !hasDeposited(matchDetails) && (
         <>
           <p
             className="feedback warning"
@@ -461,6 +464,12 @@ export function DepositStake({
             {isApproving ? 'Approving…' : 'Approve Token'}
           </button>
         </>
+      )}
+
+      {stateReason && (
+        <p role="status" data-testid="deposit-state-reason">
+          {stateReason}
+        </p>
       )}
 
       {/* Match timeout expired */}

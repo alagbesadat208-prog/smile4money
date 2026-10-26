@@ -30,7 +30,7 @@ vi.mock('@stellar/stellar-sdk', () => ({
 
 describe('MatchStatus — loading state', () => {
   it('shows loading state while fetching match', () => {
-    render(<MatchStatus matchId="123" />);
+    render(<MatchStatus matchId="123" onFetchMatch={() => new Promise(() => {})} />);
     // The loading skeleton uses data-testid="match-status-skeleton"
     expect(screen.getByTestId('match-status-skeleton')).toBeInTheDocument();
   });
@@ -38,7 +38,7 @@ describe('MatchStatus — loading state', () => {
 
 describe('MatchStatus — no match ID', () => {
   it('shows message when no match ID provided', () => {
-    render(<MatchStatus matchId="" />);
+    render(<MatchStatus matchId="" onFetchMatch={async () => null} />);
     expect(screen.getByTestId('match-status')).toBeInTheDocument();
     expect(screen.getByText(/Enter a match ID/i)).toBeInTheDocument();
   });
@@ -550,5 +550,15 @@ describe('MatchStatus — PendingResult countdown', () => {
 
     expect(screen.getByText(/Draw/)).toBeInTheDocument();
     expect(screen.getByTestId('dispute-countdown')).toBeInTheDocument();
+  });
+});
+
+describe('MatchStatus — reader contract', () => {
+  it('reports missing reader configuration for untyped callers', async () => {
+    // @ts-expect-error A configured reader is required at compile time.
+    render(<MatchStatus matchId="123" />);
+    expect(await screen.findByTestId('match-error')).toHaveTextContent(
+      'requires an onFetchMatch reader',
+    );
   });
 });
