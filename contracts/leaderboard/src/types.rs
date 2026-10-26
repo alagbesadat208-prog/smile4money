@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address, Vec};
 
 /// Errors returned by the leaderboard contract.
 ///
@@ -10,7 +10,9 @@ use soroban_sdk::{contracterror, contracttype, Address};
 /// |  4   | InvalidResult    | Result is not a recognised variant             |
 /// |  5   | InvalidRange     | `limit` is zero or the page offset is past the end |
 /// |  6   | ContractPaused   | Result recording is paused                     |
-/// |  7   | CollectionLimitReached | A player's asset or season limit was reached |
+/// |  7   | DuplicateSource  | Reporter is already authorised                 |
+/// |  8   | SnapshotChanged  | Ranking changed; restart pagination            |
+/// |  9   | ResultCountOverflow | Ranking revision space exhausted            |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -31,8 +33,15 @@ pub enum Error {
 
     /// [E006] Result recording is paused.
     ContractPaused = 6,
-    /// [E007] A player's asset or season limit has been reached.
-    CollectionLimitReached = 7,
+
+    /// [E007] This reporter is already authorised; no changes were made.
+    DuplicateSource = 7,
+
+    /// [E008] A result changed the ranking; restart pagination at offset zero.
+    SnapshotChanged = 8,
+
+    /// [E009] No further unique ranking revision can be allocated.
+    ResultCountOverflow = 9,
 }
 
 /// The outcome of a single match, as reported by the escrow contract.
@@ -69,28 +78,6 @@ pub struct PlayerStats {
     pub token: Address,
 }
 
-/// Per-token contribution to a player's lifetime totals. Amounts are in the
-/// token's smallest unit; values from different token addresses must not be added.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AssetStats {
-    /// Token contract address identifying the asset and its units.
-    pub token: Address,
-    /// Matches won using this token.
-    pub wins: u32,
-    /// Matches lost using this token.
-    pub losses: u32,
-    /// Matches drawn using this token.
-    pub draws: u32,
-    /// Total winnings in this token's smallest unit.
-    pub earnings: i128,
-}
-
-/// Maximum distinct token assets retained for one player.
-pub const MAX_ASSETS_PER_PLAYER: u32 = 16;
-/// Maximum distinct season identifiers retained for one player.
-pub const MAX_SEASONS_PER_PLAYER: u32 = 16;
-
 impl PlayerStats {
     /// A zeroed record for a player who has not been seen.
     ///
@@ -122,8 +109,17 @@ impl PlayerStats {
 pub struct LeaderboardEntry {
     /// The player's Stellar address.
     pub player: Address,
-    /// The player's lifetime or requested-season record.
+    /// The player's lifetime record.
     pub stats: PlayerStats,
+}
+
+/// One revision-checked leaderboard page. A revision is not a historical read:
+/// subsequent requests must use this token or restart if it has expired.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaderboardPage {
+    pub snapshot: u32,
+    pub entries: Vec<LeaderboardEntry>,
 }
 
 /// Storage keys.
@@ -133,13 +129,9 @@ pub struct LeaderboardEntry {
 /// | `Admin`              | Instance   | Address permitted to pause and re-key |
 /// | `Paused`             | Instance   | Whether recording results is blocked  |
 /// | `Stats(Address)`     | Persistent | [`PlayerStats`] for one address       |
-/// | `SeasonStats(Address, u32)` | Persistent | One player's totals in one season |
-/// | `Assets(Address)`    | Persistent | Bounded per-token lifetime totals      |
-/// | `Seasons(Address)`   | Persistent | Bounded season IDs seen by one player  |
 /// | `ResultCount`        | Instance   | Number of results recorded so far     |
 /// | `Sources(Address)`   | Instance   | Whether an address may submit results |
 /// | `Roster`             | Instance   | Every address that has a stats entry  |
-/// | `SeasonRoster(u32)`  | Instance   | Addresses with results in a season     |
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -149,12 +141,6 @@ pub enum DataKey {
     Paused,
     /// A player's [`PlayerStats`].
     Stats(Address),
-    /// A player's stats for one season.
-    SeasonStats(Address, u32),
-    /// All asset contributions for one player.
-    Assets(Address),
-    /// Season identifiers in which a player has recorded a result.
-    Seasons(Address),
     /// How many results have been recorded, used to bound the leaderboard.
     ResultCount,
     /// Whether `Address` is authorised to submit results.
@@ -165,8 +151,6 @@ pub enum DataKey {
     /// has no other way to discover which players exist. This is the index that
     /// makes the leaderboard readable.
     Roster,
-    /// Addresses with a result in a season.
-    SeasonRoster(u32),
 }
 
 /// Maximum number of rows a single `get_leaderboard` call may return.
