@@ -25,10 +25,10 @@ pub enum Slot {
     Vacant,
 }
 
-/// The state of a bracket node, derived from its sides.
+/// The state of a bracket node, derived from its sides and result fields.
 ///
-/// The state is never stored, it is always recomputed from the sides of the
-/// node so that it cannot drift away from the recorded bracket.
+/// The state is never stored, it is always recomputed from the node so that it
+/// cannot drift away from the recorded bracket.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NodeState {
@@ -37,11 +37,15 @@ pub enum NodeState {
     AwaitingParticipants,
     /// Both sides hold a participant, the match can be played.
     Ready,
+    /// A result has been reported and is inside its review window:
+    /// `(provisional_winner, review_deadline_ledger)`. Advancement is blocked
+    /// until the review deadline passes and the result is finalized.
+    UnderReview(Address, u32),
     /// Explicit bye: the carried participant advances without playing.
     ByeAdvance(Address),
     /// Both sides are byes: nobody advances out of this node.
     Void,
-    /// The match was played, the winner advances.
+    /// The match was played and finalized after its review window; the winner advances.
     Resolved(Address),
 }
 
@@ -60,7 +64,14 @@ pub struct Node {
     pub slot1: Slot,
     /// Second side of the node.
     pub slot2: Slot,
-    /// Winner of the match, recorded when the result is submitted.
+    /// Provisional winner recorded when a result is first reported; subject to
+    /// amendment by the authorized reviewer until `review_deadline`.
+    pub pending_winner: Option<Address>,
+    /// Ledger sequence at which the review window closes and the provisional
+    /// result can be finalized.
+    pub review_deadline: Option<u32>,
+    /// Finalized winner of the match, set once the review window expires and
+    /// `finalize_result` is called.
     pub winner: Option<Address>,
 }
 
@@ -71,6 +82,10 @@ pub struct Bracket {
     pub id: u64,
     /// Address allowed to seal the bracket, cancel it, and submit results.
     pub admin: Address,
+    /// Address allowed to amend a provisional result during its review window.
+    pub reviewer: Address,
+    /// Review window duration in ledgers before a reported result can be finalized.
+    pub review_window_ledgers: u32,
     /// Number of first round sides. Always a power of two.
     pub size: u32,
     /// Number of rounds, `log2(size)`.
