@@ -46,7 +46,7 @@ mod types;
 
 pub use types::*;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol, Vec};
 
 #[contract]
 pub struct LeaderboardContract;
@@ -171,29 +171,6 @@ impl LeaderboardContract {
         outcome: MatchOutcome,
         payout: i128,
         token: Address,
-        settlement_id: String,
-        caller: Address,
-    ) -> Result<(), Error> {
-        Self::record_result_inner(
-            env,
-            player1,
-            player2,
-            outcome,
-            payout,
-            token,
-            settlement_id,
-            caller,
-        )
-    }
-
-    fn record_result_inner(
-        env: Env,
-        player1: Address,
-        player2: Address,
-        outcome: MatchOutcome,
-        payout: i128,
-        token: Address,
-        settlement_id: String,
         caller: Address,
     ) -> Result<(), Error> {
         if !env
@@ -206,12 +183,6 @@ impl LeaderboardContract {
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
         }
-        if settlement_id.len() == 0 {
-            return Err(Error::InvalidResult);
-        }
-        if Self::has_settlement_id(&env, &settlement_id) {
-            return Ok(());
-        }
         // A self-match would credit a player a win and a loss at once, and
         // inflate `matches_played` for both slots.
         if player1 == player2 {
@@ -222,35 +193,43 @@ impl LeaderboardContract {
         }
         caller.require_auth();
 
+        // `MatchOutcome` is not `Copy`, so the outcome is matched once to decide
+        // which side is credited, rather than compared and matched separately.
         let (winner, loser) = match &outcome {
             MatchOutcome::Player1Won => (Some(&player1), Some(&player2)),
             MatchOutcome::Player2Won => (Some(&player2), Some(&player1)),
+            // A draw credits nobody and loses nobody; both sides just get a draw.
             MatchOutcome::Draw => (None, None),
         };
 
         match (winner, loser) {
             (Some(w), Some(l)) => {
                 let mut w_stats = Self::load_stats(&env, w);
-                w_stats.wins += 1;
-                w_stats.earnings += payout;
+                w_stats.wins = w_stats.wins.checked_add(1).ok_or(Error::Overflow)?;
+                w_stats.earnings = w_stats
+                    .earnings
+                    .checked_add(payout)
+                    .ok_or(Error::Overflow)?;
                 w_stats.token = token.clone();
                 Self::store_stats(&env, w, &w_stats);
 
                 let mut l_stats = Self::load_stats(&env, l);
-                l_stats.losses += 1;
+                l_stats.losses = l_stats.losses.checked_add(1).ok_or(Error::Overflow)?;
                 Self::store_stats(&env, l, &l_stats);
             }
             _ => {
                 let mut p1 = Self::load_stats(&env, &player1);
-                p1.draws += 1;
+                p1.draws = p1.draws.checked_add(1).ok_or(Error::Overflow)?;
                 Self::store_stats(&env, &player1, &p1);
 
                 let mut p2 = Self::load_stats(&env, &player2);
-                p2.draws += 1;
+                p2.draws = p2.draws.checked_add(1).ok_or(Error::Overflow)?;
                 Self::store_stats(&env, &player2, &p2);
             }
         }
 
+        // Both sides are added unconditionally: even a player who only ever
+        // loses or draws needs a roster entry to be ranked.
         Self::add_to_roster(&env, &player1);
         Self::add_to_roster(&env, &player2);
 
@@ -259,11 +238,10 @@ impl LeaderboardContract {
             .instance()
             .get(&DataKey::ResultCount)
             .unwrap_or(0);
+        let next_count = count.checked_add(1).ok_or(Error::Overflow)?;
         env.storage()
             .instance()
-            .set(&DataKey::ResultCount, &count.saturating_add(1));
-
-        Self::remember_settlement_id(&env, &settlement_id);
+            .set(&DataKey::ResultCount, &next_count);
 
         env.events().publish(
             (Symbol::new(&env, "result"), symbol_short!("recorded")),
@@ -353,7 +331,7 @@ impl LeaderboardContract {
         while idx < roster_len {
             let player = roster.get(idx).unwrap();
             let stats = Self::load_stats(&env, &player);
-            if stats.matches_played() > 0 {
+            if stats.matches_played().ok_or(Error::Overflow)? > 0 {
                 ranked.push_back((player, stats));
             }
             idx += 1;
@@ -457,22 +435,6 @@ impl LeaderboardContract {
 
         roster.push_back(player.clone());
         env.storage().instance().set(&DataKey::Roster, &roster);
-    }
-
-    /// Return whether the settlement ID has already been processed.
-    fn has_settlement_id(env: &Env, settlement_id: &String) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::SettlementId(settlement_id.clone()))
-    }
-
-    /// Remember a settlement ID so repeated relayer deliveries are ignored.
-    fn remember_settlement_id(env: &Env, settlement_id: &String) {
-        let key = DataKey::SettlementId(settlement_id.clone());
-        env.storage().persistent().set(&key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, STATS_TTL_LEDGERS, STATS_TTL_LEDGERS);
     }
 
     /// Whether `a` should sort after `b` — i.e. `a` ranks lower.

@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address, String};
+use soroban_sdk::{contracterror, contracttype, Address};
 
 /// Errors returned by the leaderboard contract.
 ///
@@ -10,8 +10,7 @@ use soroban_sdk::{contracterror, contracttype, Address, String};
 /// |  4   | InvalidResult    | Result is not a recognised variant             |
 /// |  5   | InvalidRange     | `limit` is zero or the page offset is past the end |
 /// |  6   | ContractPaused   | Result recording is paused                     |
-/// |  7   | InvalidAsset     | Asset is not a contract implementing token decimals |
-/// |  8   | TooManyPlayers   | Maximum indexed population has been reached   |
+/// |  7   | Overflow         | A leaderboard aggregate exceeds its integer range |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -33,11 +32,8 @@ pub enum Error {
     /// [E006] Result recording is paused.
     ContractPaused = 6,
 
-    /// The supplied asset is not a deployed token contract.
-    InvalidAsset = 7,
-
-    /// The leaderboard has reached its declared maximum population.
-    TooManyPlayers = 8,
+    /// [E007] A leaderboard aggregate exceeds its integer range.
+    Overflow = 7,
 }
 
 /// The outcome of a single match, as reported by the escrow contract.
@@ -52,12 +48,13 @@ pub enum MatchOutcome {
     Draw,
 }
 
-/// A player's global counters and current earnings denomination.
+/// A player's lifetime record.
 ///
 /// `wins + losses + draws` is the number of completed matches that player has
-/// taken part in. `earnings` accumulates in the `token` denomination and resets
-/// when a later win uses another token. Use the per-asset leaderboard for a
-/// player's separate totals across multiple tokens.
+/// taken part in. `earnings` is in the token's smallest unit and is therefore
+/// **not** comparable across tokens — a player who only staked USDC and a
+/// player who only staked XLM produce numbers on different scales. The
+/// leaderboard surfaces the token alongside the figure for this reason.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlayerStats {
@@ -67,9 +64,9 @@ pub struct PlayerStats {
     pub losses: u32,
     /// Completed matches drawn.
     pub draws: u32,
-    /// Amount won in `token`'s smallest unit since the latest denomination change.
+    /// Total amount won, in the token's smallest unit.
     pub earnings: i128,
-    /// Token for the current `earnings` amount.
+    /// Address of the token `earnings` is denominated in.
     pub token: Address,
 }
 
@@ -90,8 +87,8 @@ impl PlayerStats {
     }
 
     /// Total completed matches this player took part in.
-    pub fn matches_played(&self) -> u32 {
-        self.wins + self.losses + self.draws
+    pub fn matches_played(&self) -> Option<u32> {
+        self.wins.checked_add(self.losses)?.checked_add(self.draws)
     }
 }
 
@@ -116,11 +113,8 @@ pub struct LeaderboardEntry {
 /// | `Paused`             | Instance   | Whether recording results is blocked  |
 /// | `Stats(Address)`     | Persistent | [`PlayerStats`] for one address       |
 /// | `ResultCount`        | Instance   | Number of results recorded so far     |
-/// | `SettlementId(String)` | Persistent | Whether a settlement ID was processed |
 /// | `Sources(Address)`   | Instance   | Whether an address may submit results |
 /// | `Roster`             | Instance   | Every address that has a stats entry  |
-/// | `RankedRoster`       | Instance   | Global rank-ordered address index     |
-/// | `AssetRoster(Address)` | Persistent | Rank-ordered addresses for one asset  |
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -130,20 +124,16 @@ pub enum DataKey {
     Paused,
     /// A player's [`PlayerStats`].
     Stats(Address),
-    /// A player's per-asset record.
-    AssetStats(Address, Address),
     /// How many results have been recorded, used to bound the leaderboard.
     ResultCount,
-    /// Whether this settlement identifier has been processed.
-    SettlementId(String),
     /// Whether `Address` is authorised to submit results.
     Sources(Address),
     /// Every address that has a [`PlayerStats`] entry.
+    ///
+    /// Persistent storage cannot be enumerated on-chain, so `get_leaderboard`
+    /// has no other way to discover which players exist. This is the index that
+    /// makes the leaderboard readable.
     Roster,
-    /// Rank-sorted global player index.
-    RankedRoster,
-    /// Rank-sorted player index for one asset.
-    AssetRoster(Address),
 }
 
 /// Maximum number of rows a single `get_leaderboard` call may return.
@@ -152,10 +142,6 @@ pub enum DataKey {
 /// costs more as the contract grows, and the response must fit in a single
 /// transaction's return budget. Callers page with `offset` instead.
 pub const MAX_PAGE_SIZE: u32 = 50;
-
-/// Maximum distinct players stored by this contract. The maintained rank
-/// indexes cap write work and the amount of state a leaderboard can occupy.
-pub const MAX_PLAYERS: u32 = 256;
 
 /// How many ledgers a [`PlayerStats`] entry lives once written.
 ///
