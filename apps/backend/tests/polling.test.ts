@@ -725,3 +725,24 @@ describe('Game Polling System', () => {
     });
   });
 });
+
+describe('permanent provider outcomes', () => {
+  it.each(['stop', 'review'] as const)('does not retry %s outcomes or submit them', async action => {
+    const store = new PollingJobStore();
+    const job = store.createJob(0, 'quarantined', 'lichess');
+    const onGameCompleted = vi.fn();
+    const onMaxAttemptsExceeded = vi.fn();
+    const poll = vi.fn().mockResolvedValue({ status: 'failed', action, reason: 'invalid evidence' });
+    const worker = new PollingWorker(store, { poll }, {
+      pollingIntervalMs: 100, maxPollingAttempts: 5, backoffMultiplier: 1,
+      onGameCompleted, onMaxAttemptsExceeded,
+    });
+    const cleanup = worker.start();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    cleanup();
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(store.getJob(job.id)).toBeNull();
+    expect(onGameCompleted).not.toHaveBeenCalled();
+    expect(onMaxAttemptsExceeded).toHaveBeenCalledTimes(action === 'review' ? 1 : 0);
+  });
+});

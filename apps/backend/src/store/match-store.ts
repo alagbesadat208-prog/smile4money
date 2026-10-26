@@ -38,6 +38,9 @@ export class MatchStore {
   private nextId = 0;
 
   async createMatch(payload: CreateMatchPayload): Promise<MatchRecord> {
+    if (!Number.isSafeInteger(this.nextId) || this.nextId < 0) {
+      throw new Error('Match identifier range exhausted');
+    }
     if (this.gameIds.has(payload.gameId)) {
       throw new Error('duplicate game_id');
     }

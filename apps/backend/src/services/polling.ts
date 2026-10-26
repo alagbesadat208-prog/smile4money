@@ -94,6 +94,7 @@ export interface PollJob {
 }
 
 export interface PollJobStatus {
+  action?: 'retry' | 'stop' | 'review';
   status: 'pending' | 'completed' | 'failed' | 'in_progress';
   result?: MatchResult;
   reason?: string;
@@ -647,6 +648,19 @@ export class PollingWorker {
         );
       }
     } else if (status.status === 'failed') {
+      if (status.action === 'stop' || status.action === 'review') {
+        // Permanent missing games stop; quarantined evidence goes to the
+        // existing dead-letter/operator callback without another fetch.
+        this.store.removeJob(job.id);
+        if (status.action === 'review') {
+          try {
+            await this.config.onMaxAttemptsExceeded(job, status.reason);
+          } catch {
+            logger.error({ match_id: job.matchId }, 'provider_review_callback_failed');
+          }
+        }
+        return;
+      }
       // Polling failed — check if we should retry or move to DLQ
       if (job.pollingAttempt >= this.config.maxPollingAttempts) {
         logger.error(

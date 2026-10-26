@@ -87,32 +87,31 @@ describe('validateSubmitResultInput', () => {
 
   it('returns error when matchId is not a number', () => {
     expect(validateSubmitResultInput({ matchId: 'bad' as any, gameId: 'g', platform: 'lichess' }))
-      .toBe('matchId must be a positive integer');
+      .toBe('matchId must be a non-negative safe integer');
   });
 
   it('returns error when matchId is NaN', () => {
     expect(validateSubmitResultInput({ matchId: NaN, gameId: 'g', platform: 'lichess' }))
-      .toBe('matchId must be a positive integer');
+      .toBe('matchId must be a non-negative safe integer');
   });
 
   it('returns error when matchId is a non-numeric string', () => {
     expect(validateSubmitResultInput({ matchId: 'abc' as any, gameId: 'g', platform: 'lichess' }))
-      .toBe('matchId must be a positive integer');
+      .toBe('matchId must be a non-negative safe integer');
   });
 
   it('returns error when matchId is a float', () => {
     expect(validateSubmitResultInput({ matchId: 1.5, gameId: 'g', platform: 'lichess' }))
-      .toBe('matchId must be a positive integer');
+      .toBe('matchId must be a non-negative safe integer');
   });
 
-  it('returns error when matchId is zero', () => {
-    expect(validateSubmitResultInput({ matchId: 0, gameId: 'g', platform: 'lichess' }))
-      .toBe('matchId must be a positive integer');
+  it('accepts matchId zero', () => {
+    expect(validateSubmitResultInput({ matchId: 0, gameId: 'g', platform: 'lichess' })).toBeNull();
   });
 
   it('returns error when matchId is negative', () => {
     expect(validateSubmitResultInput({ matchId: -1, gameId: 'g', platform: 'lichess' }))
-      .toBe('matchId must be a positive integer');
+      .toBe('matchId must be a non-negative safe integer');
   });
 
   it('returns error when gameId is missing', () => {

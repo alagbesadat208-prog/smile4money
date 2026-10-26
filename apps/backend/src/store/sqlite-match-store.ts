@@ -98,6 +98,9 @@ export class SqliteMatchStore {
   }
 
   async createMatch(payload: CreateMatchPayload): Promise<MatchRecord> {
+    if (!Number.isSafeInteger(this.nextId) || this.nextId < 0) {
+      throw new Error('Match identifier range exhausted');
+    }
     // #1720 — see match-store.ts's MatchStore.createMatch for the rationale;
     // kept identical here so both store implementations bind the same way.
     const identityHash =

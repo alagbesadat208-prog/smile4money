@@ -4,6 +4,7 @@
  * rather than treating it as a permanent failure.
  */
 export class RateLimitError extends Error {
+  readonly policy = 'retry' as const;
   constructor(
     message: string = 'Rate limit exceeded',
     public readonly retryAfterMs?: number,
