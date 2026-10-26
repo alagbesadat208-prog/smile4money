@@ -410,6 +410,34 @@ escrow.submit_result(
 
 ---
 
+### Fees and Payouts
+
+What a player pays and receives for one match (#112). The frontend shows this breakdown before every wallet approval; the calculation is `apps/frontend/src/utils/payout.ts`.
+
+| Item | Amount | Notes |
+|------|--------|-------|
+| Stake | `stake_amount`, the same for both players | Transferred into escrow by `deposit` |
+| Platform fee | **0** | The escrow contract takes no cut. `PLATFORM_FEE_BPS = 0` in `payout.ts` records this. |
+| Win | Gross `2 × stake_amount`, net `+stake_amount` | Paid by `finalize_result` after the dispute window |
+| Draw | Gross `stake_amount` to each player, net `0` | Both stakes refunded by `finalize_result` |
+| Loss | Gross `0`, net `−stake_amount` | |
+| Cancel / timeout | Each player's own stake back | `cancel_match`, `claim_timeout` |
+| Network fee | **Estimate only** | See below |
+
+**Network fee.** Each transaction the player signs (`create_match`, a token approval when needed, `deposit`) pays a Stellar fee in XLM from the signer's balance. It is never taken out of the stake or the payout.
+
+The fee is the inclusion fee (at least 100 stroops) plus a Soroban resource fee. The resource fee is only known once the wallet simulates the transaction, and it depends on network prices at that moment.
+
+The UI shows an upper estimate per step:
+
+```
+100 stroops + VITE_ESTIMATED_RESOURCE_FEE_STROOPS (default 500,000 stroops = 0.05 XLM)
+```
+
+The UI labels it as an estimate and tells the player that the wallet shows the exact fee before approval. Never present it as exact. Set `VITE_ESTIMATED_RESOURCE_FEE_STROOPS` per deployment if observed fees differ.
+
+If the contract ever takes a platform fee, update `PLATFORM_FEE_BPS` and this table in the same change as the contract.
+
 ### Query Functions
 
 #### `get_match`

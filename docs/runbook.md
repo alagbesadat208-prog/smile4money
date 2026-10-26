@@ -425,6 +425,8 @@ stellar contract invoke \
   --platform '{"Lichess":{}}'
 ```
 
+> **Oracle database lost or corrupted?** Restore it from backup with [Oracle Database Recovery](oracle-db-recovery.md), which covers the backup schedule, recovery objectives and restore steps.
+
 ---
 
 ## 6. Post-Incident Report Template
