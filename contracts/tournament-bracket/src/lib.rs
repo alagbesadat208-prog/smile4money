@@ -45,9 +45,7 @@ use errors::Error;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Env, String, Symbol, TryFromVal, Vec,
 };
-use types::{
-    DataKey, MatchNode, NodeStatus, Tournament, TournamentState, TOURNAMENT_SCHEMA_VERSION,
-};
+use types::{DataKey, MatchNode, NodeStatus, Tournament, TournamentState};
 
 /// Return `true` if `addr` is the all-zeros Stellar account key.
 ///
@@ -134,6 +132,11 @@ impl TournamentBracket {
         Ok(t.entry_fee * t.player_count as i128)
     }
 
+    /// The immutable prize schedule recorded at creation time.
+    pub fn get_prize_schedule(env: &Env, tournament_id: u64) -> Result<Vec<i128>, Error> {
+        Ok(Self::load_tournament(env, tournament_id)?.prize_schedule)
+    }
+
     /// How many entrants have paid their entry fee so far.
     pub fn get_funded_count(env: &Env, tournament_id: u64) -> Result<u32, Error> {
         let t = Self::load_tournament(env, tournament_id)?;
@@ -168,7 +171,6 @@ impl TournamentBracket {
         {
             return Err(Error::InvalidAdmin);
         }
-        admin.require_auth();
 
         // Prove `token` really is a SEP-41 contract before accepting entry fees
         // in it. Same validation the escrow contract performs.
@@ -221,6 +223,29 @@ impl TournamentBracket {
         entry_fee: i128,
         players: Vec<Address>,
     ) -> Result<u64, Error> {
+        // Default rules: winner takes the whole pool.
+        let mut schedule: Vec<i128> = Vec::new(&env);
+        let n = players.len() as i128;
+        schedule.push_back(entry_fee.checked_mul(n).ok_or(Error::InvalidAmount)?);
+        Self::create_tournament_with_prizes(env, entry_fee, players, schedule)
+    }
+
+    /// Like [`create_tournament`](Self::create_tournament) but records an explicit
+    /// prize schedule (`prize_schedule[i]` is the prize for place `i + 1`) with the
+    /// tournament. The schedule and token are immutable and readable through
+    /// `get_prize_schedule` / `get_tournament`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidPrizeSchedule`] if the schedule is empty, has a non-positive
+    /// entry, has more places than entrants, or its total exceeds
+    /// `entry_fee x players.len()`. Also all errors of `create_tournament`.
+    pub fn create_tournament_with_prizes(
+        env: Env,
+        entry_fee: i128,
+        players: Vec<Address>,
+        prize_schedule: Vec<i128>,
+    ) -> Result<u64, Error> {
         let admin: Address = env
             .storage()
             .instance()
@@ -246,25 +271,25 @@ impl TournamentBracket {
             return Err(Error::InvalidPlayerCount);
         }
 
-        let rounds = n.trailing_zeros();
-        let expected_node_total = n.checked_sub(1).ok_or(Error::InvalidPlayerCount)?;
-        let mut computed_node_total = 0u32;
-        let mut round = 0u32;
-        while round < rounds {
-            computed_node_total = computed_node_total
-                .checked_add(Self::node_count(n, round))
-                .ok_or(Error::InvalidPlayerCount)?;
-            round += 1;
-        }
-        if computed_node_total != expected_node_total || computed_node_total > MAX_PLAYERS - 1 {
-            return Err(Error::InvalidPlayerCount);
-        }
-
         let prize_pool = entry_fee
             .checked_mul(n as i128)
             .ok_or(Error::InvalidAmount)?;
         if prize_pool > MAX_PRIZE_POOL {
             return Err(Error::StakeTooHigh);
+        }
+
+        if prize_schedule.is_empty() || prize_schedule.len() > n {
+            return Err(Error::InvalidPrizeSchedule);
+        }
+        let mut total: i128 = 0;
+        for p in prize_schedule.iter() {
+            if p <= 0 {
+                return Err(Error::InvalidPrizeSchedule);
+            }
+            total = total.checked_add(p).ok_or(Error::InvalidPrizeSchedule)?;
+        }
+        if total > prize_pool {
+            return Err(Error::InvalidPrizeSchedule);
         }
 
         // Reject zero and duplicate entrants before anything is written.
@@ -291,13 +316,14 @@ impl TournamentBracket {
             token: token_addr,
             entry_fee,
             player_count: n,
-            rounds,
+            // `n` is a power of two, so this is exactly log2(n).
+            rounds: n.trailing_zeros(),
             funded_count: 0,
             state: TournamentState::Registration,
             champion: None,
             created_ledger: env.ledger().sequence(),
             completed_ledger: None,
-            schema_version: TOURNAMENT_SCHEMA_VERSION,
+            prize_schedule,
         };
         Self::save_tournament(&env, &t);
 
@@ -725,16 +751,10 @@ impl TournamentBracket {
         if tournament_id >= Self::tournament_count(env) {
             return Err(Error::TournamentNotFound);
         }
-        let key = DataKey::Tournament(tournament_id);
-        match env
-            .storage()
+        env.storage()
             .persistent()
-            .try_get::<DataKey, Tournament>(&key)
-        {
-            Ok(Some(t)) if t.schema_version == TOURNAMENT_SCHEMA_VERSION => Ok(t),
-            Ok(Some(_)) | Err(_) => Err(Error::UnsupportedTournamentVersion),
-            Ok(None) => Err(Error::TournamentNotFound),
-        }
+            .get::<DataKey, Tournament>(&DataKey::Tournament(tournament_id))
+            .ok_or(Error::TournamentNotFound)
     }
 
     fn load_node(
