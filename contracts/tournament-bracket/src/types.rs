@@ -1,121 +1,157 @@
-use soroban_sdk::{contracttype, Address, String};
+use soroban_sdk::{contracttype, Address};
 
-/// A single side of a bracket node.
+/// Lifecycle of a tournament.
 ///
-/// The three variants are deliberately distinct: a side is never "just empty".
+/// ```text
+/// (none) ──create_tournament──► Registration
+///                                  │
+///                        all entrants deposit
+///                                  │
+///                                  ▼
+///                             InProgress
+///                                  │
+///                     final decided  │  cancel_tournament / claim_timeout
+///                                  │            │
+///                     ┌────────────┘            └──────────┐
+///                     ▼                                  ▼
+///                 Completed                          Cancelled
+/// ```
 ///
-/// * [`Slot::Filled`] holds the participant that occupies the side.
-/// * [`Slot::Bye`] is an *explicit* bye. The bracket has been seeded, nobody
-///   will ever take this side and the participant on the other side advances
-///   for free.
-/// * [`Slot::Vacant`] means the side is still open. Registration has not
-///   finished and the side may still be filled.
-///
-/// Inferring a bye from a missing participant would conflate a valid
-/// tournament state with an incomplete registration — or with corrupted
-/// storage — so the two are kept apart everywhere in the contract.
+/// `Completed` and `Cancelled` are **terminal states**.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Slot {
-    /// The side holds a registered participant.
-    Filled(Address),
-    /// Explicit bye: nobody occupies this side, the opponent advances.
-    Bye,
-    /// Still unfilled: registration for this side is open.
-    Vacant,
+pub enum TournamentState {
+    /// The bracket has been created but not every entrant has paid their entry
+    /// fee yet. No match can be decided in this state.
+    Registration,
+
+    /// Every entrant has paid, so the first round is under way.
+    InProgress,
+
+    /// The final has been decided and the prize pool has been paid to the
+    /// champion. **Terminal.**
+    Completed,
+
+    /// The tournament was abandoned before a champion emerged. Every funded
+    /// entrant has been refunded. **Terminal.**
+    Cancelled,
 }
 
-/// The state of a bracket node, derived from its sides and result fields.
-///
-/// The state is never stored, it is always recomputed from the node so that it
-/// cannot drift away from the recorded bracket.
+/// Lifecycle of a single node (one match) in the bracket.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NodeState {
-    /// At least one side is still vacant. The node is not playable and it is
-    /// not a bye either: it is simply not decided yet.
-    AwaitingParticipants,
-    /// Both sides hold a participant, the match can be played.
-    Ready,
-    /// A result has been reported and is inside its review window:
-    /// `(provisional_winner, review_deadline_ledger)`. Advancement is blocked
-    /// until the review deadline passes and the result is finalized.
-    UnderReview(Address, u32),
-    /// Explicit bye: the carried participant advances without playing.
-    ByeAdvance(Address),
-    /// Both sides are byes: nobody advances out of this node.
-    Void,
-    /// The match was played and finalized after its review window; the winner advances.
-    Resolved(Address),
+pub enum NodeStatus {
+    /// A first-round node still waiting for one or both entrants to pay their
+    /// entry fee. A node is created in this state.
+    ///
+    /// Later-round nodes are also created in this state but are promoted to
+    /// `AwaitingResult` as soon as both slots are filled by advancement, since
+    /// those entrants already paid at the start of the tournament.
+    AwaitingFunding,
+
+    /// Both entrants are known and funded. The oracle may report a result.
+    AwaitingResult,
+
+    /// The oracle has reported a result. [`MatchNode::winner`] is set and, unless
+    /// this was the final, the winner has been written into the parent node.
+    /// **Terminal.**
+    Decided,
 }
 
-/// A node of the bracket — one match slot of one round.
+/// A tournament and everything needed to run it.
+///
+/// Stored in **persistent** storage under [`DataKey::Tournament`], with the TTL
+/// extended to `MATCH_TTL_LEDGERS` (~30 days) on every write.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Node {
-    pub bracket_id: u64,
-    /// Flat id of the node inside its bracket.
-    pub node_id: u64,
-    /// Round index, `0` is the first round.
+pub struct Tournament {
+    id: u64,
+    admin: Address,
+    token: Address,
+    entry_fee: i128,
+    player_count: u32,
+    minimum_entrants: u32,
+    rounds: u32,
+    funded_count: u32,
+    state: TournamentState,
+    champion: Option<Address>,
+    created_ledger: u32,
+    completed_ledger: Option<u32>,
+}
+
+/// One match in the bracket: a node in the single-elimination tree.
+///
+/// A tournament of `N` entrants has exactly `N - 1` of these. Node `(r, i)`
+/// feeds node `(r + 1, i / 2)`, entering its `player1` slot when `i` is even and
+/// its `player2` slot when `i` is odd.
+///
+/// Stored in **persistent** storage under [`DataKey::Node`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MatchNode {
+    /// The tournament this node belongs to.
+    pub tournament_id: u64,
+
+    /// Round index, 0-based. Round 0 is the first round.
     pub round: u32,
-    /// Index of the node inside its round.
+
+    /// Index of the node within its round, 0-based.
     pub index: u32,
-    /// First side of the node.
-    pub slot1: Slot,
-    /// Second side of the node.
-    pub slot2: Slot,
-    /// Unique external game identifier bound to this playable node within the bracket.
-    pub game_id: Option<String>,
-    /// Provisional winner recorded when a result is first reported; subject to
-    /// amendment by the authorized reviewer until `review_deadline`.
-    pub pending_winner: Option<Address>,
-    /// Ledger sequence at which the review window closes and the provisional
-    /// result can be finalized.
-    pub review_deadline: Option<u32>,
-    /// Finalized winner of the match, set once the review window expires and
-    /// `finalize_result` is called.
+
+    /// First entrant. Fixed at `create_tournament` time for round-0 nodes;
+    /// filled by advancement for later rounds.
+    pub player1: Option<Address>,
+
+    /// Second entrant. See [`player1`](MatchNode::player1).
+    pub player2: Option<Address>,
+
+    /// Whether [`player1`](MatchNode::player1) has paid their entry fee.
+    /// Later-round nodes are never set here: those entrants paid at the start of
+    /// the tournament.
+    pub funded1: bool,
+
+    /// Whether [`player2`](MatchNode::player2) has paid their entry fee.
+    /// See [`funded1`](MatchNode::funded1).
+    pub funded2: bool,
+
+    /// The winner reported by the oracle. `None` until the node is `Decided`.
     pub winner: Option<Address>,
+
+    /// The current lifecycle state. See [`NodeStatus`].
+    pub status: NodeStatus,
+
+    /// The ledger at which the oracle reported a result.
+    /// `None` until the node is `Decided`.
+    pub result_ledger: Option<u32>,
 }
 
-/// A tournament bracket.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Bracket {
-    pub id: u64,
-    /// Address allowed to seal the bracket, cancel it, and submit results.
-    pub admin: Address,
-    /// Address allowed to amend a provisional result during its review window.
-    pub reviewer: Address,
-    /// Review window duration in ledgers before a reported result can be finalized.
-    pub review_window_ledgers: u32,
-    /// Number of first round sides. Always a power of two.
-    pub size: u32,
-    /// Number of rounds, `log2(size)`.
-    pub rounds: u32,
-    /// Number of participants currently registered in the bracket.
-    pub registered: u32,
-    /// Registration is closed: every side of the first round that was still
-    /// vacant has been sealed as an explicit bye.
-    pub locked: bool,
-    /// Whether the bracket has been cancelled. Cancelled brackets cannot
-    /// progress, but remaining participants may still exit and claim refunds.
-    pub cancelled: bool,
-    /// Optional token used for entry fees and refunds.
-    pub token: Option<Address>,
-    /// Entry fee per participant (0 for free brackets).
-    pub entry_fee: i128,
-    /// Winner of the bracket, set once the final is decided.
-    pub champion: Option<Address>,
-}
-
+/// Storage keys used by the tournament bracket contract.
+///
+/// | Key variant                | Storage tier | Description                                       |
+/// |----------------------------|--------------|---------------------------------------------------|
+/// | `Tournament(u64)`          | Persistent   | [`Tournament`] record, keyed by tournament ID     |
+/// | `Node(u64, u32, u32)`      | Persistent   | [`MatchNode`] record, keyed by (id, round, index) |
+/// | `TournamentCount`          | Instance     | Running counter used to assign tournament IDs     |
+/// | `Oracle`                   | Instance     | Address allowed to report match results           |
+/// | `Admin`                    | Instance     | Contract administrator                           |
+/// | `Token`                    | Instance     | The SEP-41 token all fees and prizes use          |
 #[contracttype]
 pub enum DataKey {
+    /// Stores the [`Tournament`] record for the given tournament ID.
+    Tournament(u64),
+
+    /// Stores the [`MatchNode`] record at the given coordinates.
+    Node(u64, u32, u32),
+
+    /// Running counter that tracks the total number of tournaments created.
+    TournamentCount,
+
+    /// The address permitted to call `submit_match_result`.
+    Oracle,
+
+    /// The contract administrator.
     Admin,
-    Paused,
-    Bracket(u64),
-    BracketCount,
-    /// Keyed by (bracket id, node id).
-    Node(u64, u64),
-    /// Keyed by (bracket id, external game id) -> node id.
-    GameId(u64, String),
+
+    /// The SEP-41 token address configured at `initialize` time.
+    Token,
 }

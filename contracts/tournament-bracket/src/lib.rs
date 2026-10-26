@@ -1,880 +1,223 @@
+//! # Tournament bracket
+//!
+//! A single-elimination bracket for a power-of-two field, as specified in
+//! [ADR-003](../../docs/adr/003-tournament-bracket.md).
+//!
+//! An entrant pays their entry fee exactly once. Winners advance from round to
+//! round on oracle result submission, and the champion receives the entire prize
+//! pool (`entry_fee × player_count`) when the final is decided.
+//!
+//! ## Bracket shape
+//!
+//! ```text
+//!  4 entrants, seeded [s0 s3] [s1 s2]
+//!
+//!  round 0                 round 1 (final)
+//!  ┌───────────┐           ┌───────────┐
+//!  │ 0  s0 ─┬──┐           │           │
+//!  │         │  ├─ winner ─┤  0   ─┬──┘
+//!  │ 0  s3 ─┴──┘           │        │
+//!  └───────────┘           │        │
+//!  ┌───────────┐           │        │
+//!  │ 1  s1 ─┬──┐           │        │
+//!  │         │  ├─ winner ─┤        ├── champion
+//!  │ 1  s2 ─┴──┘           │        │
+//!  └───────────┘           │        │
+//!                         └───────────┘
+//! ```
+//!
+//! ## Related documentation
+//!
+//! - Design rationale: [`docs/adr/003-tournament-bracket.md`](../../docs/adr/003-tournament-bracket.md)
+//! - Single-match escrow, which this contract generalises:
+//!   [`docs/api-reference.md`](../../docs/api-reference.md)
+//! - Oracle architecture: [`docs/oracle.md`](../../docs/oracle.md)
+
 #![no_std]
 
+mod constants;
 mod errors;
 mod types;
 
+pub use constants::*;
+
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, String, Symbol, Vec};
-use types::{Bracket, DataKey, Node, NodeState, Slot};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, token, Address, Env, String, Symbol, TryFromVal, Vec,
+};
+use types::{DataKey, MatchNode, NodeStatus, Tournament, TournamentState};
 
-/// ~30 days at 5s/ledger. Used as both the TTL threshold and the extend-to value.
-const BRACKET_TTL_LEDGERS: u32 = 518_400;
+/// Return `true` if `addr` is the all-zeros Stellar account key.
+///
+/// A zero address is the canonical burn address and is never a valid participant.
+fn is_zero_address(env: &Env, addr: &Address) -> bool {
+    // The all-zeros Stellar account key encodes to this strkey.
+    // We construct the Address via the ScAddress XDR path since
+    // TryFromVal<Env, String> is not implemented for Address.
+    use soroban_sdk::xdr::{AccountId, PublicKey, ScAddress, Uint256};
+    let zero_key = Uint256([0u8; 32]);
+    let sc_addr = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(zero_key)));
+    let zero_address = Address::try_from_val(env, &sc_addr).expect("invalid zero address");
+    addr == &zero_address
+}
 
-/// Largest supported bracket: 256 first round sides, 8 rounds.
-pub const MAX_BRACKET_SIZE: u32 = 256;
-
-/// Maximum allowed byte length for an external `game_id` string.
-pub const MAX_GAME_ID_LEN: u32 = 64;
-
-/// Default review window in ledgers (~10 minutes at 5s/ledger) during which a
-/// reported match result remains in [`NodeState::UnderReview`] and can be
-/// amended by the bracket's authorized reviewer before becoming final.
-pub const DEFAULT_REVIEW_WINDOW_LEDGERS: u32 = 120;
-
-/// A tournament bracket.
+/// The single-elimination bracket contract.
 ///
-/// The bracket is a fixed size elimination tree: round `0` holds `size / 2`
-/// nodes, every following round halves the number of nodes and the last round
-/// holds the final. A node of round `r` and index `i` feeds the node of round
-/// `r + 1` and index `i / 2`, into its first side when `i` is even and into
-/// its second side when `i` is odd.
-///
-/// Byes are explicit. Every side of a node is either occupied by a
-/// participant, sealed as a bye or still vacant, and the three cases are never
-/// mixed up:
-///
-/// * A **bye node** has one side sealed as a bye and one side occupied. The
-///   participant advances into the next round without playing.
-/// * A **void node** has both sides sealed as byes. Nobody advances and the
-///   next round receives an explicit bye for that side.
-/// * An **unfilled node** still has a vacant side. It is neither a bye nor a
-///   void: it is simply not decided yet and cannot be played.
-///
-/// ## Node Game Identifiers
-///
-/// Each playable node can be bound to a unique external `game_id` within its
-/// tournament via [`BracketContract::set_node_game_id`] or when reporting a
-/// result via [`BracketContract::submit_result_with_game_id`]:
-///
-/// * Duplicate `game_id` values within the same tournament are rejected with
-///   [`Error::DuplicateGameId`].
-/// * Empty or oversized (`> 64` bytes) identifiers are rejected with
-///   [`Error::InvalidGameId`].
-/// * Once a node is finalized ([`NodeState::Resolved`]), its `game_id` is
-///   immutable and any attempt to replace it fails with
-///   [`Error::AlreadyResolved`].
-/// * Reporting a result with a `game_id` that disagrees with the node's bound
-///   identifier fails with [`Error::GameIdMismatch`].
-///
-/// ## Distinct-Participant Invariant
-///
-/// No participant may occupy more than one slot in a bracket or both sides of
-/// the same node:
-///
-/// * Bracket construction ([`BracketContract::create_seeded_bracket`]) and
-///   registration ([`BracketContract::register`]) reject duplicate participant
-///   addresses and prevent identical addresses from being placed into `slot1`
-///   and `slot2`.
-/// * Advancement ([`BracketContract::write_parent_slot`]) verifies that the
-///   opposite side of the parent node does not already hold the advancing
-///   participant, failing with [`Error::DuplicateParticipant`] before mutating
-///   storage.
-/// * Any stored node whose `slot1` and `slot2` hold the same participant is
-///   rejected as [`Error::MalformedNode`].
-///
-/// ## Result Review Window
-///
-/// Reporting a match outcome via [`BracketContract::submit_result`] or
-/// [`BracketContract::submit_result_with_game_id`] does not immediately advance
-/// the player. Instead, the node enters [`NodeState::UnderReview`] with a
-/// deadline of `env.ledger().sequence() + bracket.review_window_ledgers`
-/// (defaulting to [`DEFAULT_REVIEW_WINDOW_LEDGERS`] and configurable via
-/// [`BracketContract::set_review_config`]):
-///
-/// * While `env.ledger().sequence() < review_deadline`:
-///   - Only `bracket.reviewer` can call [`BracketContract::amend_result`] to
-///     correct a contested provisional winner.
-///   - Advancement to the parent round is blocked and
-///     [`BracketContract::finalize_result`] fails with
-///     [`Error::ReviewWindowOpen`].
-/// * Once `env.ledger().sequence() >= review_deadline`:
-///   - [`BracketContract::amend_result`] is rejected with
-///     [`Error::ReviewWindowExpired`].
-///   - [`BracketContract::finalize_result`] transitions the node to
-///     [`NodeState::Resolved`] and advances the winner into the next round.
-///
-/// ## Emergency Mode
-///
-/// The contract admin can place the contract into emergency mode via
-/// [`BracketContract::pause`] and lift it via [`BracketContract::unpause`]:
-///
-/// * **Blocked while paused** ([`Error::ContractPaused`]):
-///   - [`BracketContract::create_bracket`]
-///   - [`BracketContract::create_seeded_bracket`]
-///   - [`BracketContract::create_paid_bracket`]
-///   - [`BracketContract::set_review_config`]
-///   - [`BracketContract::set_node_game_id`]
-///   - [`BracketContract::register`]
-///   - [`BracketContract::lock_registration`]
-///   - [`BracketContract::submit_result`]
-///   - [`BracketContract::submit_result_with_game_id`]
-///   - [`BracketContract::amend_result`]
-///   - [`BracketContract::finalize_result`]
-///   - [`BracketContract::advance_bye`]
-/// * **Allowed while paused** (participant exits, cancellation, recovery, and reads):
-///   - [`BracketContract::withdraw`] — registered participants can exit any
-///     incomplete bracket and immediately receive their entry fee refund, even
-///     if the bracket was already locked before the incident.
-///   - [`BracketContract::cancel_bracket`] — admin can permanently cancel an
-///     incomplete bracket so participants remain able to withdraw even after
-///     emergency mode is lifted.
-///   - [`BracketContract::unpause`] — admin can lift emergency mode.
-///   - Read queries (`is_paused`, `get_bracket`, `get_node`,
-///     `get_node_by_game_id`, `get_node_state`, `get_champion`).
+/// `#[contractimpl]` on the `impl` block below generates the exported
+/// `TournamentBracket` entry points and the `TournamentBracketClient` used by
+/// the unit tests.
 #[contract]
-pub struct BracketContract;
+pub struct TournamentBracket;
 
 #[contractimpl]
-impl BracketContract {
-    /// Initialize the contract with the address allowed to manage brackets.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+impl TournamentBracket {
+    // ------------------------------ views ------------------------------
+
+    /// Total number of tournaments ever created.
+    ///
+    /// Exposed as a read-only view so frontends can paginate without enumerating.
+    pub fn tournament_count(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TournamentCount)
+            .unwrap_or(0)
+    }
+
+    /// The SEP-41 token address this contract was initialized with.
+    pub fn get_token(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::Unauthorized)
+    }
+
+    /// Read a tournament by ID.
+    pub fn get_tournament(env: &Env, tournament_id: u64) -> Result<Tournament, Error> {
+        Self::load_tournament(env, tournament_id)
+    }
+
+    /// Read a single bracket node.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TournamentNotFound`] or [`Error::NodeNotFound`] if the tournament
+    /// does not exist or has no node at `(round, index)`.
+    pub fn get_node(
+        env: &Env,
+        tournament_id: u64,
+        round: u32,
+        index: u32,
+    ) -> Result<MatchNode, Error> {
+        Self::load_node(env, tournament_id, round, index)
+    }
+
+    /// The champion of a completed tournament.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidState`] if the tournament has no champion yet — either it
+    /// has not been decided, or it was cancelled and refunded.
+    pub fn get_champion(env: &Env, tournament_id: u64) -> Result<Address, Error> {
+        let t = Self::load_tournament(env, tournament_id)?;
+        t.champion.ok_or(Error::InvalidState)
+    }
+
+    /// The total prize pool on offer: `entry_fee × player_count`.
+    ///
+    /// This is the amount the champion receives. It is the same number whether
+    /// the tournament is still in `Registration` or already `Completed`, so a UI
+    /// can display it from the moment the bracket is created.
+    pub fn get_prize_pool(env: &Env, tournament_id: u64) -> Result<i128, Error> {
+        let t = Self::load_tournament(env, tournament_id)?;
+        Ok(t.entry_fee * t.player_count as i128)
+    }
+
+    /// How many entrants have paid their entry fee so far.
+    pub fn get_funded_count(env: &Env, tournament_id: u64) -> Result<u32, Error> {
+        let t = Self::load_tournament(env, tournament_id)?;
+        Ok(t.funded_count)
+    }
+
+    // ---------------------------- lifecycle ----------------------------
+
+    /// Initialize the contract.
+    ///
+    /// Can only be called once; subsequent calls return
+    /// [`Error::AlreadyInitialized`].
+    ///
+    /// # Arguments
+    ///
+    /// * `admin` — The contract administrator. May cancel a tournament that is
+    ///   still in `Registration`.
+    /// * `oracle` — The address permitted to report match results and advance winners.
+    /// * `token` — The SEP-41 token entry fees and prizes are denominated in.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        oracle: Address,
+        token: Address,
+    ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
+        if is_zero_address(&env, &admin)
+            || is_zero_address(&env, &oracle)
+            || is_zero_address(&env, &token)
+        {
+            return Err(Error::InvalidAdmin);
+        }
+
+        // Prove `token` really is a SEP-41 contract before accepting entry fees
+        // in it. Same validation the escrow contract performs.
+        let token_client = token::Client::new(&env, &token);
+        let _ = token_client.decimals();
+
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Paused, &false);
-        env.storage().instance().set(&DataKey::BracketCount, &0u64);
-        env.events()
-            .publish((Symbol::new(&env, "bracket"), symbol_short!("init")), admin);
-        Ok(())
-    }
-
-    /// Activate emergency mode — admin only.
-    ///
-    /// Blocks all tournament creation and progression while keeping
-    /// `cancel_bracket`, `withdraw`, `unpause`, and all read queries available.
-    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("paused")),
-            admin,
-        );
-        Ok(())
-    }
-
-    /// Lift emergency mode — admin only.
-    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
-        let admin = Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Paused, &false);
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("unpaused")),
-            admin,
-        );
-        Ok(())
-    }
-
-    /// Return whether emergency pause mode is currently active.
-    pub fn is_paused(env: Env) -> bool {
-        Self::paused(&env)
-    }
-
-    /// Create a free bracket with `size` first round sides and the default
-    /// review window ([`DEFAULT_REVIEW_WINDOW_LEDGERS`]).
-    ///
-    /// `size` must be a power of two: every round halves the number of nodes
-    /// and the last round holds the final.
-    pub fn create_bracket(env: Env, size: u32) -> Result<u64, Error> {
-        Self::create_bracket_internal(&env, size, None, 0)
-    }
-
-    /// Create a bracket pre-seeded with `participants` in round `0`.
-    ///
-    /// Rejects duplicate participant addresses (including identical addresses
-    /// across both slots of any node) with [`Error::DuplicateParticipant`].
-    pub fn create_seeded_bracket(
-        env: Env,
-        size: u32,
-        participants: Vec<Address>,
-    ) -> Result<u64, Error> {
-        if participants.len() > size {
-            return Err(Error::BracketFull);
-        }
-
-        // Reject any duplicate participant before creating or mutating state.
-        let count = participants.len();
-        for i in 0..count {
-            let p_i = participants.get(i).unwrap();
-            for j in (i + 1)..count {
-                let p_j = participants.get(j).unwrap();
-                if p_i == p_j {
-                    return Err(Error::DuplicateParticipant);
-                }
-            }
-        }
-
-        let bracket_id = Self::create_bracket_internal(&env, size, None, 0)?;
-        let mut bracket = Self::load_bracket(&env, bracket_id)?;
-
-        for side in 0..count {
-            let participant = participants.get(side).unwrap();
-            let node_id = Self::node_id(size, 0, side / 2);
-            let mut node = Self::load_node(&env, bracket_id, node_id)?;
-            Self::assign_node_side(&mut node, side % 2, participant)?;
-            Self::save_node(&env, &node);
-            bracket.registered += 1;
-        }
-
-        Self::save_bracket(&env, &bracket);
-        Ok(bracket_id)
-    }
-
-    /// Create a bracket with an escrowed `entry_fee` in `token` per participant.
-    ///
-    /// Participants transfer `entry_fee` on [`BracketContract::register`] and
-    /// receive a full refund on [`BracketContract::withdraw`].
-    pub fn create_paid_bracket(
-        env: Env,
-        size: u32,
-        token: Address,
-        entry_fee: i128,
-    ) -> Result<u64, Error> {
-        if entry_fee <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        Self::create_bracket_internal(&env, size, Some(token), entry_fee)
-    }
-
-    /// Configure the authorized `reviewer` and `review_window_ledgers` for a
-    /// bracket — bracket admin only.
-    ///
-    /// `review_window_ledgers` must be greater than zero so that reported
-    /// results always pass through a reviewable window before finalization.
-    pub fn set_review_config(
-        env: Env,
-        bracket_id: u64,
-        reviewer: Address,
-        review_window_ledgers: u32,
-        caller: Address,
-    ) -> Result<(), Error> {
-        if Self::paused(&env) {
-            return Err(Error::ContractPaused);
-        }
-        if review_window_ledgers == 0 {
-            return Err(Error::InvalidReviewWindow);
-        }
-
-        let mut bracket = Self::load_bracket(&env, bracket_id)?;
-        if caller != bracket.admin {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
-        if bracket.cancelled {
-            return Err(Error::BracketCancelled);
-        }
-        if bracket.champion.is_some() {
-            return Err(Error::AlreadyCompleted);
-        }
-
-        bracket.reviewer = reviewer.clone();
-        bracket.review_window_ledgers = review_window_ledgers;
-        Self::save_bracket(&env, &bracket);
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("review")),
-            (bracket_id, reviewer, review_window_ledgers),
-        );
-
-        Ok(())
-    }
-
-    /// Associate a unique external `game_id` with a playable bracket node —
-    /// bracket admin only.
-    ///
-    /// * Rejects empty or oversized (`> MAX_GAME_ID_LEN`) identifiers with
-    ///   [`Error::InvalidGameId`].
-    /// * Rejects `game_id` values already used in the same bracket with
-    ///   [`Error::DuplicateGameId`].
-    /// * Rejects attempts to replace a finalized ([`NodeState::Resolved`])
-    ///   node's `game_id` with [`Error::AlreadyResolved`].
-    /// * Rejects non-playable (`ByeAdvance`, `Void`) or unfilled
-    ///   (`AwaitingParticipants`) nodes with [`Error::NotPlayable`] /
-    ///   [`Error::SlotVacant`].
-    pub fn set_node_game_id(
-        env: Env,
-        bracket_id: u64,
-        node_id: u64,
-        game_id: String,
-        caller: Address,
-    ) -> Result<(), Error> {
-        if Self::paused(&env) {
-            return Err(Error::ContractPaused);
-        }
-        Self::validate_game_id(&game_id)?;
-
-        let bracket = Self::load_bracket(&env, bracket_id)?;
-        if caller != bracket.admin {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
-        if bracket.cancelled {
-            return Err(Error::BracketCancelled);
-        }
-
-        let mut node = Self::load_node(&env, bracket_id, node_id)?;
-        match Self::node_state(&node, &bracket)? {
-            NodeState::AwaitingParticipants => return Err(Error::SlotVacant),
-            NodeState::ByeAdvance(_) | NodeState::Void => return Err(Error::NotPlayable),
-            NodeState::Resolved(_) => return Err(Error::AlreadyResolved),
-            NodeState::Ready | NodeState::UnderReview(_, _) => {}
-        }
-
-        Self::bind_game_id(&env, bracket_id, &mut node, game_id.clone())?;
-        Self::save_node(&env, &node);
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("game_id")),
-            (bracket_id, node_id, game_id),
-        );
-
-        Ok(())
-    }
-
-    /// Register `participant` in the next free side of the first round.
-    ///
-    /// Sides are handed out in order of the first vacant slot. A participant
-    /// can only take one side of a bracket. Blocked while emergency mode is
-    /// active or if the bracket has been cancelled.
-    pub fn register(env: Env, bracket_id: u64, participant: Address) -> Result<(), Error> {
-        participant.require_auth();
-
-        if Self::paused(&env) {
-            return Err(Error::ContractPaused);
-        }
-
-        let mut bracket = Self::load_bracket(&env, bracket_id)?;
-        if bracket.cancelled {
-            return Err(Error::BracketCancelled);
-        }
-        if bracket.locked {
-            return Err(Error::RegistrationClosed);
-        }
-        if bracket.registered >= bracket.size {
-            return Err(Error::BracketFull);
-        }
-        if Self::find_participant(&env, &bracket, &participant).is_some() {
-            return Err(Error::AlreadyRegistered);
-        }
-
-        let side = Self::first_vacant_side(&env, &bracket)?.ok_or(Error::BracketFull)?;
-        let node_id = Self::node_id(bracket.size, 0, side / 2);
-        let mut node = Self::load_node(&env, bracket_id, node_id)?;
-        Self::assign_node_side(&mut node, side % 2, participant.clone())?;
-
-        if let Some(ref token_addr) = bracket.token {
-            if bracket.entry_fee > 0 {
-                let token_client = token::Client::new(&env, token_addr);
-                token_client.transfer(
-                    &participant,
-                    &env.current_contract_address(),
-                    &bracket.entry_fee,
-                );
-            }
-        }
-
-        Self::save_node(&env, &node);
-        bracket.registered += 1;
-        Self::save_bracket(&env, &bracket);
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("entered")),
-            (bracket_id, participant),
-        );
-
-        Ok(())
-    }
-
-    /// Close registration and seal every vacant side of the first round as an
-    /// explicit bye.
-    ///
-    /// From this point on a vacant side no longer means "registration is
-    /// open": every side of the first round is either occupied or a bye. The
-    /// byes advance on their own while the bracket is sealed.
-    pub fn lock_registration(env: Env, bracket_id: u64, caller: Address) -> Result<(), Error> {
-        if Self::paused(&env) {
-            return Err(Error::ContractPaused);
-        }
-
-        let mut bracket = Self::load_bracket(&env, bracket_id)?;
-        if caller != bracket.admin {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
-        if bracket.cancelled {
-            return Err(Error::BracketCancelled);
-        }
-        if bracket.locked {
-            return Err(Error::AlreadyLocked);
-        }
-
-        for index in 0..Self::nodes_in_round(bracket.size, 0) {
-            let node_id = Self::node_id(bracket.size, 0, index);
-            let mut node = Self::load_node(&env, bracket_id, node_id)?;
-            if node.slot1 == Slot::Vacant {
-                node.slot1 = Slot::Bye;
-            }
-            if node.slot2 == Slot::Vacant {
-                node.slot2 = Slot::Bye;
-            }
-            Self::save_node(&env, &node);
-        }
-
-        bracket.locked = true;
-        Self::save_bracket(&env, &bracket);
-
-        // Byes advance without anybody having to ask for it.
-        for index in 0..Self::nodes_in_round(bracket.size, 0) {
-            let node_id = Self::node_id(bracket.size, 0, index);
-            Self::settle_from(&env, &mut bracket, node_id)?;
-        }
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("locked")),
-            bracket_id,
-        );
-
-        Ok(())
-    }
-
-    /// Report the provisional winner of a match and start its review window.
-    ///
-    /// The node enters [`NodeState::UnderReview`] until
-    /// `env.ledger().sequence() + bracket.review_window_ledgers`. Advancement
-    /// into the next round is blocked until the review window expires and
-    /// [`BracketContract::finalize_result`] is called.
-    pub fn submit_result(
-        env: Env,
-        bracket_id: u64,
-        node_id: u64,
-        winner: Address,
-        caller: Address,
-    ) -> Result<(), Error> {
-        Self::submit_result_internal(&env, bracket_id, node_id, None, winner, caller)
-    }
-
-    /// Report the provisional winner of a match while verifying or persisting
-    /// the node's external `game_id`.
-    ///
-    /// * If the node already has a `game_id`, `game_id` must match it or the
-    ///   call fails with [`Error::GameIdMismatch`].
-    /// * If the node does not yet have a `game_id`, `game_id` is validated for
-    ///   uniqueness within the bracket (`Error::DuplicateGameId`) and stored on
-    ///   the node.
-    pub fn submit_result_with_game_id(
-        env: Env,
-        bracket_id: u64,
-        node_id: u64,
-        game_id: String,
-        winner: Address,
-        caller: Address,
-    ) -> Result<(), Error> {
-        Self::submit_result_internal(&env, bracket_id, node_id, Some(game_id), winner, caller)
-    }
-
-    /// Amend a provisional match result while its review window is still open.
-    ///
-    /// Only the bracket's authorized `reviewer` may call this function, and
-    /// only strictly before `review_deadline` (`env.ledger().sequence() < deadline`).
-    pub fn amend_result(
-        env: Env,
-        bracket_id: u64,
-        node_id: u64,
-        new_winner: Address,
-        caller: Address,
-    ) -> Result<(), Error> {
-        if Self::paused(&env) {
-            return Err(Error::ContractPaused);
-        }
-
-        let bracket = Self::load_bracket(&env, bracket_id)?;
-        if caller != bracket.reviewer {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
-        if bracket.cancelled {
-            return Err(Error::BracketCancelled);
-        }
-
-        let mut node = Self::load_node(&env, bracket_id, node_id)?;
-        match Self::node_state(&node, &bracket)? {
-            NodeState::UnderReview(_, deadline) => {
-                if env.ledger().sequence() >= deadline {
-                    return Err(Error::ReviewWindowExpired);
-                }
-            }
-            NodeState::Resolved(_) => return Err(Error::AlreadyResolved),
-            _ => return Err(Error::NotUnderReview),
-        }
-
-        let is_participant = matches!(&node.slot1, Slot::Filled(a) if *a == new_winner)
-            || matches!(&node.slot2, Slot::Filled(a) if *a == new_winner);
-        if !is_participant {
-            return Err(Error::InvalidWinner);
-        }
-
-        node.pending_winner = Some(new_winner.clone());
-        Self::save_node(&env, &node);
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("amended")),
-            (bracket_id, node_id, new_winner),
-        );
-
-        Ok(())
-    }
-
-    /// Finalize a reviewed match result once its review deadline has passed and
-    /// advance the winner in the bracket.
-    pub fn finalize_result(env: Env, bracket_id: u64, node_id: u64) -> Result<(), Error> {
-        if Self::paused(&env) {
-            return Err(Error::ContractPaused);
-        }
-
-        let mut bracket = Self::load_bracket(&env, bracket_id)?;
-        if bracket.cancelled {
-            return Err(Error::BracketCancelled);
-        }
-
-        let mut node = Self::load_node(&env, bracket_id, node_id)?;
-        let winner = match Self::node_state(&node, &bracket)? {
-            NodeState::UnderReview(provisional_winner, deadline) => {
-                if env.ledger().sequence() < deadline {
-                    return Err(Error::ReviewWindowOpen);
-                }
-                provisional_winner
-            }
-            NodeState::Resolved(_) => return Err(Error::AlreadyResolved),
-            _ => return Err(Error::NotUnderReview),
-        };
-
-        node.pending_winner = None;
-        node.review_deadline = None;
-        node.winner = Some(winner.clone());
-        Self::save_node(&env, &node);
-
-        // Now that the result is final, advance the winner into the next round.
-        Self::settle_from(&env, &mut bracket, node_id)?;
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("resolved")),
-            (bracket_id, node_id, winner),
-        );
-
-        Ok(())
-    }
-
-    /// Advance the participant of a bye node into the next round.
-    ///
-    /// Byes advance automatically when the bracket is sealed and when a result
-    /// is finalized. This entry point only makes the rule explicit, it is
-    /// idempotent and it rejects a node that is not a bye.
-    pub fn advance_bye(env: Env, bracket_id: u64, node_id: u64) -> Result<(), Error> {
-        if Self::paused(&env) {
-            return Err(Error::ContractPaused);
-        }
-
-        let mut bracket = Self::load_bracket(&env, bracket_id)?;
-        if bracket.cancelled {
-            return Err(Error::BracketCancelled);
-        }
-        let node = Self::load_node(&env, bracket_id, node_id)?;
-
-        match Self::node_state(&node, &bracket)? {
-            NodeState::ByeAdvance(_) => {}
-            // Not decided yet: an unfilled node is not a bye.
-            NodeState::AwaitingParticipants => return Err(Error::SlotVacant),
-            NodeState::Void
-            | NodeState::Ready
-            | NodeState::UnderReview(_, _)
-            | NodeState::Resolved(_) => return Err(Error::NotABye),
-        }
-
-        Self::settle_from(&env, &mut bracket, node_id)?;
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("advance")),
-            (bracket_id, node_id),
-        );
-
-        Ok(())
-    }
-
-    /// Cancel an incomplete bracket — admin only.
-    ///
-    /// Available both during normal operation and while emergency mode is
-    /// active (`is_paused() == true`). Once cancelled, the bracket can never
-    /// resume progression, and all registered participants can call
-    /// [`BracketContract::withdraw`] to exit and claim their refund.
-    pub fn cancel_bracket(env: Env, bracket_id: u64, caller: Address) -> Result<(), Error> {
-        let mut bracket = Self::load_bracket(&env, bracket_id)?;
-        if caller != bracket.admin {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
-
-        if bracket.champion.is_some() {
-            return Err(Error::AlreadyCompleted);
-        }
-        if bracket.cancelled {
-            return Err(Error::BracketCancelled);
-        }
-
-        bracket.cancelled = true;
-        Self::save_bracket(&env, &bracket);
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("cancel")),
-            bracket_id,
-        );
-
-        Ok(())
-    }
-
-    /// Exit a bracket and refund any escrowed entry fee to `participant`.
-    ///
-    /// Allowed when:
-    /// * Registration is still open (`!bracket.locked`), OR
-    /// * The bracket has been cancelled (`bracket.cancelled`), OR
-    /// * The contract is in emergency mode (`is_paused() == true`) and the
-    ///   bracket has not completed (`bracket.champion.is_none()`).
-    ///
-    /// If a participant withdraws from a locked bracket while emergency mode is
-    /// active, the bracket is also marked `cancelled` so that partial state
-    /// cannot resume if the contract is later unpaused.
-    pub fn withdraw(env: Env, bracket_id: u64, participant: Address) -> Result<(), Error> {
-        participant.require_auth();
-
-        let mut bracket = Self::load_bracket(&env, bracket_id)?;
-        if bracket.champion.is_some() {
-            return Err(Error::AlreadyCompleted);
-        }
-
-        let can_exit = !bracket.locked || bracket.cancelled || Self::paused(&env);
-        if !can_exit {
-            return Err(Error::RegistrationClosed);
-        }
-
-        let side =
-            Self::find_participant(&env, &bracket, &participant).ok_or(Error::NotRegistered)?;
-        let node_id = Self::node_id(bracket.size, 0, side / 2);
-        let mut node = Self::load_node(&env, bracket_id, node_id)?;
-
-        let replacement = if bracket.locked {
-            bracket.cancelled = true;
-            Slot::Bye
-        } else {
-            Slot::Vacant
-        };
-
-        if side % 2 == 0 {
-            node.slot1 = replacement;
-        } else {
-            node.slot2 = replacement;
-        }
-
-        if let Some(ref token_addr) = bracket.token {
-            if bracket.entry_fee > 0 {
-                let token_client = token::Client::new(&env, token_addr);
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &participant,
-                    &bracket.entry_fee,
-                );
-            }
-        }
-
-        Self::save_node(&env, &node);
-        bracket.registered = bracket.registered.saturating_sub(1);
-        Self::save_bracket(&env, &bracket);
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("withdrew")),
-            (bracket_id, participant),
-        );
-
-        Ok(())
-    }
-
-    /// Read a bracket by id.
-    pub fn get_bracket(env: Env, bracket_id: u64) -> Result<Bracket, Error> {
-        Self::load_bracket(&env, bracket_id)
-    }
-
-    /// Read a node by id.
-    pub fn get_node(env: Env, bracket_id: u64, node_id: u64) -> Result<Node, Error> {
-        Self::load_node(&env, bracket_id, node_id)
-    }
-
-    /// Read a node by its bound external `game_id` within `bracket_id`.
-    pub fn get_node_by_game_id(env: Env, bracket_id: u64, game_id: String) -> Result<Node, Error> {
-        let node_id: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::GameId(bracket_id, game_id))
-            .ok_or(Error::NotFound)?;
-        Self::load_node(&env, bracket_id, node_id)
-    }
-
-    /// Read the state of a node.
-    ///
-    /// The state tells a bye apart from a node that is still waiting for
-    /// participants and from a node whose stored state is corrupted.
-    pub fn get_node_state(env: Env, bracket_id: u64, node_id: u64) -> Result<NodeState, Error> {
-        let bracket = Self::load_bracket(&env, bracket_id)?;
-        let node = Self::load_node(&env, bracket_id, node_id)?;
-        Self::node_state(&node, &bracket)
-    }
-
-    /// Read the champion of a bracket.
-    pub fn get_champion(env: Env, bracket_id: u64) -> Result<Address, Error> {
-        let bracket = Self::load_bracket(&env, bracket_id)?;
-        bracket.champion.ok_or(Error::NotFound)
-    }
-
-    fn paused(env: &Env) -> bool {
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+        env.storage().instance().set(&DataKey::Token, &token);
         env.storage()
             .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-    }
-
-    fn require_admin(env: &Env, caller: &Address) -> Result<Address, Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        if *caller != admin {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
-        Ok(admin)
-    }
-
-    fn validate_game_id(game_id: &String) -> Result<(), Error> {
-        if game_id.is_empty() || game_id.len() > MAX_GAME_ID_LEN {
-            return Err(Error::InvalidGameId);
-        }
-        Ok(())
-    }
-
-    fn bind_game_id(
-        env: &Env,
-        bracket_id: u64,
-        node: &mut Node,
-        game_id: String,
-    ) -> Result<(), Error> {
-        let key = DataKey::GameId(bracket_id, game_id.clone());
-        if env.storage().persistent().has(&key) {
-            return Err(Error::DuplicateGameId);
-        }
-
-        if let Some(ref previous_game_id) = node.game_id {
-            let old_key = DataKey::GameId(bracket_id, previous_game_id.clone());
-            env.storage().persistent().remove(&old_key);
-        }
-
-        env.storage().persistent().set(&key, &node.node_id);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BRACKET_TTL_LEDGERS, BRACKET_TTL_LEDGERS);
-        node.game_id = Some(game_id);
-        Ok(())
-    }
-
-    fn submit_result_internal(
-        env: &Env,
-        bracket_id: u64,
-        node_id: u64,
-        game_id: Option<String>,
-        winner: Address,
-        caller: Address,
-    ) -> Result<(), Error> {
-        if Self::paused(env) {
-            return Err(Error::ContractPaused);
-        }
-
-        let bracket = Self::load_bracket(env, bracket_id)?;
-        if caller != bracket.admin {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
-        if bracket.cancelled {
-            return Err(Error::BracketCancelled);
-        }
-
-        let mut node = Self::load_node(env, bracket_id, node_id)?;
-        match Self::node_state(&node, &bracket)? {
-            // The node is not decided yet, it is not a bye either.
-            NodeState::AwaitingParticipants => return Err(Error::SlotVacant),
-            // A bye or a void node is never played.
-            NodeState::ByeAdvance(_) | NodeState::Void => return Err(Error::NotPlayable),
-            NodeState::UnderReview(_, _) | NodeState::Resolved(_) => {
-                return Err(Error::AlreadyResolved)
-            }
-            NodeState::Ready => {}
-        }
-
-        let is_participant = matches!(&node.slot1, Slot::Filled(a) if *a == winner)
-            || matches!(&node.slot2, Slot::Filled(a) if *a == winner);
-        if !is_participant {
-            return Err(Error::InvalidWinner);
-        }
-
-        if let Some(provided_game_id) = game_id {
-            Self::validate_game_id(&provided_game_id)?;
-            match &node.game_id {
-                Some(existing) if *existing != provided_game_id => {
-                    return Err(Error::GameIdMismatch);
-                }
-                Some(_) => {}
-                None => {
-                    Self::bind_game_id(env, bracket_id, &mut node, provided_game_id)?;
-                }
-            }
-        }
-
-        let deadline = env
-            .ledger()
-            .sequence()
-            .checked_add(bracket.review_window_ledgers)
-            .ok_or(Error::Overflow)?;
-
-        node.pending_winner = Some(winner.clone());
-        node.review_deadline = Some(deadline);
-        Self::save_node(env, &node);
+            .set(&DataKey::TournamentCount, &0u64);
+        Self::bump_instance_ttl(&env);
 
         env.events().publish(
-            (Symbol::new(env, "bracket"), symbol_short!("reported")),
-            (bracket_id, node_id, winner, deadline),
+            (Symbol::new(&env, "tournament"), symbol_short!("init")),
+            (admin, oracle, token),
         );
-
         Ok(())
     }
 
-    fn assign_node_side(node: &mut Node, side: u32, participant: Address) -> Result<(), Error> {
-        let opposite = if side == 0 { &node.slot2 } else { &node.slot1 };
-        if matches!(opposite, Slot::Filled(existing) if *existing == participant) {
-            return Err(Error::DuplicateParticipant);
-        }
-        if side == 0 {
-            node.slot1 = Slot::Filled(participant);
-        } else {
-            node.slot2 = Slot::Filled(participant);
-        }
-        Ok(())
-    }
-
-    fn create_bracket_internal(
-        env: &Env,
-        size: u32,
-        token: Option<Address>,
+    /// Create a single-elimination bracket.
+    ///
+    /// Builds the full node tree up front (`player_count - 1` nodes) and seeds
+    /// round 0. Entrants are seeded in the order supplied: seed 1 plays seed N,
+    /// seed 2 plays seed N−1, and so on, so the two strongest seeds can only meet
+    /// in the final.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry_fee` — What each entrant pays, in the smallest unit of the
+    ///   configured token. Must be at least `MIN_ENTRY_FEE`, and
+    ///   `entry_fee × players.len()` must not exceed `MAX_PRIZE_POOL`.
+    /// * `players` — The entrants, strongest seed first. Must contain a power of
+    ///   two number of distinct, non-zero addresses.
+    ///
+    /// # Returns
+    ///
+    /// The ID of the new tournament.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::InvalidPlayerCount`] — `players.len()` is not a power of two, or
+    ///   is outside `[2, 64]`.
+    /// * [`Error::DuplicatePlayer`] — an address appears twice.
+    /// * [`Error::InvalidAddress`] — an entrant is the zero address.
+    /// * [`Error::StakeTooLow`] / [`Error::StakeTooHigh`] — `entry_fee` out of range.
+    pub fn create_tournament(
+        env: Env,
         entry_fee: i128,
+        players: Vec<Address>,
     ) -> Result<u64, Error> {
-        if Self::paused(env) {
-            return Err(Error::ContractPaused);
-        }
-
         let admin: Address = env
             .storage()
             .instance()
@@ -882,314 +225,520 @@ impl BracketContract {
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
 
-        if size < 2 || size > MAX_BRACKET_SIZE || !size.is_power_of_two() {
-            return Err(Error::InvalidSize);
-        }
-
-        let id: u64 = env
+        let token_addr: Address = env
             .storage()
             .instance()
-            .get(&DataKey::BracketCount)
-            .unwrap_or(0);
-        let rounds = size.trailing_zeros();
-        let bracket = Bracket {
-            id,
-            admin: admin.clone(),
-            reviewer: admin,
-            review_window_ledgers: DEFAULT_REVIEW_WINDOW_LEDGERS,
-            size,
-            rounds,
-            registered: 0,
-            locked: false,
-            cancelled: false,
-            token,
-            entry_fee,
-            champion: None,
-        };
+            .get(&DataKey::Token)
+            .ok_or(Error::Unauthorized)?;
 
-        // Nobody is seeded yet: every side of every node starts vacant.
-        for round in 0..rounds {
-            for index in 0..Self::nodes_in_round(size, round) {
-                let node = Node {
-                    bracket_id: id,
-                    node_id: Self::node_id(size, round, index),
-                    round,
-                    index,
-                    slot1: Slot::Vacant,
-                    slot2: Slot::Vacant,
-                    game_id: None,
-                    pending_winner: None,
-                    review_deadline: None,
-                    winner: None,
-                };
-                Self::save_node(env, &node);
+        if entry_fee < MIN_ENTRY_FEE {
+            return Err(Error::StakeTooLow);
+        }
+
+        // A power of two keeps every round evenly filled, so nobody gets a bye.
+        // The bounds are checked first so a field of 0 or 1 is rejected on its
+        // own terms rather than as "not a power of two".
+        let n = players.len();
+        if n < MIN_PLAYERS || n > MAX_PLAYERS || !n.is_power_of_two() {
+            return Err(Error::InvalidPlayerCount);
+        }
+
+        let prize_pool = entry_fee
+            .checked_mul(n as i128)
+            .ok_or(Error::InvalidAmount)?;
+        if prize_pool > MAX_PRIZE_POOL {
+            return Err(Error::StakeTooHigh);
+        }
+
+        // Reject zero and duplicate entrants before anything is written.
+        for i in 0..n {
+            let a = players.get(i).ok_or(Error::InvalidPlayerCount)?;
+            if is_zero_address(&env, &a) {
+                return Err(Error::InvalidAddress);
+            }
+            let mut j = 0;
+            while j < i {
+                let b = players.get(j).ok_or(Error::InvalidPlayerCount)?;
+                if a == b {
+                    return Err(Error::DuplicatePlayer);
+                }
+                j += 1;
             }
         }
 
-        Self::save_bracket(env, &bracket);
+        let id = Self::tournament_count(&env);
         let next_id = id.checked_add(1).ok_or(Error::Overflow)?;
+       let t = Tournament {
+    id,
+    admin,
+    token: token_addr,
+    entry_fee,
+    player_count: n,
+    minimum_entrants: n as u32,
+    rounds: n.trailing_zeros(),
+    funded_count: 0,
+        Self::save_tournament(&env, &t);
+
+        // Publish the new ID before writing the nodes: `load_node` refuses to
+        // read a tournament whose ID is not yet below the counter.
         env.storage()
             .instance()
-            .set(&DataKey::BracketCount, &next_id);
+            .set(&DataKey::TournamentCount, &next_id);
+
+        // Build the whole tree now. Round `r` holds `n >> (r + 1)` nodes, so the
+        // total is n/2 + n/4 + ... + 1 == n - 1.
+        let mut r = 0u32;
+        while r < t.rounds {
+            let count = Self::node_count(n, r);
+            let mut i = 0u32;
+            while i < count {
+                Self::save_node(
+                    &env,
+                    MatchNode {
+                        tournament_id: id,
+                        round: r,
+                        index: i,
+                        player1: None,
+                        player2: None,
+                        funded1: false,
+                        funded2: false,
+                        winner: None,
+                        status: NodeStatus::AwaitingFunding,
+                        result_ledger: None,
+                    },
+                );
+                i += 1;
+            }
+            r += 1;
+        }
+
+        // Seed round 0: snake order, so seed 0 meets seed n-1, 1 meets n-2, ...
+        let mut i = 0u32;
+        while i < n / 2 {
+            let p1 = players
+                .get(Self::seed_position(2 * i, n))
+                .ok_or(Error::InvalidPlayerCount)?;
+            let p2 = players
+                .get(Self::seed_position(2 * i + 1, n))
+                .ok_or(Error::InvalidPlayerCount)?;
+            let mut node = Self::load_node(&env, id, 0, i)?;
+            node.player1 = Some(p1);
+            node.player2 = Some(p2);
+            Self::save_node(&env, node);
+            i += 1;
+        }
+
+        Self::bump_instance_ttl(&env);
 
         env.events().publish(
-            (Symbol::new(env, "bracket"), symbol_short!("created")),
-            (id, size),
+            (Symbol::new(&env, "tournament"), symbol_short!("created")),
+            (id, n, entry_fee),
         );
-
         Ok(id)
     }
 
-    /// Derive the state of a node from its sides and result fields.
+    /// Pay this entrant's entry fee.
     ///
-    /// This is the only place where the bracket rules are decided. Anything
-    /// that cannot be read as one of the states below is reported as
-    /// [`Error::MalformedNode`] instead of being interpreted.
-    fn node_state(node: &Node, bracket: &Bracket) -> Result<NodeState, Error> {
-        match (&node.slot1, &node.slot2) {
-            // At least one side is still open. In a sealed first round that
-            // cannot happen: every side was either taken or sealed as a bye.
-            (Slot::Vacant, _) | (_, Slot::Vacant) => {
-                if bracket.locked && node.round == 0 {
-                    return Err(Error::MalformedNode);
-                }
-                if node.winner.is_some()
-                    || node.pending_winner.is_some()
-                    || node.review_deadline.is_some()
-                    || node.game_id.is_some()
-                {
-                    return Err(Error::MalformedNode);
-                }
-                Ok(NodeState::AwaitingParticipants)
-            }
-            (Slot::Filled(p1), Slot::Filled(p2)) => {
-                if p1 == p2 {
-                    // Nobody plays against themselves.
-                    return Err(Error::MalformedNode);
-                }
-                if let Some(ref gid) = node.game_id {
-                    if Self::validate_game_id(gid).is_err() {
-                        return Err(Error::MalformedNode);
-                    }
-                }
-                match (&node.winner, &node.pending_winner, node.review_deadline) {
-                    (Some(w), None, None) if w == p1 || w == p2 => {
-                        Ok(NodeState::Resolved(w.clone()))
-                    }
-                    (None, Some(pw), Some(deadline)) if pw == p1 || pw == p2 => {
-                        Ok(NodeState::UnderReview(pw.clone(), deadline))
-                    }
-                    (None, None, None) => Ok(NodeState::Ready),
-                    _ => Err(Error::MalformedNode),
-                }
-            }
-            // One side is a bye: the participant advances without playing.
-            (Slot::Filled(p), Slot::Bye) | (Slot::Bye, Slot::Filled(p)) => {
-                if node.winner.is_some()
-                    || node.pending_winner.is_some()
-                    || node.review_deadline.is_some()
-                    || node.game_id.is_some()
-                {
-                    // A bye node is never played, so it cannot carry a winner or game_id.
-                    return Err(Error::MalformedNode);
-                }
-                Ok(NodeState::ByeAdvance(p.clone()))
-            }
-            // Both sides are byes: nobody advances out of this node.
-            (Slot::Bye, Slot::Bye) => {
-                if node.winner.is_some()
-                    || node.pending_winner.is_some()
-                    || node.review_deadline.is_some()
-                    || node.game_id.is_some()
-                {
-                    return Err(Error::MalformedNode);
-                }
-                Ok(NodeState::Void)
-            }
+    /// Called once per entrant, by the entrant. Both players of a first-round node
+    /// move to `AwaitingResult` as soon as they have both paid, and the tournament
+    /// moves to [`TournamentState::InProgress`] once every entrant has paid.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::PlayerNotRegistered`] — the caller is not an entrant.
+    /// * [`Error::AlreadyFunded`] — this entrant has already paid.
+    /// * [`Error::TournamentFinished`] — the tournament is completed or cancelled.
+    pub fn deposit(env: Env, tournament_id: u64, player: Address) -> Result<(), Error> {
+        player.require_auth();
+
+        let mut t = Self::load_tournament(&env, tournament_id)?;
+        if t.state == TournamentState::Completed || t.state == TournamentState::Cancelled {
+            return Err(Error::TournamentFinished);
         }
-    }
 
-    /// Propagate the automatic result of a node up the bracket.
-    ///
-    /// A bye node hands its participant to the next round, a void node hands
-    /// an explicit bye to the next round and a resolved node hands its winner
-    /// over. The cascade stops as soon as a node is still waiting for
-    /// participants, is ready to be played, or is still under review.
-    fn settle_from(env: &Env, bracket: &mut Bracket, node_id: u64) -> Result<(), Error> {
-        let size = bracket.size;
-        let rounds = bracket.rounds;
-        let mut current = node_id;
+        let (node_index, is_first) =
+            Self::find_entry_slot(&env, &t, &player)?.ok_or(Error::PlayerNotRegistered)?;
 
-        loop {
-            let node = Self::load_node(env, bracket.id, current)?;
-            let state = Self::node_state(&node, bracket)?;
-
-            let contribution = match state {
-                NodeState::AwaitingParticipants
-                | NodeState::Ready
-                | NodeState::UnderReview(_, _) => return Ok(()),
-                NodeState::ByeAdvance(participant) => Slot::Filled(participant),
-                NodeState::Void => Slot::Bye,
-                NodeState::Resolved(winner) => Slot::Filled(winner),
-            };
-
-            let (parent_id, side) = match Self::parent_of(size, rounds, &node) {
-                Some(parent) => parent,
-                // Last round: the node decides the champion.
-                None => {
-                    if let Slot::Filled(champion) = contribution {
-                        if bracket.champion.is_none() {
-                            if let Some(ref token_addr) = bracket.token {
-                                let prize = bracket.entry_fee * (bracket.registered as i128);
-                                if prize > 0 {
-                                    let token_client = token::Client::new(env, token_addr);
-                                    token_client.transfer(
-                                        &env.current_contract_address(),
-                                        &champion,
-                                        &prize,
-                                    );
-                                }
-                            }
-                        }
-                        bracket.champion = Some(champion);
-                        Self::save_bracket(env, bracket);
-                    }
-                    return Ok(());
-                }
-            };
-
-            Self::write_parent_slot(env, bracket.id, parent_id, side, contribution)?;
-            current = parent_id;
+        let mut node = Self::load_node(&env, tournament_id, 0, node_index)?;
+        if (is_first && node.funded1) || (!is_first && node.funded2) {
+            return Err(Error::AlreadyFunded);
         }
-    }
 
-    /// Write the contribution of a node into the side of its parent it feeds.
-    ///
-    /// Enforces the invariant that the two sides of a parent node never hold
-    /// identical participant addresses.
-    fn write_parent_slot(
-        env: &Env,
-        bracket_id: u64,
-        parent_id: u64,
-        side: u32,
-        value: Slot,
-    ) -> Result<(), Error> {
-        let mut parent = Self::load_node(env, bracket_id, parent_id)?;
-        let (current, opposite) = if side == 0 {
-            (&parent.slot1, &parent.slot2)
+        let client = token::Client::new(&env, &t.token);
+        client.transfer(&player, &env.current_contract_address(), &t.entry_fee);
+
+        if is_first {
+            node.funded1 = true;
         } else {
-            (&parent.slot2, &parent.slot1)
-        };
-
-        if let (Slot::Filled(incoming), Slot::Filled(other)) = (&value, opposite) {
-            if incoming == other {
-                return Err(Error::DuplicateParticipant);
-            }
+            node.funded2 = true;
         }
-
-        match (current, &value) {
-            (Slot::Vacant, _) => {}
-            // Already propagated.
-            (Slot::Bye, Slot::Bye) => return Ok(()),
-            (Slot::Filled(a), Slot::Filled(b)) if a == b => return Ok(()),
-            // The parent side already holds somebody else.
-            _ => return Err(Error::MalformedNode),
+        if node.funded1 && node.funded2 {
+            node.status = NodeStatus::AwaitingResult;
         }
+        Self::save_node(&env, node);
 
-        if side == 0 {
-            parent.slot1 = value;
-        } else {
-            parent.slot2 = value;
+        t.funded_count += 1;
+        if t.funded_count == t.player_count {
+            t.state = TournamentState::InProgress;
         }
-        Self::save_node(env, &parent);
+        Self::save_tournament(&env, &t);
+        Self::bump_instance_ttl(&env);
 
+        env.events().publish(
+            (Symbol::new(&env, "tournament"), symbol_short!("deposit")),
+            (tournament_id, player, t.entry_fee),
+        );
         Ok(())
     }
 
-    /// Number of nodes in `round` of a bracket with `size` first round sides.
-    fn nodes_in_round(size: u32, round: u32) -> u32 {
-        size >> (round + 1)
-    }
+    /// Report the result of one match and advance its winner.
+    ///
+    /// Callable only by the registered oracle. The winner is named by `Address`
+    /// and must be one of the node's two entrants — a draw is not representable
+    /// in a single-elimination bracket, and naming an address that is not in the
+    /// match is rejected rather than silently accepted.
+    ///
+    /// If the node is not the final, its winner is written into the parent node
+    /// and the parent becomes `AwaitingResult` once both its slots are filled. If
+    /// it *is* the final, the tournament completes and the champion is paid the
+    /// whole prize pool in this same call.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`] — caller is not the oracle.
+    /// * [`Error::InvalidGameId`] — `game_id` is empty, too long, or has
+    ///   characters outside `[A-Za-z0-9_-]`.
+    /// * [`Error::InvalidNodeStatus`] — the node is not `AwaitingResult`.
+    /// * [`Error::WinnerNotInMatch`] — `winner` is not one of the node's entrants.
+    /// * [`Error::TournamentFinished`] — the tournament is completed or cancelled.
+    pub fn submit_match_result(
+        env: Env,
+        tournament_id: u64,
+        round: u32,
+        index: u32,
+        game_id: String,
+        winner: Address,
+    ) -> Result<(), Error> {
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Oracle)
+            .ok_or(Error::Unauthorized)?;
+        oracle.require_auth();
 
-    /// Flat id of the first node of `round`.
-    fn round_offset(size: u32, round: u32) -> u32 {
-        size - (size >> round)
-    }
-
-    /// Flat id of the node at `index` of `round`.
-    fn node_id(size: u32, round: u32, index: u32) -> u64 {
-        (Self::round_offset(size, round) + index) as u64
-    }
-
-    /// Parent node of a node and the side of the parent it feeds.
-    fn parent_of(size: u32, rounds: u32, node: &Node) -> Option<(u64, u32)> {
-        if node.round + 1 >= rounds {
-            return None;
+        let mut t = Self::load_tournament(&env, tournament_id)?;
+        if t.state == TournamentState::Completed || t.state == TournamentState::Cancelled {
+            return Err(Error::TournamentFinished);
         }
-        let parent_round = node.round + 1;
-        let parent_index = node.index / 2;
-        let side = node.index % 2;
-        Some((Self::node_id(size, parent_round, parent_index), side))
+
+        let len = game_id.len();
+        if len == 0 || len > MAX_GAME_ID_LEN {
+            return Err(Error::InvalidGameId);
+        }
+        if !Self::is_valid_game_id(&game_id) {
+            return Err(Error::InvalidGameId);
+        }
+
+        let mut node = Self::load_node(&env, tournament_id, round, index)?;
+        if node.status != NodeStatus::AwaitingResult {
+            return Err(Error::InvalidNodeStatus);
+        }
+        if node.player1.as_ref() != Some(&winner) && node.player2.as_ref() != Some(&winner) {
+            return Err(Error::WinnerNotInMatch);
+        }
+
+        node.winner = Some(winner.clone());
+        node.status = NodeStatus::Decided;
+        node.result_ledger = Some(env.ledger().sequence());
+        Self::save_node(&env, node);
+
+        if round + 1 < t.rounds {
+            // Not the final: advance into the parent node. Node `i` of round `r`
+            // feeds node `i / 2` of round `r + 1`.
+            let parent_index = index / 2;
+            let mut parent = Self::load_node(&env, tournament_id, round + 1, parent_index)?;
+            if index % 2 == 0 {
+                parent.player1 = Some(winner.clone());
+            } else {
+                parent.player2 = Some(winner.clone());
+            }
+            if parent.player1.is_some() && parent.player2.is_some() {
+                parent.status = NodeStatus::AwaitingResult;
+            }
+            Self::save_node(&env, parent);
+
+            Self::bump_instance_ttl(&env);
+            env.events().publish(
+                (Symbol::new(&env, "tournament"), symbol_short!("advanced")),
+                (tournament_id, round, index, winner),
+            );
+            return Ok(());
+        }
+
+        // The final: crown the champion and pay the whole pot. No payout happens
+        // before this point — an earlier-round winner keeps their fee in the pot.
+        t.champion = Some(winner.clone());
+        t.state = TournamentState::Completed;
+        t.completed_ledger = Some(env.ledger().sequence());
+        Self::save_tournament(&env, &t);
+
+        let payout = t.entry_fee * t.player_count as i128;
+        Self::ensure_reserve_for_payout(&env, &t.token, payout)?;
+        let client = token::Client::new(&env, &t.token);
+        client.transfer(&env.current_contract_address(), &winner, &payout);
+
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "tournament"), symbol_short!("champion")),
+            (tournament_id, winner, payout),
+        );
+        Ok(())
     }
 
-    /// First vacant side in round `0`, if any.
-    fn first_vacant_side(env: &Env, bracket: &Bracket) -> Result<Option<u32>, Error> {
-        for index in 0..Self::nodes_in_round(bracket.size, 0) {
-            let node_id = Self::node_id(bracket.size, 0, index);
-            let node = Self::load_node(env, bracket.id, node_id)?;
-            if node.slot1 == Slot::Vacant {
-                return Ok(Some(index * 2));
+    /// Abandon a tournament that has not started and refund every funded entrant.
+    ///
+    /// Admin only, and only while the tournament is still in
+    /// [`Registration`](TournamentState::Registration) — i.e. no match has been
+    /// decided. Once results are in, the pot is committed and only the
+    /// trustless `claim_timeout` path remains.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`] — caller is not the admin.
+    /// * [`Error::TournamentInProgress`] — at least one match has been decided.
+    pub fn cancel_tournament(env: Env, tournament_id: u64) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+
+        let mut t = Self::load_tournament(&env, tournament_id)?;
+        if t.state != TournamentState::Registration {
+            return Err(Error::TournamentInProgress);
+        }
+
+        // Recorded before the refund, which zeroes the counter.
+        let refunded = t.funded_count;
+        Self::refund_all(&env, &mut t)?;
+        t.state = TournamentState::Cancelled;
+        t.completed_ledger = Some(env.ledger().sequence());
+        Self::save_tournament(&env, &t);
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "tournament"), symbol_short!("cancelled")),
+            (tournament_id, refunded),
+        );
+        Ok(())
+    }
+
+    /// Refund everyone once the tournament has clearly stalled.
+    ///
+    /// Callable by **anyone** once `TIMEOUT_LEDGERS` have elapsed since the
+    /// tournament was created, so a stalled bracket can never hold player funds
+    /// indefinitely. This is the trustless backstop; it mirrors
+    /// `EscrowContract::claim_timeout`, which is likewise permissionless.
+    ///
+    /// Note this resolves a stalled tournament by refunding *everyone* rather than
+    /// picking a default winner. Deciding who advances when a player refuses to
+    /// play is real policy and is out of scope — see ADR-003, "Known limitation".
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::TimeoutNotReached`] — the window has not elapsed yet.
+    /// * [`Error::TournamentFinished`] — already completed or cancelled.
+    pub fn claim_timeout(env: Env, tournament_id: u64, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut t = Self::load_tournament(&env, tournament_id)?;
+        if t.state == TournamentState::Completed || t.state == TournamentState::Cancelled {
+            return Err(Error::TournamentFinished);
+        }
+        if env.ledger().sequence() <= t.created_ledger + TIMEOUT_LEDGERS {
+            return Err(Error::TimeoutNotReached);
+        }
+
+        // Recorded before the refund, which zeroes the counter.
+        let refunded = t.funded_count;
+        Self::refund_all(&env, &mut t)?;
+        t.state = TournamentState::Cancelled;
+        t.completed_ledger = Some(env.ledger().sequence());
+        Self::save_tournament(&env, &t);
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "tournament"), symbol_short!("timeout")),
+            (tournament_id, refunded, caller),
+        );
+        Ok(())
+    }
+
+    // ---------------------------- internals ----------------------------
+
+    /// Extend the lifetime of the contract's instance-storage entries.
+    ///
+    /// Instance storage (admin, oracle, token, tournament count) shares a single
+    /// TTL, so it is bumped as a unit after every mutating call.
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Number of nodes in round `r` of a `player_count`-entrant bracket.
+    fn node_count(player_count: u32, round: u32) -> u32 {
+        player_count >> (round + 1)
+    }
+
+    /// Map a round-0 seed slot to a position in the entrants list.
+    ///
+    /// Snake seeding: slot 0 is the top seed, slot 1 the bottom seed, slot 2 the
+    /// second seed, and so on. For 4 entrants that gives
+    /// `0 -> 0, 1 -> 3, 2 -> 1, 3 -> 2`, i.e. `[s0 s3] [s1 s2]`.
+    fn seed_position(index: u32, player_count: u32) -> u32 {
+        if index % 2 == 0 {
+            index / 2
+        } else {
+            player_count - 1 - index / 2
+        }
+    }
+
+    /// Find `player` in round 0. Returns `Some((node_index, is_first_slot))`.
+    fn find_entry_slot(
+        env: &Env,
+        t: &Tournament,
+        player: &Address,
+    ) -> Result<Option<(u32, bool)>, Error> {
+        let mut i = 0u32;
+        while i < t.player_count / 2 {
+            let node = Self::load_node(env, t.id, 0, i)?;
+            if node.player1.as_ref() == Some(player) {
+                return Ok(Some((i, true)));
             }
-            if node.slot2 == Slot::Vacant {
-                return Ok(Some(index * 2 + 1));
+            if node.player2.as_ref() == Some(player) {
+                return Ok(Some((i, false)));
             }
+            i += 1;
         }
         Ok(None)
     }
 
-    /// Side of the first round occupied by `participant`, if any.
-    fn find_participant(env: &Env, bracket: &Bracket, participant: &Address) -> Option<u32> {
-        for index in 0..Self::nodes_in_round(bracket.size, 0) {
-            let node_id = Self::node_id(bracket.size, 0, index);
-            let node = Self::load_node(env, bracket.id, node_id).ok()?;
-            if matches!(&node.slot1, Slot::Filled(a) if a == participant) {
-                return Some(index * 2);
-            }
-            if matches!(&node.slot2, Slot::Filled(a) if a == participant) {
-                return Some(index * 2 + 1);
+    /// Validate that every byte of `game_id` belongs to `[A-Za-z0-9_-]`.
+    ///
+    /// Mirrors the escrow contract's check: printable ASCII only, so null bytes,
+    /// control characters, whitespace and non-ASCII sequences never enter
+    /// persistent storage where they would diverge from the platform's own
+    /// game-ID format.
+    ///
+    /// The string is copied into a fixed stack buffer of `MAX_GAME_ID_LEN` bytes,
+    /// so no heap allocation is required inside the WASM guest.
+    fn is_valid_game_id(game_id: &String) -> bool {
+        let len = game_id.len() as usize;
+        // Safety: len is already validated to be in [1, MAX_GAME_ID_LEN].
+        let mut buf = [0u8; MAX_GAME_ID_LEN as usize];
+        game_id.copy_into_slice(&mut buf[..len]);
+        for i in 0..len {
+            let b = buf[i];
+            let ok = b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+            if !ok {
+                return false;
             }
         }
-        None
+        true
     }
 
-    fn load_bracket(env: &Env, bracket_id: u64) -> Result<Bracket, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Bracket(bracket_id))
-            .ok_or(Error::NotFound)
+    /// Reject a payout that would drop the contract below
+    /// [`ESCROW_RESERVE_BUFFER_STROOPS`].
+    ///
+    /// Without this a `transfer` could fail at the Stellar protocol layer with a
+    /// reserve-induced `op_under_min_balance`, leaving the tournament marked
+    /// `Completed` with the champion unpaid. Same guard as the escrow contract.
+    fn ensure_reserve_for_payout(
+        env: &Env,
+        token: &Address,
+        payout_total: i128,
+    ) -> Result<(), Error> {
+        let client = token::Client::new(env, token);
+        let balance = client.balance(&env.current_contract_address());
+        if balance < payout_total + ESCROW_RESERVE_BUFFER_STROOPS {
+            return Err(Error::InsufficientReserve);
+        }
+        Ok(())
     }
 
-    fn save_bracket(env: &Env, bracket: &Bracket) {
-        let key = DataKey::Bracket(bracket.id);
-        env.storage().persistent().set(&key, bracket);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BRACKET_TTL_LEDGERS, BRACKET_TTL_LEDGERS);
+    /// Refund every entrant who has paid, and clear their funded flags.
+    fn refund_all(env: &Env, t: &mut Tournament) -> Result<(), Error> {
+        if t.funded_count == 0 {
+            return Ok(());
+        }
+        Self::ensure_reserve_for_payout(env, &t.token, t.entry_fee * t.funded_count as i128)?;
+
+        let contract = env.current_contract_address();
+        let client = token::Client::new(env, &t.token);
+        let mut i = 0u32;
+        while i < t.player_count / 2 {
+            let mut node = Self::load_node(env, t.id, 0, i)?;
+            if node.funded1 {
+                if let Some(p) = node.player1.clone() {
+                    client.transfer(&contract, &p, &t.entry_fee);
+                }
+                node.funded1 = false;
+            }
+            if node.funded2 {
+                if let Some(p) = node.player2.clone() {
+                    client.transfer(&contract, &p, &t.entry_fee);
+                }
+                node.funded2 = false;
+            }
+            Self::save_node(env, node);
+            i += 1;
+        }
+        t.funded_count = 0;
+        Ok(())
     }
 
-    fn load_node(env: &Env, bracket_id: u64, node_id: u64) -> Result<Node, Error> {
+    fn load_tournament(env: &Env, tournament_id: u64) -> Result<Tournament, Error> {
+        if tournament_id >= Self::tournament_count(env) {
+            return Err(Error::TournamentNotFound);
+        }
         env.storage()
             .persistent()
-            .get(&DataKey::Node(bracket_id, node_id))
-            .ok_or(Error::NotFound)
+            .get::<DataKey, Tournament>(&DataKey::Tournament(tournament_id))
+            .ok_or(Error::TournamentNotFound)
     }
 
-    fn save_node(env: &Env, node: &Node) {
-        let key = DataKey::Node(node.bracket_id, node.node_id);
-        env.storage().persistent().set(&key, node);
+    fn load_node(
+        env: &Env,
+        tournament_id: u64,
+        round: u32,
+        index: u32,
+    ) -> Result<MatchNode, Error> {
+        let t = Self::load_tournament(env, tournament_id)?;
+        if round >= t.rounds || index >= Self::node_count(t.player_count, round) {
+            return Err(Error::NodeNotFound);
+        }
         env.storage()
             .persistent()
-            .extend_ttl(&key, BRACKET_TTL_LEDGERS, BRACKET_TTL_LEDGERS);
+            .get::<DataKey, MatchNode>(&DataKey::Node(tournament_id, round, index))
+            .ok_or(Error::NodeNotFound)
+    }
+
+    fn save_tournament(env: &Env, t: &Tournament) {
+        let key = DataKey::Tournament(t.id);
+        env.storage().persistent().set(&key, t);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+    }
+
+    fn save_node(env: &Env, node: MatchNode) {
+        let key = DataKey::Node(node.tournament_id, node.round, node.index);
+        env.storage().persistent().set(&key, &node);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
     }
 }
 
