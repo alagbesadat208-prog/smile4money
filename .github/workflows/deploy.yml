@@ -1,32 +1,45 @@
 name: Deploy to Testnet
 
-concurrency:
-  group: ${{ github.ref }}
-  cancel-in-progress: true
-
 on:
   workflow_dispatch:
   push:
-    branches: [ master ]
+    branches: [master]
     paths:
       - 'contracts/**'
+      - 'scripts/deploy_*.sh'
+      - 'scripts/verify_admin_readback.sh'
+      - 'scripts/create_deployment_manifest.py'
+      - 'scripts/verify_and_export_frontend.sh'
+      - '.github/workflows/deploy.yml'
+
+concurrency:
+  group: deploy-testnet
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   deploy:
-    name: Deploy contracts
+    name: Deploy and attest contracts
     runs-on: ubuntu-latest
     environment: testnet
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
+        uses: actions/cache@v3
         with:
           path: |
             ~/.cargo/registry
@@ -37,7 +50,7 @@ jobs:
 
       - name: Install Stellar CLI
         run: |
-          curl -sSL https://github.com/stellar/stellar-cli/releases/download/v22.0.1/stellar-cli-22.0.1-x86_64-unknown-linux-gnu.tar.gz \
+          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v22.0.1/stellar-cli-22.0.1-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C /usr/local/bin stellar
 
       - name: Import deployer identity
@@ -45,16 +58,35 @@ jobs:
           DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET_KEY }}
         run: |
           if [ -z "$DEPLOYER_SECRET" ]; then
-            echo "DEPLOYER_SECRET_KEY secret is not set — skipping deploy"
+            echo 'ERROR: DEPLOYER_SECRET_KEY is not set.' >&2
             exit 1
           fi
-          stellar keys add deployer --secret-key "$DEPLOYER_SECRET"
+          stellar keys add deployer --secret-key "$DEPLOYER_SECRET" >/dev/null
 
-      - name: Deploy
-        run: ./scripts/deploy_testnet.sh
+      - name: Deploy and verify initialized admin
+        env:
+          ESCROW_TOKEN_ADDRESS: ${{ vars.TESTNET_ESCROW_TOKEN_ADDRESS }}
+          ESCROW_SAFE_ADDRESS: ${{ vars.TESTNET_ESCROW_SAFE_ADDRESS }}
+        run: bash ./scripts/deploy_testnet.sh
 
-      - name: Upload contract addresses
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Attest the source-bound deployment manifest
+        uses: actions/attest@v4
         with:
-          name: contract-addresses
-          path: .env
+          subject-path: deployments/testnet.json
+
+      - name: Verify attestation BEFORE exporting frontend configuration
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/verify_and_export_frontend.sh \
+            deployments/testnet.json \
+            apps/frontend/.env.deployment
+
+      - name: Publish verified public deployment metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-deployment
+          path: |
+            deployments/testnet.json
+            apps/frontend/.env.deployment
+          if-no-files-found: error

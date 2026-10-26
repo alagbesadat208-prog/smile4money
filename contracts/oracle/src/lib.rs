@@ -99,6 +99,17 @@ pub struct OracleContract;
 
 #[contractimpl]
 impl OracleContract {
+    /// Read the current admin for deployment authorization checks.
+    /// Does not mutate state or grant authority.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        let state: InstanceState = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstanceState)
+            .ok_or(Error::Unauthorized)?;
+        Ok(state.admin)
+    }
+
     /// Initialize the oracle contract with a trusted admin address.
     ///
     /// The `admin` is the address of the off-chain oracle service that is authorised
