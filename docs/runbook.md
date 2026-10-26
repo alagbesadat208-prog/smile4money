@@ -2,6 +2,8 @@
 
 > **Audience:** On-call engineers and administrators with access to the admin private key.
 > **Scope:** Emergency response, oracle key rotation, and post-incident analysis.
+>
+> **Chess platform outage during active wagers?** See [Provider Outage Policy](provider-outage-policy.md) for escalation, player notices and how it interacts with the on-chain timeout.
 
 ---
 

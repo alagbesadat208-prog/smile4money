@@ -8,8 +8,13 @@
 
 import { fetchLichessResult, GameNotFoundError } from '../fetchers/lichess.js';
 import { fetchChessDotComResult } from '../fetchers/chessdotcom.js';
-import type { MatchResult } from '../fetchers/lichess.js';
+import type { MatchResult, GameResult } from '../fetchers/lichess.js';
 import { errorToHttpStatus } from '../errors/errorToHttpStatus.js';
+import {
+  checkGameEligibility,
+  type EligibilityRejection,
+  type GameMetadata,
+} from './game-eligibility.js';
 
 export interface ValidateGameInput {
   gameId: string;
@@ -47,7 +52,54 @@ export interface ValidateGameError {
   message?: string;
 }
 
-export type ValidateGameResult = ValidateGameSuccess | ValidateGameNotFound | ValidateGameError;
+/** The game exists but breaks a rule in docs/supported-games.md (#110). */
+export interface ValidateGameIneligible {
+  ok: false;
+  status: 422;
+  valid: false;
+  platform: string;
+  gameId: string;
+  message: string;
+  rejections: EligibilityRejection[];
+}
+
+export type ValidateGameResult =
+  | ValidateGameSuccess
+  | ValidateGameNotFound
+  | ValidateGameIneligible
+  | ValidateGameError;
+
+/**
+ * A fetched game, optionally carrying provider metadata (variant, time
+ * control, clock) for the eligibility rules. Fetchers that do not attach it
+ * yet are checked on `status` alone.
+ */
+type FetchedGame = GameResult & { metadata?: GameMetadata };
+
+/**
+ * Apply the eligibility rules to a fetched game. Returns the rejection
+ * response, or null when the game is eligible.
+ */
+function ineligibleResponse(
+  platform: string,
+  gameId: string,
+  game: FetchedGame,
+): ValidateGameIneligible | null {
+  const { eligible, rejections } = checkGameEligibility({
+    ...game.metadata,
+    status: game.status,
+  });
+  if (eligible) return null;
+  return {
+    ok: false,
+    status: 422,
+    valid: false,
+    platform,
+    gameId,
+    message: rejections.map((r) => r.message).join(' '),
+    rejections,
+  };
+}
 
 /**
  * Validate the input fields for a game-validation request.
@@ -73,8 +125,8 @@ export function validateGameInput(input: Partial<ValidateGameInput>): string | n
 }
 
 /**
- * Validate that a chess game exists on the given platform and return its
- * details.
+ * Validate that a chess game exists on the given platform, meets the
+ * eligibility rules (docs/supported-games.md), and return its details.
  *
  * Assumes input has already been validated by `validateGameInput`.
  */
@@ -84,6 +136,8 @@ export async function validateGame(input: ValidateGameInput): Promise<ValidateGa
   try {
     if (platform === 'lichess') {
       const result = await fetchLichessResult(gameId);
+      const ineligible = ineligibleResponse('lichess', result.gameId, result);
+      if (ineligible) return ineligible;
       return {
         ok: true,
         valid: true,
@@ -97,6 +151,8 @@ export async function validateGame(input: ValidateGameInput): Promise<ValidateGa
     } else {
       // chessdotcom — username already validated by validateGameInput
       const result = await fetchChessDotComResult(username as string, gameId);
+      const ineligible = ineligibleResponse('chessdotcom', result.gameId, result);
+      if (ineligible) return ineligible;
       return {
         ok: true,
         valid: true,

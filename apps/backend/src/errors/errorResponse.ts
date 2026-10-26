@@ -69,6 +69,8 @@ export function statusToErrorCode(status: number): ErrorCode {
       return ErrorCode.NOT_FOUND;
     case 409:
       return ErrorCode.CONFLICT;
+    case 422:
+      return ErrorCode.VALIDATION_ERROR;
     case 429:
       return ErrorCode.RATE_LIMITED;
     default:

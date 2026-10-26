@@ -1,0 +1,44 @@
+# Code owners for production-sensitive paths (#119).
+#
+# A change to anything below can alter production behavior: which network and
+# RPC endpoints the apps talk to, which contract IDs and token addresses they
+# trust, how contracts are built and deployed, and what the deploy pipeline is
+# allowed to do. Branch protection on `master` requires an approving review
+# from a code owner for every pull request that touches these paths ("Require
+# review from Code Owners"); see docs/contributing.md#production-configuration-changes.
+#
+# Later rules override earlier ones, so the general rules come first. Replace
+# an individual owner with a GitHub team (e.g. @org/contracts) once teams exist;
+# every path must keep at least one owner who is not the change's author.
+
+# ── Network, RPC endpoints, contract IDs and token addresses ─────────────────
+/environments.toml                      @obajecollinsmicheal-cmd
+/.env.example                           @obajecollinsmicheal-cmd
+/apps/backend/src/config/               @obajecollinsmicheal-cmd
+/apps/backend/src/services/stellar.ts   @obajecollinsmicheal-cmd
+/apps/frontend/src/constants.ts         @obajecollinsmicheal-cmd
+/apps/frontend/src/main.tsx             @obajecollinsmicheal-cmd
+
+# ── Smart contracts (on-chain behavior, error codes, interface) ──────────────
+/contracts/                             @obajecollinsmicheal-cmd
+/Cargo.toml                             @obajecollinsmicheal-cmd
+/Cargo.lock                             @obajecollinsmicheal-cmd
+/rust-toolchain.toml                    @obajecollinsmicheal-cmd
+
+# ── Deployment policy and pipeline ───────────────────────────────────────────
+/.github/workflows/                     @obajecollinsmicheal-cmd
+/scripts/deploy_mainnet.sh              @obajecollinsmicheal-cmd
+/scripts/deploy_testnet.sh              @obajecollinsmicheal-cmd
+/scripts/verify_wasm_hash.sh            @obajecollinsmicheal-cmd
+/scripts/validate_environments.py       @obajecollinsmicheal-cmd
+/scripts/check-secrets.sh               @obajecollinsmicheal-cmd
+/docs/deployment.md                     @obajecollinsmicheal-cmd
+/docs/runbook.md                        @obajecollinsmicheal-cmd
+
+# ── Supply-chain policy ──────────────────────────────────────────────────────
+/deny.toml                              @obajecollinsmicheal-cmd
+/audit.toml                             @obajecollinsmicheal-cmd
+/.github/dependabot.yml                 @obajecollinsmicheal-cmd
+
+# ── This file ────────────────────────────────────────────────────────────────
+/.github/CODEOWNERS                     @obajecollinsmicheal-cmd

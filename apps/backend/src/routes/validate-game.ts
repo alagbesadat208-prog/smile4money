@@ -41,6 +41,9 @@ router.post('/', async (req, res) => {
       platform: result.platform ?? payload.platform,
       gameId: result.gameId ?? payload.gameId,
       ...(result.message ? { message: result.message } : {}),
+      // Machine-readable eligibility rejections (#110), when the game exists
+      // but cannot be wagered on.
+      ...('rejections' in result ? { rejections: result.rejections } : {}),
       error: errorEnvelope(statusToErrorCode(result.status), message).error,
     });
   }

@@ -1,0 +1,639 @@
+{
+  "schemaVersion": 1,
+  "specHash": "40b1543545c2d06c",
+  "generatedBy": "scripts/generate-contract-interface.mjs",
+  "contracts": {
+    "escrow": {
+      "methods": [
+        {
+          "name": "cancel_match",
+          "args": [
+            {
+              "name": "match_id",
+              "type": "u64"
+            },
+            {
+              "name": "caller",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "claim_timeout",
+          "args": [
+            {
+              "name": "match_id",
+              "type": "u64"
+            },
+            {
+              "name": "caller",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "create_match",
+          "args": [
+            {
+              "name": "player1",
+              "type": "Address"
+            },
+            {
+              "name": "player2",
+              "type": "Address"
+            },
+            {
+              "name": "stake_amount",
+              "type": "i128"
+            },
+            {
+              "name": "token",
+              "type": "Option<Address>"
+            },
+            {
+              "name": "game_id",
+              "type": "String"
+            },
+            {
+              "name": "platform",
+              "type": "Platform"
+            }
+          ],
+          "returns": "Result<u64, Error>"
+        },
+        {
+          "name": "deposit",
+          "args": [
+            {
+              "name": "match_id",
+              "type": "u64"
+            },
+            {
+              "name": "player",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "emergency_drain",
+          "args": [
+            {
+              "name": "caller",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "finalize_result",
+          "args": [
+            {
+              "name": "match_id",
+              "type": "u64"
+            },
+            {
+              "name": "caller",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "get_escrow_balance",
+          "args": [
+            {
+              "name": "match_id",
+              "type": "u64"
+            }
+          ],
+          "returns": "Result<u128, Error>"
+        },
+        {
+          "name": "get_game_id_owner",
+          "args": [
+            {
+              "name": "game_id",
+              "type": "String"
+            }
+          ],
+          "returns": "Option<u64>"
+        },
+        {
+          "name": "get_match",
+          "args": [
+            {
+              "name": "match_id",
+              "type": "u64"
+            }
+          ],
+          "returns": "Result<Match, Error>"
+        },
+        {
+          "name": "get_platform",
+          "args": [
+            {
+              "name": "match_id",
+              "type": "u64"
+            }
+          ],
+          "returns": "Result<Platform, Error>"
+        },
+        {
+          "name": "get_token",
+          "args": [],
+          "returns": "Result<Address, Error>"
+        },
+        {
+          "name": "initialize",
+          "args": [
+            {
+              "name": "oracle",
+              "type": "Address"
+            },
+            {
+              "name": "admin",
+              "type": "Address"
+            },
+            {
+              "name": "token",
+              "type": "Address"
+            },
+            {
+              "name": "safe_address",
+              "type": "Address"
+            },
+            {
+              "name": "dispute_window_ledgers",
+              "type": "Option<u32>"
+            },
+            {
+              "name": "timeout_ledgers",
+              "type": "Option<u32>"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "is_funded",
+          "args": [
+            {
+              "name": "match_id",
+              "type": "u64"
+            }
+          ],
+          "returns": "Result<bool, Error>"
+        },
+        {
+          "name": "list_matches",
+          "args": [
+            {
+              "name": "start",
+              "type": "u64"
+            },
+            {
+              "name": "limit",
+              "type": "u32"
+            }
+          ],
+          "returns": "Vec<u64>"
+        },
+        {
+          "name": "list_matches_after",
+          "args": [
+            {
+              "name": "after_match_id",
+              "type": "u64"
+            },
+            {
+              "name": "limit",
+              "type": "u32"
+            }
+          ],
+          "returns": "Vec<u64>"
+        },
+        {
+          "name": "match_count",
+          "args": [],
+          "returns": "u64"
+        },
+        {
+          "name": "override_result",
+          "args": [
+            {
+              "name": "match_id",
+              "type": "u64"
+            },
+            {
+              "name": "new_winner",
+              "type": "Winner"
+            },
+            {
+              "name": "caller",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "pause",
+          "args": [],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "submit_result",
+          "args": [
+            {
+              "name": "match_id",
+              "type": "u64"
+            },
+            {
+              "name": "game_id",
+              "type": "String"
+            },
+            {
+              "name": "winner",
+              "type": "Winner"
+            },
+            {
+              "name": "caller",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "transfer_admin",
+          "args": [
+            {
+              "name": "caller",
+              "type": "Address"
+            },
+            {
+              "name": "new_admin",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "unpause",
+          "args": [],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "update_oracle",
+          "args": [
+            {
+              "name": "new_oracle",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        }
+      ],
+      "errors": [
+        {
+          "name": "MatchNotFound",
+          "code": 1
+        },
+        {
+          "name": "AlreadyFunded",
+          "code": 2
+        },
+        {
+          "name": "NotFunded",
+          "code": 3
+        },
+        {
+          "name": "Unauthorized",
+          "code": 4
+        },
+        {
+          "name": "InvalidState",
+          "code": 5
+        },
+        {
+          "name": "AlreadyExists",
+          "code": 6
+        },
+        {
+          "name": "AlreadyInitialized",
+          "code": 7
+        },
+        {
+          "name": "Overflow",
+          "code": 8
+        },
+        {
+          "name": "ContractPaused",
+          "code": 9
+        },
+        {
+          "name": "InvalidAmount",
+          "code": 10
+        },
+        {
+          "name": "InvalidGameId",
+          "code": 11
+        },
+        {
+          "name": "InvalidPlayers",
+          "code": 12
+        },
+        {
+          "name": "GameIdMismatch",
+          "code": 13
+        },
+        {
+          "name": "DuplicateGameId",
+          "code": 14
+        },
+        {
+          "name": "TransferFailed",
+          "code": 15
+        },
+        {
+          "name": "MatchCancelled",
+          "code": 16
+        },
+        {
+          "name": "MatchCompleted",
+          "code": 17
+        },
+        {
+          "name": "NotPaused",
+          "code": 18
+        },
+        {
+          "name": "InsufficientAllowance",
+          "code": 19
+        },
+        {
+          "name": "DisputeWindowActive",
+          "code": 20
+        },
+        {
+          "name": "MatchTimedOut",
+          "code": 21
+        },
+        {
+          "name": "InvalidToken",
+          "code": 22
+        },
+        {
+          "name": "InvalidAdmin",
+          "code": 23
+        },
+        {
+          "name": "StakeTooLow",
+          "code": 24
+        },
+        {
+          "name": "StakeTooHigh",
+          "code": 25
+        },
+        {
+          "name": "InsufficientReserve",
+          "code": 26
+        },
+        {
+          "name": "InvalidAddress",
+          "code": 27
+        },
+        {
+          "name": "TokenNotAllowlisted",
+          "code": 28
+        },
+        {
+          "name": "TokenAlreadyListed",
+          "code": 29
+        },
+        {
+          "name": "TokenNotListed",
+          "code": 30
+        },
+        {
+          "name": "CannotRemoveDefault",
+          "code": 31
+        },
+        {
+          "name": "InvalidStakeAmount",
+          "code": 32
+        },
+        {
+          "name": "ActiveMatchExists",
+          "code": 33
+        },
+        {
+          "name": "DisputeWindowExpired",
+          "code": 28
+        }
+      ],
+      "enums": [
+        {
+          "name": "MatchState",
+          "variants": [
+            "Pending",
+            "Active",
+            "PendingResult",
+            "Completed",
+            "Cancelled"
+          ]
+        },
+        {
+          "name": "Platform",
+          "variants": [
+            "Lichess",
+            "ChessDotCom"
+          ]
+        },
+        {
+          "name": "Winner",
+          "variants": [
+            "Player1",
+            "Player2",
+            "Draw"
+          ]
+        }
+      ]
+    },
+    "leaderboard": {
+      "methods": [
+        {
+          "name": "add_source",
+          "args": [
+            {
+              "name": "source",
+              "type": "Address"
+            },
+            {
+              "name": "caller",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "get_admin",
+          "args": [],
+          "returns": "Result<Address, Error>"
+        },
+        {
+          "name": "get_leaderboard",
+          "args": [
+            {
+              "name": "limit",
+              "type": "u32"
+            },
+            {
+              "name": "offset",
+              "type": "u32"
+            }
+          ],
+          "returns": "Result<Vec<LeaderboardEntry>, Error>"
+        },
+        {
+          "name": "get_stats",
+          "args": [
+            {
+              "name": "player",
+              "type": "Address"
+            }
+          ],
+          "returns": "PlayerStats"
+        },
+        {
+          "name": "initialize",
+          "args": [
+            {
+              "name": "admin",
+              "type": "Address"
+            },
+            {
+              "name": "source",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "is_paused",
+          "args": [],
+          "returns": "bool"
+        },
+        {
+          "name": "is_source",
+          "args": [
+            {
+              "name": "source",
+              "type": "Address"
+            }
+          ],
+          "returns": "bool"
+        },
+        {
+          "name": "record_result",
+          "args": [
+            {
+              "name": "player1",
+              "type": "Address"
+            },
+            {
+              "name": "player2",
+              "type": "Address"
+            },
+            {
+              "name": "outcome",
+              "type": "MatchOutcome"
+            },
+            {
+              "name": "payout",
+              "type": "i128"
+            },
+            {
+              "name": "token",
+              "type": "Address"
+            },
+            {
+              "name": "caller",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "remove_source",
+          "args": [
+            {
+              "name": "source",
+              "type": "Address"
+            },
+            {
+              "name": "caller",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        },
+        {
+          "name": "result_count",
+          "args": [],
+          "returns": "u32"
+        },
+        {
+          "name": "set_paused",
+          "args": [
+            {
+              "name": "paused",
+              "type": "bool"
+            },
+            {
+              "name": "caller",
+              "type": "Address"
+            }
+          ],
+          "returns": "Result<(), Error>"
+        }
+      ],
+      "errors": [
+        {
+          "name": "AlreadyInitialized",
+          "code": 1
+        },
+        {
+          "name": "Unauthorized",
+          "code": 2
+        },
+        {
+          "name": "NotInitialized",
+          "code": 3
+        },
+        {
+          "name": "InvalidResult",
+          "code": 4
+        },
+        {
+          "name": "InvalidRange",
+          "code": 5
+        },
+        {
+          "name": "ContractPaused",
+          "code": 6
+        }
+      ],
+      "enums": [
+        {
+          "name": "MatchOutcome",
+          "variants": [
+            "Player1Won",
+            "Player2Won",
+            "Draw"
+          ]
+        }
+      ]
+    }
+  }
+}
