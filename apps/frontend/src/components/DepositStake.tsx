@@ -153,8 +153,8 @@ async function deserializeMatch(
 
   // Fetch current ledger height from RPC
   const server = new rpc.Server(rpcUrl);
-  const ledgerResponse = await server.getLedgers().order('desc').limit(1).call();
-  const currentLedger = parseInt(ledgerResponse.records[0].sequence, 10);
+  const ledgerResponse = await server.getLatestLedger();
+  const currentLedger = ledgerResponse.sequence;
 
   return {
     stakeAmount: String(raw.stake_amount),
@@ -175,7 +175,7 @@ interface DepositStakeProps {
   contractId: string;
   networkPassphrase?: string;
   rpcUrl?: string;
-  onDeposit?: (matchId: string) => Promise<void>;
+  onDeposit?: (matchId: string) => Promise<{ hash: string; confirmed: true }>;
   /** Called when the user clicks 'Approve Token'. Should submit an approve/allowance tx. */
   onApprove?: (matchId: string) => Promise<void>;
   /** Optional: externally supply allowance status to skip the internal check. */
@@ -315,7 +315,11 @@ export function DepositStake({
     setTxHash(null);
 
     try {
-      await onDeposit?.(matchId);
+      const receipt = await onDeposit?.(matchId);
+      if (!receipt || receipt.confirmed !== true || !receipt.hash) {
+        throw new Error('No confirmed deposit transaction was returned.');
+      }
+      setTxHash(receipt.hash);
       setStatus('success');
     } catch (err) {
       setStatus('error');
@@ -347,7 +351,12 @@ export function DepositStake({
   // insufficient, or timeout has expired. The isPending guard is the critical one — without it the user
   // can click twice and submit duplicate transactions.
   const isDisabled =
-    isLoading || isPending || hasDeposited(matchDetails) || isCheckingAllowance || needsApproval || isExpired;
+    isLoading ||
+    isPending ||
+    hasDeposited(matchDetails) ||
+    isCheckingAllowance ||
+    needsApproval ||
+    isExpired;
 
   // Loading state
   if (isLoading && !matchDetails) {
@@ -421,7 +430,9 @@ export function DepositStake({
           {timeoutSecondsRemaining !== null && (
             <p className="timeout-countdown" data-testid="timeout-countdown">
               <span className="timeout-label">Time to deposit:</span>{' '}
-              <strong className={isExpired ? 'expired' : ''}>{formatDuration(timeoutSecondsRemaining)}</strong>
+              <strong className={isExpired ? 'expired' : ''}>
+                {formatDuration(timeoutSecondsRemaining)}
+              </strong>
             </p>
           )}
         </div>
@@ -466,12 +477,7 @@ export function DepositStake({
 
       {/* Match timeout expired */}
       {isExpired && (
-        <p
-          className="feedback error"
-          role="alert"
-          data-testid="timeout-expired"
-          aria-live="polite"
-        >
+        <p className="feedback error" role="alert" data-testid="timeout-expired" aria-live="polite">
           Match deposit window has expired. No further deposits are allowed.
         </p>
       )}
@@ -497,7 +503,7 @@ export function DepositStake({
 
       {/* Transaction status with aria-live announcements */}
       <TransactionStatus
-        status={status === 'loading' ? 'idle' : (status as any)}
+        status={status === 'loading' || status === 'approving' ? 'idle' : status}
         pendingMessage="Depositing stake…"
         successMessage="Deposit successful!"
         errorMessage={errorMsg}

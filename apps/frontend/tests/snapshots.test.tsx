@@ -152,12 +152,11 @@ describe('CreateMatch — snapshots', () => {
     expect(container).toMatchSnapshot();
   });
 
-  it('matches snapshot: USDC token selected', () => {
-    const { container, getByTestId } = render(
+  it('hides USDC when no deployment is configured for the network', () => {
+    const { queryByTestId } = render(
       <CreateMatch contractId="test-contract" player1Address={VALID_ADDRESS} />,
     );
-    getByTestId('toggle-usdc').click();
-    expect(container).toMatchSnapshot();
+    expect(queryByTestId('toggle-usdc')).not.toBeInTheDocument();
   });
 
   it('matches snapshot: Chess.com platform selected', () => {

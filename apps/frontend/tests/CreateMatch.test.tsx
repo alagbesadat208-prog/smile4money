@@ -14,10 +14,10 @@ describe('CreateMatch — rendering', () => {
     expect(screen.getByTestId('game-id-input')).toBeInTheDocument();
   });
 
-  it('renders token toggle with XLM and USDC options', () => {
+  it('offers only assets configured for the selected network', () => {
     render(<CreateMatch contractId="test-contract" player1Address={validAddress} />);
     expect(screen.getByTestId('toggle-xlm')).toBeInTheDocument();
-    expect(screen.getByTestId('toggle-usdc')).toBeInTheDocument();
+    expect(screen.queryByTestId('toggle-usdc')).not.toBeInTheDocument();
   });
 
   it('renders platform selector with Lichess and Chess.com options', () => {
@@ -29,7 +29,7 @@ describe('CreateMatch — rendering', () => {
   it('defaults to XLM token', () => {
     render(<CreateMatch contractId="test-contract" player1Address={validAddress} />);
     expect(screen.getByTestId('toggle-xlm')).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByTestId('toggle-usdc')).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.queryByTestId('toggle-usdc')).not.toBeInTheDocument();
   });
 
   it('defaults to Lichess platform', () => {
@@ -44,12 +44,22 @@ describe('CreateMatch — rendering', () => {
   });
 });
 
-describe('CreateMatch — token toggle', () => {
-  it('toggles between XLM and USDC', () => {
+describe('CreateMatch — token configuration', () => {
+  it('does not offer USDC when its network deployment is not configured', () => {
     render(<CreateMatch contractId="test-contract" player1Address={validAddress} />);
-    fireEvent.click(screen.getByTestId('toggle-usdc'));
-    expect(screen.getByTestId('toggle-usdc')).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByTestId('toggle-xlm')).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.queryByTestId('toggle-usdc')).not.toBeInTheDocument();
+  });
+
+  it('disables match creation when the selected network has no configured assets', () => {
+    render(
+      <CreateMatch
+        contractId="test-contract"
+        player1Address={validAddress}
+        networkPassphrase="unsupported-network"
+      />,
+    );
+    expect(screen.queryByTestId('toggle-xlm')).not.toBeInTheDocument();
+    expect(screen.getByTestId('submit-match-btn')).toBeDisabled();
   });
 });
 
