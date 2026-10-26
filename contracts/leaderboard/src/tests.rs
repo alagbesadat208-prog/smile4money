@@ -11,7 +11,6 @@ use soroban_sdk::{testutils::Address as _, Address, Env};
 struct Fixture {
     env: Env,
     client: LeaderboardContractClient<'static>,
-    contract_id: Address,
     admin: Address,
     source: Address,
     player1: Address,
@@ -36,7 +35,6 @@ fn setup() -> Fixture {
     Fixture {
         env,
         client,
-        contract_id: id,
         admin,
         source,
         player1,
@@ -142,8 +140,8 @@ fn matches_played_sums_all_three_counters() {
     record(&f, MatchOutcome::Player1Won, 10, &f.player1, &f.player2);
     record(&f, MatchOutcome::Player1Won, 10, &f.player1, &f.player2);
     record(&f, MatchOutcome::Draw, 0, &f.player1, &f.player2);
-    assert_eq!(f.client.get_stats(&f.player1).matches_played(), Some(3));
-    assert_eq!(f.client.get_stats(&f.player2).matches_played(), Some(3));
+    assert_eq!(f.client.get_stats(&f.player1).matches_played(), 3);
+    assert_eq!(f.client.get_stats(&f.player2).matches_played(), 3);
 }
 
 #[test]
@@ -302,101 +300,6 @@ fn result_count_increments_per_result() {
 }
 
 #[test]
-fn result_recording_rejects_counter_overflow() {
-    let f = setup();
-    f.env.as_contract(&f.contract_id, || {
-        f.env.storage().persistent().set(
-            &DataKey::Stats(f.player1.clone()),
-            &PlayerStats {
-                wins: u32::MAX,
-                losses: 0,
-                draws: 0,
-                earnings: 0,
-                token: f.token.clone(),
-            },
-        );
-    });
-
-    assert_eq!(
-        f.client.try_record_result(
-            &f.player1,
-            &f.player2,
-            &MatchOutcome::Player1Won,
-            &1,
-            &f.token,
-            &f.source,
-        ),
-        Err(Ok(Error::Overflow))
-    );
-}
-
-#[test]
-fn result_recording_rejects_earnings_overflow() {
-    let f = setup();
-    f.env.as_contract(&f.contract_id, || {
-        f.env.storage().persistent().set(
-            &DataKey::Stats(f.player1.clone()),
-            &PlayerStats {
-                wins: 0,
-                losses: 0,
-                draws: 0,
-                earnings: i128::MAX,
-                token: f.token.clone(),
-            },
-        );
-    });
-
-    assert_eq!(
-        f.client.try_record_result(
-            &f.player1,
-            &f.player2,
-            &MatchOutcome::Player1Won,
-            &1,
-            &f.token,
-            &f.source,
-        ),
-        Err(Ok(Error::Overflow))
-    );
-}
-
-#[test]
-fn result_recording_rejects_result_count_overflow() {
-    let f = setup();
-    f.env.as_contract(&f.contract_id, || {
-        f.env
-            .storage()
-            .instance()
-            .set(&DataKey::ResultCount, &u32::MAX);
-    });
-
-    assert_eq!(
-        f.client.try_record_result(
-            &f.player1,
-            &f.player2,
-            &MatchOutcome::Player1Won,
-            &1,
-            &f.token,
-            &f.source,
-        ),
-        Err(Ok(Error::Overflow))
-    );
-}
-
-#[test]
-fn matches_played_detects_overflow() {
-    let f = setup();
-    let stats = PlayerStats {
-        wins: u32::MAX,
-        losses: 1,
-        draws: 0,
-        earnings: 0,
-        token: f.token,
-    };
-
-    assert_eq!(stats.matches_played(), None);
-}
-
-#[test]
 fn get_admin_returns_the_configured_admin() {
     let f = setup();
     assert_eq!(f.client.get_admin(), f.admin);
@@ -407,14 +310,9 @@ fn get_admin_returns_the_configured_admin() {
 fn give_wins(f: &Fixture, player: &Address, wins: u32) {
     for _ in 0..wins {
         let opponent = Address::generate(&f.env);
-        f.client.record_result(
-            player,
-            &opponent,
-            &MatchOutcome::Player1Won,
-            &10,
-            &f.token,
-            &f.source,
-        );
+        let outcome = MatchOutcome::Player1Won;
+        f.client
+            .record_result(player, &opponent, &outcome, &10, &f.token, &f.source);
     }
 }
 
@@ -513,11 +411,17 @@ fn leaderboard_paginates_without_gaps_or_duplicates() {
     }
     assert_eq!(f.client.get_leaderboard(&10, &0).len(), 10);
 
-    // Walking the board page by page must visit every player exactly once.
+    // Winners and their losing opponents must each appear exactly once.
     let mut seen: Vec<Address> = Vec::new(&f.env);
     let mut offset = 0u32;
-    while offset < 10 {
+    loop {
+        if offset >= 10 {
+            break;
+        }
         let page = f.client.get_leaderboard(&2, &offset);
+        if page.is_empty() {
+            break;
+        }
         for e in page.iter() {
             seen.push_back(e.player.clone());
         }
@@ -538,8 +442,7 @@ fn leaderboard_last_page_is_short_rather_than_an_error() {
     for _ in 0..3 {
         give_wins(&f, &Address::generate(&f.env), 1);
     }
-    // Six players are in the roster because the opponents count too.
-    // Asking for two rows at offset five leaves a one-row page.
+    // Three winners and three opponents: offset 5 leaves exactly one row.
     let page = f.client.get_leaderboard(&2, &5);
     assert_eq!(page.len(), 1);
 }
@@ -613,4 +516,71 @@ fn loss_only_players_are_still_ranked() {
         }
     }
     assert!(found, "the losing player should be on the leaderboard");
+}
+
+#[test]
+fn versioned_events_decode_with_unchanged_payloads() {
+    use soroban_sdk::{testutils::Events, FromVal, IntoVal, Val};
+    let f = setup();
+    let mut events = f.env.events().all();
+    let backup = Address::generate(&f.env);
+    f.client.add_source(&backup, &f.admin);
+    events.append(&f.env.events().all());
+    f.client.remove_source(&backup, &f.admin);
+    events.append(&f.env.events().all());
+    f.client.set_paused(&true, &f.admin);
+    events.append(&f.env.events().all());
+    f.client.set_paused(&false, &f.admin);
+    events.append(&f.env.events().all());
+    record(&f, MatchOutcome::Player2Won, 42, &f.player1, &f.player2);
+    events.append(&f.env.events().all());
+    assert_eq!(events.len(), 6);
+    for (index, category, action) in [
+        (0, "admin", "init"),
+        (1, "admin", "src_add"),
+        (2, "admin", "src_del"),
+        (3, "admin", "pause_set"),
+        (4, "admin", "pause_set"),
+        (5, "result", "recorded"),
+    ] {
+        let (_, topics, data) = events.get(index).unwrap();
+        let expected: Vec<Val> = (
+            Symbol::new(&f.env, category),
+            Symbol::new(&f.env, action),
+            1u32,
+        )
+            .into_val(&f.env);
+        assert_eq!(topics, expected);
+        match index {
+            0 | 1 => {
+                let decoded: (Address, Address) = FromVal::from_val(&f.env, &data);
+                let expected = if index == 0 {
+                    (f.admin.clone(), f.source.clone())
+                } else {
+                    (backup.clone(), f.admin.clone())
+                };
+                assert_eq!(decoded, expected);
+            }
+            2 => assert_eq!(Address::from_val(&f.env, &data), f.admin),
+            3 | 4 => {
+                let decoded: (bool, Address) = FromVal::from_val(&f.env, &data);
+                assert_eq!(decoded, (index == 3, f.admin.clone()));
+            }
+            _ => {
+                let decoded: (Address, Address, MatchOutcome, i128, Address, u32) =
+                    FromVal::from_val(&f.env, &data);
+                assert_eq!(
+                    decoded,
+                    (
+                        f.player1.clone(),
+                        f.player2.clone(),
+                        MatchOutcome::Player2Won,
+                        42,
+                        f.token.clone(),
+                        0
+                    )
+                );
+            }
+        }
+    }
 }

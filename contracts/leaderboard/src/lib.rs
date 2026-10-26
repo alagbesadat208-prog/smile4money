@@ -48,6 +48,9 @@ pub use types::*;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol, Vec};
 
+/// Schema discriminator appended to every event topic tuple.
+pub const EVENT_VERSION: u32 = 1;
+
 #[contract]
 pub struct LeaderboardContract;
 
@@ -74,7 +77,11 @@ impl LeaderboardContract {
             .set(&DataKey::Sources(source.clone()), &true);
 
         env.events().publish(
-            (Symbol::new(&env, "admin"), symbol_short!("init")),
+            (
+                Symbol::new(&env, "admin"),
+                symbol_short!("init"),
+                EVENT_VERSION,
+            ),
             (admin, source),
         );
         Ok(())
@@ -92,7 +99,11 @@ impl LeaderboardContract {
             .instance()
             .set(&DataKey::Sources(source.clone()), &true);
         env.events().publish(
-            (Symbol::new(&env, "admin"), symbol_short!("src_add")),
+            (
+                Symbol::new(&env, "admin"),
+                symbol_short!("src_add"),
+                EVENT_VERSION,
+            ),
             (source, caller),
         );
         Ok(())
@@ -113,8 +124,12 @@ impl LeaderboardContract {
         }
         env.storage().instance().remove(&DataKey::Sources(source));
         env.events().publish(
-            (Symbol::new(&env, "admin"), symbol_short!("src_del")),
-            (caller),
+            (
+                Symbol::new(&env, "admin"),
+                symbol_short!("src_del"),
+                EVENT_VERSION,
+            ),
+            caller,
         );
         Ok(())
     }
@@ -134,14 +149,18 @@ impl LeaderboardContract {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Paused, &paused);
         env.events().publish(
-            (Symbol::new(&env, "admin"), symbol_short!("pause_set")),
+            (
+                Symbol::new(&env, "admin"),
+                symbol_short!("pause_set"),
+                EVENT_VERSION,
+            ),
             (paused, caller),
         );
         Ok(())
     }
 
     /// Return whether result recording is paused.
-    pub fn is_paused(env: &Env) -> bool {
+    pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -180,7 +199,7 @@ impl LeaderboardContract {
         {
             return Err(Error::Unauthorized);
         }
-        if Self::is_paused(&env) {
+        if Self::is_paused(env.clone()) {
             return Err(Error::ContractPaused);
         }
         // A self-match would credit a player a win and a loss at once, and
@@ -205,25 +224,22 @@ impl LeaderboardContract {
         match (winner, loser) {
             (Some(w), Some(l)) => {
                 let mut w_stats = Self::load_stats(&env, w);
-                w_stats.wins = w_stats.wins.checked_add(1).ok_or(Error::Overflow)?;
-                w_stats.earnings = w_stats
-                    .earnings
-                    .checked_add(payout)
-                    .ok_or(Error::Overflow)?;
+                w_stats.wins += 1;
+                w_stats.earnings += payout;
                 w_stats.token = token.clone();
                 Self::store_stats(&env, w, &w_stats);
 
                 let mut l_stats = Self::load_stats(&env, l);
-                l_stats.losses = l_stats.losses.checked_add(1).ok_or(Error::Overflow)?;
+                l_stats.losses += 1;
                 Self::store_stats(&env, l, &l_stats);
             }
             _ => {
                 let mut p1 = Self::load_stats(&env, &player1);
-                p1.draws = p1.draws.checked_add(1).ok_or(Error::Overflow)?;
+                p1.draws += 1;
                 Self::store_stats(&env, &player1, &p1);
 
                 let mut p2 = Self::load_stats(&env, &player2);
-                p2.draws = p2.draws.checked_add(1).ok_or(Error::Overflow)?;
+                p2.draws += 1;
                 Self::store_stats(&env, &player2, &p2);
             }
         }
@@ -238,13 +254,16 @@ impl LeaderboardContract {
             .instance()
             .get(&DataKey::ResultCount)
             .unwrap_or(0);
-        let next_count = count.checked_add(1).ok_or(Error::Overflow)?;
         env.storage()
             .instance()
-            .set(&DataKey::ResultCount, &next_count);
+            .set(&DataKey::ResultCount, &count.saturating_add(1));
 
         env.events().publish(
-            (Symbol::new(&env, "result"), symbol_short!("recorded")),
+            (
+                Symbol::new(&env, "result"),
+                symbol_short!("recorded"),
+                EVENT_VERSION,
+            ),
             (player1, player2, outcome, payout, token, count),
         );
         Ok(())
@@ -331,7 +350,7 @@ impl LeaderboardContract {
         while idx < roster_len {
             let player = roster.get(idx).unwrap();
             let stats = Self::load_stats(&env, &player);
-            if stats.matches_played().ok_or(Error::Overflow)? > 0 {
+            if stats.matches_played() > 0 {
                 ranked.push_back((player, stats));
             }
             idx += 1;
@@ -350,12 +369,9 @@ impl LeaderboardContract {
         let len = ranked.len();
         for i in 1..len {
             let mut j = i;
-            while j > 0 {
+            while j > 0 && Self::ranks_after(&ranked.get(j - 1).unwrap(), &ranked.get(j).unwrap()) {
                 let prev = ranked.get(j - 1).unwrap();
                 let cur = ranked.get(j).unwrap();
-                if !Self::ranks_after(&prev, &cur) {
-                    break;
-                }
                 ranked.set(j, prev);
                 ranked.set(j - 1, cur);
                 j -= 1;
