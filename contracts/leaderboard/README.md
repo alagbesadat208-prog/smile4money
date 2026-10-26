@@ -7,6 +7,7 @@ escrow's entire history off-chain.
 - [How results get in](#how-results-get-in)
 - [Identity and edge cases](#identity-and-edge-cases)
 - [Public functions](#public-functions)
+- [Asset-denominated rankings](#asset-denominated-rankings)
 - [Errors](#errors)
 - [Events](#events)
 - [Security notes](#security-notes)
@@ -77,10 +78,10 @@ draw and **nobody is credited** — the escrow returned each player's own stake,
 so no one was paid, and counting a refund as earnings would inflate the board
 for players who draw often.
 
-`earnings` is stored in the token's smallest unit, so the `token` address is
-recorded alongside it. Amounts in different tokens are **not** comparable
-numbers, and a caller that sums them without grouping by currency would be
-adding unlike units.
+`earnings` in the global player record is denominated in `token` and resets if
+that player later wins in a different token. The per-asset leaderboard keeps
+separate counters and earnings for each token. Amounts in different tokens are
+never converted or compared across asset rankings.
 
 Emits `("result", "recorded")`.
 
@@ -90,6 +91,8 @@ Emits `("result", "recorded")`.
 - `Unauthorized` — caller is not a registered source
 - `ContractPaused` — recording is paused
 - `InvalidResult` — `player1 == player2`, or `payout` is negative
+- `InvalidAsset` — `token` does not implement the token contract interface
+- `TooManyPlayers` — the index has reached `MAX_PLAYERS` (256)
 
 ---
 
@@ -103,8 +106,9 @@ Returns a page of the leaderboard. `limit` is capped at `MAX_PAGE_SIZE` (50), so
 a caller asking for more gets one full page rather than a response too large to
 return in a single transaction.
 
-**Ordering:** wins descending, then `earnings` descending, then address
-ascending.
+**Ordering:** wins descending, then address ascending. The global index is
+maintained on writes, and reads load stats only for the requested page. The
+index is capped at 256 distinct players.
 
 The address tie-break is **not cosmetic**. Without it two players with
 identical records have no defined relative order, and paging would show the
@@ -119,27 +123,19 @@ results" signal for a paginated read.
 
 ---
 
-### `get_ranked_page`
+### `get_asset_leaderboard`
 
 ```rust
-pub fn get_ranked_page(env: Env, limit: u32, offset: u32, snapshot: Option<u32>) -> Result<LeaderboardPage, Error>
+pub fn get_asset_leaderboard(
+    env: Env, asset: Address, limit: u32, offset: u32
+) -> Result<Vec<LeaderboardEntry>, Error>
 ```
 
-Use this view for multi-page reads. Start with `offset = 0, snapshot = None`;
-reuse the returned `snapshot` on every subsequent request, including backward
-navigation. It identifies the ranking revision using the successful result
-count, and the response includes both `snapshot` and `entries`.
-
-A result recorded between requests invalidates the token. The contract returns
-`SnapshotChanged` before returning any rows. Discard the page set and restart
-at offset zero with `None`; the frontend provides a restart button. This is
-optimistic consistent pagination, not retained historical snapshots. The legacy
-`get_leaderboard` remains available for individual reads but cannot guarantee
-consistency across requests. Both views use the same ordering and page limits.
-A missing token with a nonzero offset returns `InvalidRange`.
-
-The frontend requires a deployed contract exposing this new view. Deploy the
-contract update before releasing the frontend change.
+Returns a separate ranking for one asset, ordered by wins descending, earnings
+in that asset's smallest unit descending, then player address ascending. Equal
+records therefore have a stable address order. No exchange rate is applied;
+rankings from different assets must remain separate. Page size and offsets
+follow `get_leaderboard`.
 
 ---
 
@@ -151,6 +147,8 @@ pub fn get_stats(env: Env, player: Address) -> PlayerStats
 
 One player's record. Returns a **zeroed record** rather than an error for a
 player who has never played, so callers never have to handle an absent player.
+Its `earnings` and `token` fields describe only the current denomination; use
+`get_asset_leaderboard` for complete per-token history.
 
 ---
 
@@ -164,12 +162,6 @@ pub fn remove_source(env: Env, source: Address, caller: Address) -> Result<(), E
 Admin-only. `add_source` authorises an extra relayer, for example during a
 failover; `remove_source` revokes one. Results a source already recorded are
 untouched — revoking write permission is not a rollback.
-
-Granting an already-authorised source (including the initial source) returns
-`DuplicateSource` without changing storage or publishing an event. A revoked
-source may be granted again. Removing an unknown source returns `Unauthorized`.
-Both successful operations identify `(source, caller)` in event data; their
-`src_add` and `src_del` topics distinguish grant from revoke.
 
 ---
 
@@ -193,6 +185,10 @@ rebuilding state.
 | `result_count(env) -> u32` | Results recorded so far |
 | `get_admin(env) -> Result<Address, Error>` | The configured admin |
 
+Every successful mutating call bumps instance storage TTL. Player records and
+asset indexes use persistent storage and receive the same 518,400 ledger TTL
+when updated.
+
 ## Errors
 
 | Code | Variant | Meaning |
@@ -203,9 +199,8 @@ rebuilding state.
 | 4 | `InvalidResult` | Same player on both sides, or negative payout |
 | 5 | `InvalidRange` | `limit` is zero, or `offset` is past the end |
 | 6 | `ContractPaused` | Result recording is paused |
-| 7 | `DuplicateSource` | Reporter is already authorised |
-| 8 | `SnapshotChanged` | Ranking revision expired; restart pagination |
-| 9 | `ResultCountOverflow` | No further unique ranking revision can be allocated |
+| 7 | `InvalidAsset` | Asset is not a token contract |
+| 8 | `TooManyPlayers` | The 256 player index limit was reached |
 
 ## Events
 
@@ -213,13 +208,9 @@ rebuilding state.
 |---|---|
 | `("admin", "init")` | `(admin, source)` |
 | `("admin", "src_add")` | `(source, caller)` |
-| `("admin", "src_del")` | `(source, caller)` |
+| `("admin", "src_del")` | `(caller)` |
 | `("admin", "pause_set")` | `(paused, caller)` |
 | `("result", "recorded")` | `(player1, player2, outcome, payout, token, result_count)` |
-
-The revoke payload now matches the grant payload. Indexers consuming the old
-single-caller revoke payload must update their decoder when deploying this
-contract version. Duplicate grant attempts emit no successful policy event.
 
 ## Security notes
 
@@ -231,8 +222,6 @@ contract version. Duplicate grant attempts emit no successful policy event.
 - **No admin backdoor to rewrite history.** The admin can pause recording and
   manage sources; it cannot edit or delete a recorded result. Correcting a bad
   result means recording the truth and reconciling off-chain.
-- **Unbounded roster growth is the known scaling limit.** `get_leaderboard`
-  sorts on every read with insertion sort, which is `O(n^2)` in the roster size
-  — adequate while the board is small, and the first thing to revisit if it is
-  not. The alternative (a maintained on-chain sorted index) costs far more per
-  write, which is the wrong trade for a display contract.
+- **Population is bounded at 256.** Rank indexes are maintained during writes;
+  leaderboard reads fetch only the requested page's player records. Writes
+  reorder the bounded index, while reads do no roster-wide sorting.
