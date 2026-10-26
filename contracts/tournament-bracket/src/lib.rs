@@ -205,6 +205,7 @@ impl TournamentBracket {
         {
             return Err(Error::InvalidAdmin);
         }
+        admin.require_auth();
 
         // Prove `token` really is a SEP-41 contract before accepting entry fees
         // in it. Same validation the escrow contract performs.
