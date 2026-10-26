@@ -8,9 +8,9 @@ import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/c
 import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
 import ChessPlatformPoller from './services/game-poller.js';
 import { getCurrentLedger } from './services/stellar.js';
-import { createOutcomeDisagreementServiceFromEnv } from './services/outcome-disagreement-service.js';
-import { loadRetryConfig, submitWithIdempotence, type OracleSubmission } from './services/oracle-submit.js';
+import { retryDlqSubmission, type OracleSubmission } from './services/oracle-submit.js';
 import { createShutdownHandler } from './shutdown.js';
+import { resolveNetworkConfig } from './config/network.js';
 import logger from './logger.js';
 
 const port = Number(process.env.PORT || 4000);
@@ -42,39 +42,18 @@ async function checkResultExistsOnChain(matchId: number): Promise<boolean> {
 
 /**
  * Oracle retry handler for reprocessing DLQ entries.
- * 
- * Reconstructs the original OracleSubmission from the DLQ entry payload and attempts
- * to submit it to the blockchain with idempotence checks. If submission fails, the error
- * is thrown so the entry remains in the DLQ for the next retry cycle.
+ *
+ * One attempt per worker cycle via retryDlqSubmission (#122): a failure is
+ * re-thrown so the entry stays in the DLQ with its attempt count incremented;
+ * a result already on-chain resolves the entry without resubmitting.
  */
 async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
-  const submission = entry.payload as OracleSubmission;
-  
-  if (!submission || typeof submission !== 'object' || !('matchId' in submission)) {
-    throw new Error(`Invalid DLQ entry payload: expected OracleSubmission, got ${typeof entry.payload}`);
-  }
-
-  logger.debug(
-    { dlqId: entry.id, matchId: submission.matchId, gameId: submission.gameId },
-    'oracle_dlq: retrying oracle submission'
-  );
-
-  const config = loadRetryConfig();
-  
   try {
-    // Attempt submission with idempotence check
-    // If the result already exists on-chain, this returns cleanly
-    // If submission fails, the error is thrown and propagates to the caller
-    await submitWithIdempotence(
-      submission,
-      submitOracleResultToContract,
-      checkResultExistsOnChain,
-      config
-    );
+    await retryDlqSubmission(entry, submitOracleResultToContract, checkResultExistsOnChain);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.warn(
-      { dlqId: entry.id, matchId: submission.matchId, error: message },
+      { dlqId: entry.id, attempt: entry.attempts, error: message },
       'oracle_dlq: submission failed, entry will remain in DLQ'
     );
     throw err; // Re-throw so the entry stays in the DLQ
@@ -83,6 +62,14 @@ async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
 
 async function main() {
   try {
+    // #118 — fail fast on a network identity conflict (e.g. mainnet with the
+    // testnet RPC, or another network's contract id) before touching any store.
+    const network = resolveNetworkConfig(process.env);
+    logger.info(
+      { network: network.network, rpc_url_overridden: network.rpcUrlOverridden },
+      'stellar_network_resolved',
+    );
+
     // Initialize the persistent queue store
     await initializeQueue();
     logger.info('Queue store initialized');

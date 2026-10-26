@@ -23,6 +23,28 @@ jobs:
       - name: Scan tracked files for credential patterns
         run: ./scripts/check-secrets.sh
 
+  # ── Issue #124: pinned versions must match compatibility-matrix.json ─────
+  compat-matrix:
+    name: Compatibility Matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5
+        with:
+          python-version: "3.12"
+
+      - name: Pins match the supported row
+        run: python scripts/check_compat_matrix.py
+
+      - name: Run matrix tooling tests
+        run: python scripts/test_check_compat_matrix.py
+
+      # Issue #125: the release review validator gating Deploy to Mainnet.
+      - name: Run release review tooling tests
+        run: python scripts/test_check_release_review.py
+
   # ── Issue #894: Split into parallel escrow-tests and oracle-tests jobs ────
   escrow-tests:
     name: Escrow Tests

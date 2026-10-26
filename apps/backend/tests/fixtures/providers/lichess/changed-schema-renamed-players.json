@@ -1,0 +1,35 @@
+{
+  "id": "fxLi0010",
+  "rated": true,
+  "variant": "standard",
+  "speed": "blitz",
+  "perf": "blitz",
+  "createdAt": 1767225600000,
+  "lastMoveAt": 1767226200000,
+  "status": "resign",
+  "moves": "e4 e5 Qh5 Nc6 Bc4 Nf6 Qxf7#",
+  "clock": {
+    "initial": 300,
+    "increment": 0,
+    "totalTime": 300
+  },
+  "winner": "white",
+  "participants": {
+    "white": {
+      "user": {
+        "name": "fixture-white",
+        "id": "fixture-white"
+      },
+      "rating": 1500,
+      "ratingDiff": 0
+    },
+    "black": {
+      "user": {
+        "name": "fixture-black",
+        "id": "fixture-black"
+      },
+      "rating": 1500,
+      "ratingDiff": 0
+    }
+  }
+}

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Account, Networks, Operation, TransactionBuilder, nativeToScVal, rpc, scValToNative } from '@stellar/stellar-sdk';
+import { Account, Operation, TransactionBuilder, nativeToScVal, rpc, scValToNative } from '@stellar/stellar-sdk';
+import { APP_NETWORK_CONFIG } from '../config/network';
 
 /**
  * Leaderboard page â€” issue #124 / #1803.
@@ -23,7 +24,7 @@ import { Account, Networks, Operation, TransactionBuilder, nativeToScVal, rpc, s
  * exactly the tie-breaking the contract already does.
  */
 
-const DEFAULT_RPC_URL = 'https://soroban-testnet.stellar.org';
+const DEFAULT_RPC_URL = APP_NETWORK_CONFIG.rpcUrl;
 
 /** Must match `MAX_PAGE_SIZE` in `contracts/leaderboard/src/types.rs`. */
 const PAGE_SIZE = 25;
@@ -138,7 +139,7 @@ function formatAmount(value: string): string {
 export function Leaderboard({
   contractId,
   rpcUrl = DEFAULT_RPC_URL,
-  networkPassphrase = Networks.TESTNET,
+  networkPassphrase = APP_NETWORK_CONFIG.networkPassphrase,
   fetchPage,
 }: LeaderboardProps) {
   const [page, setPage] = useState(0);

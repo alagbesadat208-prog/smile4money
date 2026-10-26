@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import type { WalletStatus, Network } from '../types';
+import { configForWallet } from '../config/network';
 
 const EXPECTED_NETWORK =
   (typeof import.meta !== 'undefined' &&
@@ -25,12 +26,6 @@ declare global {
   }
 }
 
-const HORIZON_URLS: Record<string, string> = {
-  testnet: 'https://horizon-testnet.stellar.org',
-  mainnet: 'https://horizon.stellar.org',
-  unknown: 'https://horizon-testnet.stellar.org',
-};
-
 interface StellarWallet {
   status: WalletStatus;
   address: string | null;
@@ -55,7 +50,7 @@ async function fetchHorizonBalance(
   network: Network,
   signal?: AbortSignal,
 ): Promise<string> {
-  const horizon = HORIZON_URLS[network] || HORIZON_URLS.unknown;
+  const horizon = configForWallet(network).horizonUrl;
   const res = await fetch(`${horizon}/accounts/${address}`, { signal });
   if (!res.ok) throw new Error('Failed to fetch balance');
   const data = await res.json();

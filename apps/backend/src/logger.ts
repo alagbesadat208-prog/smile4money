@@ -1,3 +1,5 @@
+import { traceLogFields } from './tracing/trace-context.js';
+
 /**
  * Simple JSON logger for structured logging.
  * Outputs JSON to stdout for easy parsing and forwarding to logging services.
@@ -43,6 +45,9 @@ class Logger {
       level,
       service: 'smile4money-backend',
       message,
+      // #123 — trace_id/span_id of the active W3C trace context, so log
+      // lines from a request, its queued work and its retries join up.
+      ...traceLogFields(),
       ...context,
     };
     console.log(JSON.stringify(logEntry));

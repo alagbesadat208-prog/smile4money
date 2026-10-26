@@ -10,6 +10,8 @@
  *   console.log(env.pollingMaxRetries); // => 5
  */
 
+import { resolveNetworkConfig } from './network.js';
+
 /** Default maximum number of poll retries before a job is moved to the DLQ. */
 const DEFAULT_POLLING_MAX_RETRIES = 5;
 
@@ -81,12 +83,14 @@ export interface Env {
  * Throws on the first invalid value so the process fails fast at startup.
  */
 function loadEnv(): Env {
+  // Network, RPC endpoint and contract ids come from the canonical table in
+  // environments.toml; conflicting overrides throw here (#118).
+  const network = resolveNetworkConfig(process.env);
   return {
-    stellarNetwork: process.env.STELLAR_NETWORK ?? 'testnet',
-    stellarRpcUrl:
-      process.env.STELLAR_RPC_URL ?? 'https://soroban-testnet.stellar.org',
-    contractEscrow: process.env.CONTRACT_ESCROW ?? '',
-    contractOracle: process.env.CONTRACT_ORACLE ?? '',
+    stellarNetwork: network.network,
+    stellarRpcUrl: network.rpcUrl,
+    contractEscrow: network.contracts.escrow ?? '',
+    contractOracle: network.contracts.oracle ?? '',
     lichessApiToken: process.env.LICHESS_API_TOKEN ?? '',
     chessdotcomApiKey: process.env.CHESSDOTCOM_API_KEY ?? '',
     pollingMaxRetries: parsePollingMaxRetries(),

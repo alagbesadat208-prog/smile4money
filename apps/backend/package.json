@@ -9,7 +9,8 @@
     "test": "vitest run",
     "test:rpc-pool": "vitest run tests/stellar.test.ts",
     "format": "prettier --write \"src/**/*.{ts}\" \"tests/**/*.{ts}\"",
-    "format:check": "prettier --check \"src/**/*.{ts}\" \"tests/**/*.{ts}\""
+    "format:check": "prettier --check \"src/**/*.{ts}\" \"tests/**/*.{ts}\"",
+    "evidence": "tsx src/cli/dispute-evidence.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "16.0.1",

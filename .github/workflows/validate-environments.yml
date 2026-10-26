@@ -1,5 +1,8 @@
 name: Validate Environments
 
+# Also enforces environments.toml as the single source of truth for network
+# and contract metadata (#118): see scripts/network_config.py.
+
 on:
   push:
     branches: [master]
@@ -7,11 +10,25 @@ on:
       - environments.toml
       - scripts/validate_environments.py
       - scripts/test_validate_environments.py
+      - scripts/network_config.py
+      - scripts/test_network_config.py
+      - scripts/deploy_testnet.sh
+      - scripts/deploy_mainnet.sh
+      - .env.example
+      - apps/frontend/src/**
+      - apps/backend/src/**
   pull_request:
     paths:
       - environments.toml
       - scripts/validate_environments.py
       - scripts/test_validate_environments.py
+      - scripts/network_config.py
+      - scripts/test_network_config.py
+      - scripts/deploy_testnet.sh
+      - scripts/deploy_mainnet.sh
+      - .env.example
+      - apps/frontend/src/**
+      - apps/backend/src/**
 
 jobs:
   validate-environments:
@@ -30,3 +47,9 @@ jobs:
 
       - name: Run validation tests
         run: python scripts/test_validate_environments.py
+
+      - name: Every consumer matches environments.toml
+        run: python scripts/network_config.py --check
+
+      - name: Run network config tests
+        run: python scripts/test_network_config.py

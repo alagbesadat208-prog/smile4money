@@ -1,0 +1,192 @@
+# Scheduled compatibility build (issue #124).
+#
+# Tests the supported combination and every candidate in compatibility-matrix.json.
+# A candidate fails only on failures it introduces: each job runs the pinned
+# baseline first, then the candidate versions, and compares the two (see
+# scripts/check_compat_matrix.py --compare-*). Pre-existing failures on master
+# therefore neither hide nor invent a regression. The `current` row runs the
+# baseline only and records it in the job log; master's own health is gated by
+# ci.yml, not here.
+#
+# See docs/compatibility.md for the policy and the upgrade procedure.
+name: Compatibility
+
+on:
+  schedule:
+    - cron: '0 5 * * 1'  # Mondays 05:00 UTC
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: 'Run only this candidate id from compatibility-matrix.json (blank = all)'
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - compatibility-matrix.json
+      - scripts/check_compat_matrix.py
+      - .github/workflows/compatibility.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5
+        with:
+          python-version: "3.12"
+
+      - name: Matrix is in sync with the repo
+        run: |
+          python scripts/check_compat_matrix.py
+          python scripts/test_check_compat_matrix.py
+
+      - name: Build plan
+        id: plan
+        env:
+          ONLY: ${{ github.event.inputs.candidate }}
+        run: echo "matrix=$(python scripts/check_compat_matrix.py --plan "$ONLY")" >> "$GITHUB_OUTPUT"
+
+  contracts:
+    name: Contracts · ${{ matrix.entry.id }}
+    needs: plan
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ !matrix.entry.required }}
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve versions
+        run: python scripts/check_compat_matrix.py --resolve "${{ matrix.entry.id }}" >> "$GITHUB_ENV"
+
+      - name: Install pinned Rust (baseline)
+        run: |
+          rustup toolchain install "$(python -c 'import json;print(json.load(open("compatibility-matrix.json"))["supported"]["rust"])')" \
+            --profile minimal --target wasm32-unknown-unknown
+
+      - name: Baseline (pinned versions)
+        run: |
+          { cargo test --workspace --no-fail-fast 2>&1 || true
+            cargo build --workspace --release --target wasm32-unknown-unknown 2>&1 || true; } | tee baseline.log
+
+      - name: Install candidate Rust ${{ env.RUST }}
+        if: matrix.entry.id != 'current'
+        run: |
+          rustup toolchain install "$RUST" --profile minimal --target wasm32-unknown-unknown
+          rustup override set "$RUST"
+          rustc --version
+
+      - name: Switch soroban-sdk to ${{ env.SOROBAN_SDK }} (working copy only)
+        if: matrix.entry.id != 'current'
+        run: |
+          sed -i -E "s/^soroban-sdk = \{ version = \"[^\"]+\" \}/soroban-sdk = { version = \"=$SOROBAN_SDK\" }/" Cargo.toml
+          grep '^soroban-sdk' Cargo.toml
+          cargo update -p soroban-sdk
+
+      - name: Candidate (tests + WASM build)
+        if: matrix.entry.id != 'current'
+        run: |
+          { cargo test --workspace --no-fail-fast 2>&1 || true
+            cargo build --workspace --release --target wasm32-unknown-unknown 2>&1 || true; } | tee candidate.log
+
+      - name: Compare with baseline
+        if: matrix.entry.id != 'current'
+        run: python scripts/check_compat_matrix.py --compare-cargo baseline.log candidate.log
+
+  apps:
+    name: ${{ matrix.app }} · ${{ matrix.entry.id }}
+    needs: plan
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ !matrix.entry.required }}
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJSON(needs.plan.outputs.matrix) }}
+        app: [backend, frontend]
+    defaults:
+      run:
+        working-directory: apps/${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: 'npm'
+          cache-dependency-path: apps/${{ matrix.app }}/package-lock.json
+
+      - name: Resolve versions
+        working-directory: .
+        run: python scripts/check_compat_matrix.py --resolve "${{ matrix.entry.id }}" >> "$GITHUB_ENV"
+
+      - name: Install pinned dependencies
+        run: npm ci
+
+      - name: Baseline tests (pinned @stellar/stellar-sdk)
+        run: npx vitest run --reporter=json --outputFile="$RUNNER_TEMP/baseline.json" || true
+
+      - name: Install @stellar/stellar-sdk@${{ env.JS_STELLAR_SDK }} (not saved)
+        if: matrix.entry.id != 'current'
+        run: |
+          npm install --no-save "@stellar/stellar-sdk@$JS_STELLAR_SDK"
+          node -p "'resolved @stellar/stellar-sdk ' + require('@stellar/stellar-sdk/package.json').version"
+
+      - name: Candidate tests
+        if: matrix.entry.id != 'current'
+        run: npx vitest run --reporter=json --outputFile="$RUNNER_TEMP/candidate.json" || true
+
+      - name: Compare with baseline
+        if: matrix.entry.id != 'current'
+        working-directory: .
+        run: python scripts/check_compat_matrix.py --compare-vitest "$RUNNER_TEMP/baseline.json" "$RUNNER_TEMP/candidate.json"
+
+  summary:
+    name: Summary
+    needs: [plan, contracts, apps]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          CONTRACTS: ${{ needs.contracts.result }}
+          APPS: ${{ needs.apps.result }}
+        run: |
+          {
+            echo "## Compatibility build"
+            echo
+            echo "Combinations: \`$(echo "$MATRIX" | python3 -c 'import json,sys;print(", ".join(e["id"] for e in json.load(sys.stdin)))')\`"
+            echo
+            echo "| Job | Result |"
+            echo "|---|---|"
+            echo "| Contracts | $CONTRACTS |"
+            echo "| Backend / frontend | $APPS |"
+            echo
+            echo "Report-only candidates never fail the run; open each job for its NEW FAILURE lines."
+            echo "Policy: docs/compatibility.md"
+          } >> "$GITHUB_STEP_SUMMARY"

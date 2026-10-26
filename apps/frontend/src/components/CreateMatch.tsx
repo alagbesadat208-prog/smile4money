@@ -1,6 +1,9 @@
 import React, { useState, useCallback } from 'react';
-import { Address, Networks } from '@stellar/stellar-sdk';
+import { APP_NETWORK_CONFIG } from '../config/network';
+import { EligibilityNotice } from './EligibilityNotice';
+import { Address } from '@stellar/stellar-sdk';
 import { validateAndConvertXlmToStroops, countDecimalPlaces } from '../utils/xlm-precision';
+import { createTraceparent } from '../utils/trace-context';
 
 type Platform = 'lichess' | 'chesscom';
 type TokenType = 'xlm' | 'usdc';
@@ -48,11 +51,6 @@ interface FormErrors {
   platformUsername?: string;
   gameValidation?: string;
 }
-
-const NETWORK_PASSPHRASES: Record<string, string> = {
-  testnet: Networks.TESTNET,
-  mainnet: Networks.PUBLIC,
-};
 
 const TOKEN_ADDRESSES: Record<TokenType, string> = {
   xlm: 'native',
@@ -149,6 +147,8 @@ async function validateGameOnPlatform(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      // #123 — starts the trace the backend carries through oracle jobs.
+      traceparent: createTraceparent(),
     },
     body: JSON.stringify(payload),
   });
@@ -170,8 +170,8 @@ async function validateGameOnPlatform(
 export function CreateMatch({
   contractId,
   player1Address,
-  networkPassphrase = Networks.TESTNET,
-  rpcUrl = 'https://soroban-testnet.stellar.org',
+  networkPassphrase = APP_NETWORK_CONFIG.networkPassphrase,
+  rpcUrl = APP_NETWORK_CONFIG.rpcUrl,
   apiBaseUrl = '/',
   knownGameIds = [],
   onCreateMatch,
@@ -322,6 +322,7 @@ export function CreateMatch({
   return (
     <div className="create-match" data-testid="create-match">
       <h2 className="create-match-title">Create New Match</h2>
+      <EligibilityNotice />
 
       {matchId && (
         <div className="match-result" data-testid="match-success">

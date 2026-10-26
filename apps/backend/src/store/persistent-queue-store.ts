@@ -5,6 +5,8 @@
  * Implementations can use MongoDB, PostgreSQL, SQLite, or other data stores.
  */
 
+import type { PersistedTraceContext } from "../tracing/trace-context.js";
+
 export interface DlqEntry {
   id: string;
   payload: unknown;
@@ -12,6 +14,13 @@ export interface DlqEntry {
   attempts: number;
   createdAt: number;
   lastAttemptAt: number | null;
+  /**
+   * W3C trace context the entry was queued under (#123), resumed as a child
+   * span on every retry. Holds only `traceparent`/`tracestate`: random ids and
+   * a sanitised vendor list, never payload data or credentials. Absent on
+   * entries written before this field existed.
+   */
+  traceContext?: PersistedTraceContext;
 }
 
 export interface PersistentQueueStore {

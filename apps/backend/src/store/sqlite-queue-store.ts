@@ -115,6 +115,21 @@ export async function withRetry<T>(
   }
 }
 
+/**
+ * Reads the stored trace context (#123). A NULL (pre-migration row) or
+ * corrupted value yields no context, so the worker starts a fresh trace
+ * instead of failing the retry.
+ */
+function parseTraceContextColumn(raw: unknown): Pick<DlqEntry, "traceContext"> {
+  if (typeof raw !== "string" || raw === "") return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.traceparent === "string" ? { traceContext: parsed } : {};
+  } catch {
+    return {};
+  }
+}
+
 export class SQLiteQueueStore implements PersistentQueueStore {
   private db: sqlite3.Database | null = null;
   private dbPath: string;
@@ -140,56 +155,14 @@ export class SQLiteQueueStore implements PersistentQueueStore {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    return new Promise((resolve, reject) => {
+    // Open the database, then run every setup step through withRetry. The
+    // steps used to sit in a nested callback that returned before this
+    // retried path ran, so lock contention at startup was never retried and
+    // nothing after table creation (like the #123 column migration) ran.
+    await new Promise<void>((resolve, reject) => {
       this.db = new sqlite3.Database(this.dbPath, (err: Error | null) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-
-        // WAL allows readers to continue while writes are in progress.
-        this.db!.run(`PRAGMA journal_mode=WAL`, (err: Error | null) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-
-          // Create table if not exists
-          this.db!.run(
-            `
-          CREATE TABLE IF NOT EXISTS oracle_dlq (
-            id TEXT PRIMARY KEY NOT NULL,
-            payload TEXT NOT NULL,
-            failureReason TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            createdAt INTEGER NOT NULL,
-            lastAttemptAt INTEGER,
-            expireAt INTEGER NOT NULL,
-            CONSTRAINT expireAt_check CHECK (expireAt > 0)
-          )
-            `,
-            (err: Error | null) => {
-              if (err) {
-                reject(err);
-                return;
-              }
-
-              // Create index for efficient queries and TTL cleanup
-              this.db!.run(
-                `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_expireAt ON oracle_dlq(expireAt)`,
-                (err: Error | null) => {
-                  if (err) {
-                    reject(err);
-                    return;
-                  }
-
-                  this.initialized = true;
-                  resolve();
-                },
-              );
-            },
-          );
-        });
+        if (err) reject(err);
+        else resolve();
       });
     });
 
@@ -208,6 +181,7 @@ export class SQLiteQueueStore implements PersistentQueueStore {
           attempts INTEGER NOT NULL DEFAULT 0,
           createdAt INTEGER NOT NULL,
           lastAttemptAt INTEGER,
+          traceContext TEXT,
           expireAt INTEGER NOT NULL,
           CONSTRAINT expireAt_check CHECK (expireAt > 0)
         )
@@ -215,6 +189,18 @@ export class SQLiteQueueStore implements PersistentQueueStore {
         (err: Error | null) => cb(err),
       ),
     );
+
+    // #123 — databases created before trace propagation lack the column.
+    const columns = await withRetry<Array<{ name: string }>>("initialize:tableInfo", (cb) =>
+      this.getDb().all(`PRAGMA table_info(oracle_dlq)`, (err: Error | null, rows: Array<{ name: string }>) =>
+        cb(err, rows),
+      ),
+    );
+    if (!columns.some((c) => c.name === "traceContext")) {
+      await withRetry<void>("initialize:addTraceContextColumn", (cb) =>
+        this.getDb().run(`ALTER TABLE oracle_dlq ADD COLUMN traceContext TEXT`, (err: Error | null) => cb(err)),
+      );
+    }
 
     await withRetry<void>("initialize:createIndex", (cb) =>
       this.getDb().run(
@@ -231,8 +217,8 @@ export class SQLiteQueueStore implements PersistentQueueStore {
     await withRetry<void>("add", (cb) =>
       this.getDb().run(
         `
-        INSERT INTO oracle_dlq (id, payload, failureReason, attempts, createdAt, lastAttemptAt, expireAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO oracle_dlq (id, payload, failureReason, attempts, createdAt, lastAttemptAt, traceContext, expireAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           entry.id,
@@ -241,6 +227,7 @@ export class SQLiteQueueStore implements PersistentQueueStore {
           entry.attempts,
           entry.createdAt,
           entry.lastAttemptAt,
+          entry.traceContext ? JSON.stringify(entry.traceContext) : null,
           expireAt,
         ],
         (err: Error | null) => cb(err),
@@ -267,6 +254,7 @@ export class SQLiteQueueStore implements PersistentQueueStore {
       attempts: row.attempts,
       createdAt: row.createdAt,
       lastAttemptAt: row.lastAttemptAt || null,
+      ...parseTraceContextColumn(row.traceContext),
     }));
   }
 

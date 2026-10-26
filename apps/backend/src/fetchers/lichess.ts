@@ -1,5 +1,7 @@
 import axios from 'axios';
 import { RateLimitError } from '../errors/RateLimitError.js';
+import { ProviderSchemaError } from '../errors/ProviderSchemaError.js';
+import { traceHeaders } from '../tracing/trace-context.js';
 
 /** Maps to the on-chain MatchResult enum. */
 export type MatchResult = 'Player1Wins' | 'Player2Wins' | 'Draw';
@@ -63,6 +65,45 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+interface LichessGamePayload {
+  id: string;
+  status: string;
+  winner?: 'white' | 'black';
+  players: {
+    white: { user?: { name: string } };
+    black: { user?: { name: string } };
+  };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Checks the fields the result mapping depends on. Extra fields are ignored,
+ * so additive provider changes keep working; a missing or retyped field
+ * throws ProviderSchemaError instead of a TypeError or a wrong result.
+ */
+function parseLichessGame(data: unknown): LichessGamePayload {
+  if (!isObject(data)) throw new ProviderSchemaError('lichess', 'body is not an object');
+  if (typeof data.id !== 'string') throw new ProviderSchemaError('lichess', 'id is not a string');
+  if (typeof data.status !== 'string') throw new ProviderSchemaError('lichess', 'status is not a string');
+  if (data.winner !== undefined && data.winner !== 'white' && data.winner !== 'black') {
+    throw new ProviderSchemaError('lichess', `unknown winner ${JSON.stringify(data.winner)}`);
+  }
+  const players = data.players;
+  if (!isObject(players) || !isObject(players.white) || !isObject(players.black)) {
+    throw new ProviderSchemaError('lichess', 'players.white/players.black missing');
+  }
+  for (const side of ['white', 'black'] as const) {
+    const user = (players[side] as Record<string, unknown>).user;
+    if (user !== undefined && !(isObject(user) && typeof user.name === 'string')) {
+      throw new ProviderSchemaError('lichess', `players.${side}.user.name is not a string`);
+    }
+  }
+  return data as unknown as LichessGamePayload;
+}
+
 /**
  * Fetches a Lichess game result and returns a normalised GameResult.
  *
@@ -74,6 +115,8 @@ function sleep(ms: number): Promise<void> {
  *   rather than a permanent failure (see services/game-poller.ts).
  * - Returns result: null when the game is still in progress.
  * - Maps winner field to MatchResult (Player1 = white, Player2 = black).
+ * - Throws ProviderSchemaError when the body is missing a field the mapping
+ *   needs, so a provider schema change fails the poll instead of settling.
  */
 export async function fetchLichessResult(gameId: string): Promise<GameResult> {
   const token = process.env.LICHESS_API_TOKEN;
@@ -84,6 +127,8 @@ export async function fetchLichessResult(gameId: string): Promise<GameResult> {
       headers: {
         Accept: 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        // #123 — continue the active trace into the provider call.
+        ...traceHeaders(),
       },
       timeout: 10_000,
       validateStatus: (s) => s < 500,
@@ -108,15 +153,7 @@ export async function fetchLichessResult(gameId: string): Promise<GameResult> {
       throw new Error(`Lichess API error: ${response.status}`);
     }
 
-    const data = response.data as {
-      id: string;
-      status: string;
-      winner?: 'white' | 'black';
-      players: {
-        white: { user?: { name: string } };
-        black: { user?: { name: string } };
-      };
-    };
+    const data = parseLichessGame(response.data);
 
     const isTerminal = TERMINAL_STATUSES.has(data.status);
     let result: MatchResult | null = null;

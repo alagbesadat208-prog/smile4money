@@ -295,6 +295,13 @@ Mainnet deployment follows the same steps but with additional precautions becaus
 
 ### Pre-deploy review checklist
 
+Mainnet launches are gated by the measurable go/no-go thresholds in
+[runbook.md §8 Production Readiness Gates](runbook.md#8-production-readiness-gates). This checklist
+covers the mechanics; the gates decide whether the release is good enough.
+
+- [ ] A release review record exists at `docs/release-reviews/<tag>.md` with every gate G1–G8
+      recorded, and its decision is **GO** (`python scripts/check_release_review.py <record>`
+      passes). The `Deploy to Mainnet` workflow checks this and stops if it fails.
 - [ ] All CI jobs pass on the commit being deployed (test, clippy, fmt, build).
 - [ ] Security audit (`cargo audit`) reports zero unresolved advisories.
 - [ ] Contracts have been live on testnet for at least one full test cycle.
@@ -629,6 +636,29 @@ Add this check to your post-deploy checklist:
 - [ ] sha256sum of escrow.wasm matches CONTRACT_ESCROW wasm_hash on-chain
 - [ ] sha256sum of oracle.wasm matches CONTRACT_ORACLE wasm_hash on-chain
 ```
+
+## Eligibility Enforcement
+
+The policy is [security.md → Wagering Eligibility Policy](security.md#wagering-eligibility-policy).
+The contracts can't enforce it, so each deployment is responsible for these controls:
+
+| Responsibility | Owner | How |
+|---|---|---|
+| Complete the policy's legal review record | Operator + legal counsel | Every row in [the review record](security.md#review-record) filled in before mainnet |
+| Publish only reviewed jurisdictions | Operator | Build the frontend with `VITE_SUPPORTED_JURISDICTIONS` set to exactly the approved list. Leave it empty until the review is complete |
+| Show the right age | Operator | `VITE_MIN_WAGERING_AGE` = the highest minimum age among the supported jurisdictions (≥ 18) |
+| Link the terms | Operator | `VITE_ELIGIBILITY_TERMS_URL` (https) to the published eligibility terms |
+| Block unsupported locations | Operator / infrastructure | Geo-restrict the frontend and the backend API at the CDN or load balancer for every jurisdiction not on the list. The UI notice alone is not enforcement |
+| Verify age / identity where required | Operator | Integrate the KYC provider chosen in the review before deposits are possible in jurisdictions that require it |
+| Keep copy honest | Frontend maintainers | Don't add wording that implies universal availability. `EligibilityNotice.test.tsx` fails CI if common phrasings appear |
+| Respond to an eligibility breach | On-call + operator | Treat a confirmed underage or unsupported-jurisdiction wager as an incident (runbook). Pause new matches if the breach is systemic |
+
+Before a mainnet frontend build, confirm:
+
+- [ ] The review record in `docs/security.md` is complete, with dates and reviewers.
+- [ ] `VITE_SUPPORTED_JURISDICTIONS`, `VITE_MIN_WAGERING_AGE` and `VITE_ELIGIBILITY_TERMS_URL` are set for this deployment.
+- [ ] Geo-restriction rules for unsupported jurisdictions are active at the edge and have been tested.
+- [ ] The eligibility notice renders on the home page, match creation and stake deposit with the production values.
 
 ## Backend Service Deployment
 

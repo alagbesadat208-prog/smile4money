@@ -14,6 +14,7 @@ interface DlqDocument extends mongoose.Document {
   attempts: number;
   createdAt: number;
   lastAttemptAt: number | null;
+  traceContext?: DlqEntry['traceContext'];
   expireAt: Date;
 }
 
@@ -25,6 +26,8 @@ const dlqSchema = new mongoose.Schema<DlqDocument>(
     attempts: { type: Number, required: true, default: 0 },
     createdAt: { type: Number, required: true },
     lastAttemptAt: { type: Number, required: false, default: null },
+    // W3C trace context the entry was queued under (#123).
+    traceContext: { type: mongoose.Schema.Types.Mixed, required: false },
     // TTL index: auto-delete entries older than 30 days
     expireAt: {
       type: Date,
@@ -64,6 +67,7 @@ export class MongoDBQueueStore implements PersistentQueueStore {
       attempts: doc.attempts,
       createdAt: doc.createdAt,
       lastAttemptAt: doc.lastAttemptAt,
+      ...(doc.traceContext ? { traceContext: doc.traceContext } : {}),
     }));
   }
 

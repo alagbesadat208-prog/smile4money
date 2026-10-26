@@ -2,6 +2,7 @@ import axios, { type AxiosInstance } from "axios";
 import http from "node:http";
 import https from "node:https";
 import { RpcTimeoutError } from "../errors/RpcTimeoutError.js";
+import { traceHeaders } from "../tracing/trace-context.js";
 
 const DEFAULT_RPC_POOL_SIZE = 10;
 const DEFAULT_RPC_KEEP_ALIVE_TIMEOUT_MS = 5_000;
@@ -46,6 +47,22 @@ function getRpcClientOptions(): Required<StellarRpcClientOptions> {
   };
 }
 
+/**
+ * Adds the active W3C trace context (#123) to every RPC request, so oracle
+ * submissions and ledger reads made from a DLQ retry or polling job show up
+ * in the same trace as the request that queued them.
+ */
+function withTraceHeaders(client: AxiosInstance): AxiosInstance {
+  client.interceptors?.request.use((config) => {
+    const headers = traceHeaders();
+    for (const [name, value] of Object.entries(headers)) {
+      config.headers?.set?.(name, value);
+    }
+    return config;
+  });
+  return client;
+}
+
 export function createStellarRpcClient(
   options: StellarRpcClientOptions = getRpcClientOptions(),
 ): AxiosInstance {
@@ -54,7 +71,7 @@ export function createStellarRpcClient(
     options.keepAliveTimeoutMs ?? DEFAULT_RPC_KEEP_ALIVE_TIMEOUT_MS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
 
-  return axios.create({
+  return withTraceHeaders(axios.create({
     timeout: timeoutMs,
     httpAgent: new http.Agent({
       keepAlive: true,
@@ -66,7 +83,7 @@ export function createStellarRpcClient(
       maxSockets: poolSize,
       keepAliveMsecs: keepAliveTimeoutMs,
     }),
-  });
+  }));
 }
 
 const resolvedRpcClientOptions = getRpcClientOptions();

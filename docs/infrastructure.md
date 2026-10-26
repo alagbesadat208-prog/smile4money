@@ -32,6 +32,34 @@ Environments are defined in `environments.toml`. Four environments are recognize
 | `futurenet` | Preview of upcoming Stellar features | `https://rpc-futurenet.stellar.org` |
 | `mainnet` | Production | `https://soroban-mainnet.stellar.org` |
 
+### Single source of truth for network and contract metadata
+
+`environments.toml` is the only place a network's identity is defined: its name, passphrase,
+Soroban RPC and Horizon endpoints, friendbot, and deployed contract ids (`[<env>.contracts]`).
+Every other consumer is generated from it or checked against it by `scripts/network_config.py`.
+The **Validate Environments** workflow runs `--check` on every change to a consumer.
+
+| Consumer | How it stays in sync |
+|---|---|
+| `apps/frontend/src/config/networks.generated.ts` | Generated (`python scripts/network_config.py --write`). Components read it through `src/config/network.ts` (`APP_NETWORK_CONFIG`, `configForWallet`) |
+| `apps/backend/src/config/networks.generated.ts` | Generated. `src/config/network.ts` resolves `STELLAR_NETWORK` against it and `server.ts` calls it at startup |
+| `.env.example` | Checked: `STELLAR_NETWORK` / `VITE_STELLAR_NETWORK` must exist and agree, each `*_RPC_URL` must be that network's endpoint, and non-placeholder `CONTRACT_*` values must match the table |
+| `scripts/deploy_testnet.sh`, `scripts/deploy_mainnet.sh` | Checked: `RPC_URL` and `NETWORK_PASSPHRASE` must match the table |
+| Any other file in `apps/*/src` | Checked: hard-coding an RPC/Horizon URL or passphrase, or using `Networks.TESTNET`/`PUBLIC`, fails |
+
+Conflicting identities are rejected in two places:
+
+- **In the table itself.** A passphrase can't be listed under the wrong network name, and a local
+  network can't claim a public passphrase. No two environments may share an endpoint or a
+  contract id, and an RPC URL can't name another network.
+- **At backend startup.** For example, `STELLAR_NETWORK=mainnet` with the testnet RPC URL, a
+  passphrase from another network, or another network's contract id all fail.
+
+An operator can still point `STELLAR_RPC_URL` at a private node for the *same* network.
+
+To deploy a contract or add a network, edit `environments.toml`, run
+`python scripts/network_config.py --write`, and commit the regenerated files with it.
+
 ### Environment promotion path
 
 ```
@@ -173,9 +201,15 @@ All secrets are managed through GitHub Actions Secrets. No secret values are eve
 
 ## 7. Toolchain and Dependency Pinning
 
+Which **combinations** of protocol, SDK and wallet are supported, and how upgrades are tested
+ahead of time, is defined in [compatibility.md](compatibility.md). The CI **Compatibility Matrix**
+job fails if any pin below drifts from it.
+
 | Tool | Pinned version | Location |
 |------|---------------|----------|
-| Rust | 1.81.0 | `rust-toolchain.toml`, all workflow files |
+| Rust | 1.88.0 | `rust-toolchain.toml`, all workflow files |
+| soroban-sdk | 22.0.11 | `Cargo.toml` `[workspace.dependencies]` |
+| @stellar/stellar-sdk | 16.0.1 | `apps/backend/package.json`, `apps/frontend/package.json` |
 | WASM target | `wasm32-unknown-unknown` | `rust-toolchain.toml` |
 | Stellar CLI | v22.0.1 | `deploy.yml` install step |
 | `cargo-audit` | 0.21.0 | `audit.yml` install step |
@@ -197,6 +231,44 @@ No monitoring or alerting is currently configured. This is acceptable for testne
 - **Contract event indexing:** Set up a Stellar Horizon or custom event listener to index `match.created`, `match.completed`, `match.cancelled`, and `oracle.result` events. These events are already emitted by the contracts.
 - **Oracle health check:** The Oracle service should expose a `/health` endpoint. A simple uptime monitor (e.g., GitHub Actions scheduled ping, or an external service) should alert if the Oracle goes down.
 - **Deployment verification:** After each deploy, run a smoke test that calls `get_match` on a known match ID (or creates a test match) to confirm the deployed contract is responsive.
+
+### 8.1 Trace context propagation
+
+The backend follows [W3C Trace Context](https://www.w3.org/TR/trace-context/) so one trace id
+follows a match from the HTTP request that started it, through durable queue work, to the
+provider and Stellar RPC calls that work makes, including retries hours later and after a
+restart.
+
+| Hop | How the trace continues | Code |
+|-----|-------------------------|------|
+| Browser → API | The frontend sends a fresh `traceparent` on backend calls (never to Horizon or other third parties) | `apps/frontend/src/utils/trace-context.ts` |
+| API request | `traceContext()` middleware continues a valid incoming `traceparent` (or starts a trace) and echoes the server span in the `traceparent` response header | `apps/backend/src/middleware/trace-context.ts` |
+| Logs | Every structured log line inside a context carries `trace_id`, `span_id` and `parent_span_id` | `apps/backend/src/logger.ts`, `apps/backend/src/queue.ts` |
+| Polling job | `PollingJobStore.createJob` stores the creating request's context; each poll runs as a child span of it | `apps/backend/src/services/polling.ts` |
+| Oracle DLQ | `writeToDlq` stores `{ traceparent, tracestate }` with the entry (SQLite column `traceContext`, Mongo field, in-memory). Each retry resumes it as a new child span under the original trace id | `apps/backend/src/queue.ts`, `apps/backend/src/store/*-queue-store.ts` |
+| Provider calls | Lichess and Chess.com requests send `traceparent`/`tracestate` | `apps/backend/src/fetchers/*.ts` |
+| Stellar RPC | An axios interceptor on the shared RPC client adds the headers | `apps/backend/src/services/stellar.ts` |
+
+**Finding a trace.** Take the `traceparent` from the API response (or the `trace_id` on any log line), then
+filter logs on `trace_id`. DLQ retries keep the trace id and show as sibling spans with the same
+`parent_span_id`.
+
+**Older entries.** DLQ rows written before this existed have no stored context (the SQLite column
+is added on startup). They, and any row whose stored value is corrupt, get a fresh trace on retry
+rather than failing.
+
+**What a trace may contain.** Random trace and span ids, the sampling flag, and a sanitised
+`tracestate`. Nothing else: no request bodies, wallet addresses, Stellar secret keys, JWTs or
+provider tokens. `tracestate` is the only client-controlled field, so `sanitizeTraceState` drops
+any member that is malformed, has a credential-like key (`token`, `secret`, `auth`, `apikey`, …), or
+holds a Stellar secret seed, a JWT or a Lichess token, and enforces the spec's 32-member and
+512-character limits. `tests/tracing/trace-context.test.ts` sends a hostile `tracestate` and asserts
+that none of those values reach the stored entry, the logs or outbound headers. The provider API
+token is only ever sent in `Authorization`.
+
+**Exporting spans.** This is propagation only; nothing is exported yet. An OpenTelemetry collector
+that reads `traceparent` (or a log pipeline grouping on `trace_id`) can stitch the hops together.
+Adding an exporter later needs no change to what is persisted.
 
 ---
 
@@ -256,3 +328,5 @@ These items are not yet implemented and represent the next infrastructure work t
 | `environments.toml` | Network RPC URLs and passphrases |
 | `.env.example` | Template for environment variables |
 | `rust-toolchain.toml` | Pinned Rust toolchain |
+| `compatibility-matrix.json` | Supported and candidate version combinations ([compatibility.md](compatibility.md)) |
+| `.github/workflows/compatibility.yml` | Weekly/on-demand compatibility build of every combination |

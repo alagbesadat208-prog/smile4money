@@ -4,6 +4,7 @@ import { History } from './History';
 import { useTransactions } from '../hooks/useTransactions';
 import { useThemeContext } from '../providers/ThemeProvider';
 import { useWalletContext } from '../providers/WalletProvider';
+import { EligibilityNotice } from '../components/EligibilityNotice';
 
 /**
  * Home screen: header (network badge + theme toggle) plus the Claim/Burn and
@@ -27,6 +28,9 @@ export function Home() {
         >
           {theme === 'dark' ? '☀️ Light' : '🌙 Dark'}
         </button>
+      </div>
+      <div className="mx-auto max-w-2xl">
+        <EligibilityNotice />
       </div>
       <div className="grid gap-6 lg:grid-cols-[1fr_420px]">
         <div>

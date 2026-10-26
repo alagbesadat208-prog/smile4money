@@ -16,6 +16,14 @@
 import { getCircuitBreaker, CircuitState } from "./services/circuit-breaker.js";
 import { InMemoryQueueStore } from "./store/in-memory-queue-store.js";
 import { SQLiteQueueStore } from "./store/sqlite-queue-store.js";
+import {
+  currentTraceContext,
+  newTraceContext,
+  persistTraceContext,
+  resumeTraceContext,
+  runWithTraceContext,
+  traceLogFields,
+} from "./tracing/trace-context.js";
 import type {
   DlqEntry,
   PersistentQueueStore,
@@ -24,13 +32,35 @@ import type {
 export type { DlqEntry };
 
 // Simple structured logger (avoids circular dependency on logger.ts)
+// Carries the active trace ids like logger.ts does (#123).
 const logger = {
   info: (context: object, message: string) =>
-    console.log(JSON.stringify({ level: "info", message, ...context })),
+    console.log(
+      JSON.stringify({
+        level: "info",
+        message,
+        ...traceLogFields(),
+        ...context,
+      }),
+    ),
   warn: (context: object, message: string) =>
-    console.warn(JSON.stringify({ level: "warn", message, ...context })),
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        message,
+        ...traceLogFields(),
+        ...context,
+      }),
+    ),
   error: (context: object, message: string) =>
-    console.error(JSON.stringify({ level: "error", message, ...context })),
+    console.error(
+      JSON.stringify({
+        level: "error",
+        message,
+        ...traceLogFields(),
+        ...context,
+      }),
+    ),
 };
 
 let queueStore: PersistentQueueStore | null = null;
@@ -117,7 +147,13 @@ function getQueueStore(): PersistentQueueStore {
   return queueStore;
 }
 
-/** Write a failed submission to the DLQ. */
+/**
+ * Write a failed submission to the DLQ.
+ *
+ * The active W3C trace context (#123) is stored with the entry so the retry
+ * worker can resume the same trace, even after a restart. Work queued
+ * outside any trace starts one here, so every entry is traceable.
+ */
 export async function writeToDlq(
   payload: unknown,
   failureReason: string,
@@ -130,6 +166,9 @@ export async function writeToDlq(
     attempts: 0,
     createdAt: Date.now(),
     lastAttemptAt: null,
+    traceContext: persistTraceContext(
+      currentTraceContext() ?? newTraceContext(),
+    ),
   };
 
   await getQueueStore().add(entry);
@@ -213,57 +252,69 @@ export function startRetryWorker(
 
     try {
       for (const entry of entries) {
-        // Record the attempt before calling the handler
-        entry.attempts += 1;
-        entry.lastAttemptAt = Date.now();
-        await updateDlqEntry(entry.id, {
-          attempts: entry.attempts,
-          lastAttemptAt: entry.lastAttemptAt,
-        });
-
-        try {
-          await handler(entry);
-          await removeDlqEntry(entry.id);
-          breaker.recordSuccess();
-          logger.info({ dlqId: entry.id }, "oracle_dlq: entry resolved");
-        } catch (err) {
-          const isRpcError =
-            String(err).includes("RPC") || String(err).includes("Network");
-
-          if (isRpcError) {
-            const circuitOpened = breaker.recordFailure();
-            if (circuitOpened) {
-              logger.error(
-                {
-                  dlqId: entry.id,
-                  attempt: entry.attempts,
-                  failureCount: breaker.getFailureCount(),
-                  cooldown: breaker.getRemainingCooldown(),
-                },
-                "circuit_breaker: RPC circuit opened, pausing job processing",
-              );
-              // Stop processing remaining entries this cycle
-              break;
-            }
-          }
-
-          logger.warn(
-            {
-              dlqId: entry.id,
-              attempt: entry.attempts,
-              isRpcError,
-              err: String(err).substring(0, 100),
-            },
-            "oracle_dlq: retry failed",
-          );
-        }
-
-        await emitDlqDepth();
+        // Each attempt is its own span under the trace the entry was queued
+        // in (#123): its logs and outbound calls carry that trace id.
+        const circuitOpened = await runWithTraceContext(
+          resumeTraceContext(entry.traceContext),
+          () => processEntry(entry),
+        );
+        // Stop processing remaining entries this cycle
+        if (circuitOpened) break;
       }
     } catch (err) {
       logger.error({ err: String(err) }, "oracle_dlq: retry worker error");
     }
   }, intervalMs);
+
+  /** Retry one entry. Returns true when this failure opened the circuit. */
+  async function processEntry(entry: DlqEntry): Promise<boolean> {
+    // Record the attempt before calling the handler
+    entry.attempts += 1;
+    entry.lastAttemptAt = Date.now();
+    await updateDlqEntry(entry.id, {
+      attempts: entry.attempts,
+      lastAttemptAt: entry.lastAttemptAt,
+    });
+
+    try {
+      await handler(entry);
+      await removeDlqEntry(entry.id);
+      breaker.recordSuccess();
+      logger.info({ dlqId: entry.id }, "oracle_dlq: entry resolved");
+    } catch (err) {
+      const isRpcError =
+        String(err).includes("RPC") || String(err).includes("Network");
+
+      if (isRpcError) {
+        const circuitOpened = breaker.recordFailure();
+        if (circuitOpened) {
+          logger.error(
+            {
+              dlqId: entry.id,
+              attempt: entry.attempts,
+              failureCount: breaker.getFailureCount(),
+              cooldown: breaker.getRemainingCooldown(),
+            },
+            "circuit_breaker: RPC circuit opened, pausing job processing",
+          );
+          return true;
+        }
+      }
+
+      logger.warn(
+        {
+          dlqId: entry.id,
+          attempt: entry.attempts,
+          isRpcError,
+          err: String(err).substring(0, 100),
+        },
+        "oracle_dlq: retry failed",
+      );
+    }
+
+    await emitDlqDepth();
+    return false;
+  }
 
   return () => {
     clearInterval(timer);

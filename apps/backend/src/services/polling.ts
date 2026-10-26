@@ -15,6 +15,14 @@
  */
 
 import logger from '../logger.js';
+import {
+  currentTraceContext,
+  newTraceContext,
+  persistTraceContext,
+  resumeTraceContext,
+  runWithTraceContext,
+  type PersistedTraceContext,
+} from '../tracing/trace-context.js';
 import type { MatchResult, GameResult } from '../fetchers/lichess.js';
 
 /** Used when POLLING_INTERVAL_MS is unset. */
@@ -77,6 +85,11 @@ export interface PollJob {
    * `PollingConfig.defaultTimeoutLedgers` when not set.
    */
   timeoutLedgers?: number;
+  /**
+   * W3C trace context of the request that created the job (#123). Each poll
+   * runs as a child span of it, and a job moved to the DLQ carries it on.
+   */
+  traceContext?: PersistedTraceContext;
 }
 
 export interface PollJobStatus {
@@ -199,6 +212,7 @@ export class PollingJobStore {
       lastPolledAt: null,
       createdAtLedger,
       timeoutLedgers,
+      traceContext: persistTraceContext(currentTraceContext() ?? newTraceContext()),
     };
 
     this.jobs.set(id, job);
@@ -435,7 +449,8 @@ export class PollingWorker {
 
     for (const job of jobs) {
       try {
-        await this.pollJob(job);
+        // Each poll is a span in the trace that created the job (#123).
+        await runWithTraceContext(resumeTraceContext(job.traceContext), () => this.pollJob(job));
       } catch (err) {
         logger.error(
           {

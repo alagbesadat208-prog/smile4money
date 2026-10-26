@@ -1,19 +1,63 @@
+# Single source of truth for network and contract metadata (issue #118).
+#
+# Every consumer is generated from or validated against this file by
+# scripts/network_config.py; edit it here, then run
+#   python scripts/network_config.py --write
+# CI (`python scripts/network_config.py --check`) fails when a consumer disagrees:
+#   - apps/frontend/src/config/networks.generated.ts and
+#     apps/backend/src/config/networks.generated.ts (generated)
+#   - .env.example (STELLAR_NETWORK / STELLAR_RPC_URL / VITE_* / CONTRACT_*)
+#   - scripts/deploy_testnet.sh and scripts/deploy_mainnet.sh
+#   - hard-coded RPC / Horizon URLs or passphrases anywhere in apps/*/src
+#
+# Keys per environment:
+#   network             canonical name (must equal the table name)
+#   network_passphrase  the network's identity; must be the well-known value for
+#                       testnet / mainnet / futurenet
+#   rpc_url             Soroban RPC endpoint
+#   horizon_url         Horizon endpoint
+#   friendbot_url       optional, test networks only
+#   [<env>.contracts]   deployed contract ids (C… StrKeys); empty until deployed
+
 [testnet]
 rpc_url = "https://soroban-testnet.stellar.org"
+horizon_url = "https://horizon-testnet.stellar.org"
+friendbot_url = "https://friendbot.stellar.org"
 network_passphrase = "Test SDF Network ; September 2015"
 network = "testnet"
 
+[testnet.contracts]
+escrow = ""
+oracle = ""
+
 [mainnet]
 rpc_url = "https://soroban-mainnet.stellar.org"
+horizon_url = "https://horizon.stellar.org"
 network_passphrase = "Public Global Stellar Network ; September 2015"
 network = "mainnet"
 
+[mainnet.contracts]
+escrow = ""
+oracle = ""
+
 [futurenet]
 rpc_url = "https://rpc-futurenet.stellar.org"
+horizon_url = "https://horizon-futurenet.stellar.org"
+friendbot_url = "https://friendbot-futurenet.stellar.org"
 network_passphrase = "Test SDF Future Network ; October 2022"
 network = "futurenet"
 
+[futurenet.contracts]
+escrow = ""
+oracle = ""
+
 [standalone]
 rpc_url = "http://localhost:8000/soroban/rpc"
+horizon_url = "http://localhost:8000"
+friendbot_url = "http://localhost:8000/friendbot"
 network_passphrase = "Standalone Network ; February 2017"
 network = "standalone"
+
+[standalone.contracts]
+escrow = ""
+oracle = ""
