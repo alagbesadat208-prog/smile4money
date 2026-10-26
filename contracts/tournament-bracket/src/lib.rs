@@ -352,6 +352,9 @@ impl TournamentBracket {
         player.require_auth();
 
         let mut t = Self::load_tournament(&env, tournament_id)?;
+        if env.ledger().sequence() >= t.created_ledger + TIMEOUT_LEDGERS {
+    return Err(Error::TournamentFinished);
+}
         if t.state == TournamentState::Completed || t.state == TournamentState::Cancelled {
             return Err(Error::TournamentFinished);
         }
