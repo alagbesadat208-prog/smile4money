@@ -8,12 +8,15 @@
 
 import { checkStellarRpc } from './stellar.js';
 import { getAllLimiterStats } from './bottleneck-limiters.js';
+import { getSettlementAgeMonitor, type SettlementSnapshot } from './settlement-age-monitor.js';
 
 export interface HealthCheckOptions {
   /** When true, performs a live connectivity check against the Stellar RPC. */
   deepCheck?: boolean;
   /** When true, appends rate-limiter statistics to the response payload. */
   includeLimiters?: boolean;
+  /** When true, appends settlement age percentiles and active alerts to the response payload. */
+  includeSettlement?: boolean;
   /** Uptime in seconds (passed in from the route so the timer origin is preserved). */
   uptimeSeconds: number;
   /** Application version string. */
@@ -28,6 +31,7 @@ export interface HealthOk {
     version: string;
     dependencies?: { stellar_rpc: 'ok' };
     limiters?: ReturnType<typeof getAllLimiterStats>;
+    settlement?: SettlementSnapshot | null;
   };
 }
 
@@ -55,7 +59,7 @@ export type HealthCheckResult = HealthOk | HealthError;
  * limiter statistics (queued / executing counts).
  */
 export async function runHealthCheck(options: HealthCheckOptions): Promise<HealthCheckResult> {
-  const { deepCheck, includeLimiters, uptimeSeconds, version } = options;
+  const { deepCheck, includeLimiters, includeSettlement, uptimeSeconds, version } = options;
 
   if (deepCheck) {
     try {
@@ -86,6 +90,10 @@ export async function runHealthCheck(options: HealthCheckOptions): Promise<Healt
 
   if (includeLimiters) {
     payload.limiters = getAllLimiterStats();
+  }
+
+  if (includeSettlement) {
+    payload.settlement = getSettlementAgeMonitor()?.getSnapshot() ?? null;
   }
 
   return { ok: true, payload };
