@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address, Vec};
+use soroban_sdk::{contracterror, contracttype, Address};
 
 /// Errors returned by the leaderboard contract.
 ///
@@ -10,9 +10,7 @@ use soroban_sdk::{contracterror, contracttype, Address, Vec};
 /// |  4   | InvalidResult    | Result is not a recognised variant             |
 /// |  5   | InvalidRange     | `limit` is zero or the page offset is past the end |
 /// |  6   | ContractPaused   | Result recording is paused                     |
-/// |  7   | DuplicateSource  | Reporter is already authorised                 |
-/// |  8   | SnapshotChanged  | Ranking changed; restart pagination            |
-/// |  9   | ResultCountOverflow | Ranking revision space exhausted            |
+/// |  7   | Overflow         | An aggregate would exceed its integer range    |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -34,14 +32,8 @@ pub enum Error {
     /// [E006] Result recording is paused.
     ContractPaused = 6,
 
-    /// [E007] This reporter is already authorised; no changes were made.
-    DuplicateSource = 7,
-
-    /// [E008] A result changed the ranking; restart pagination at offset zero.
-    SnapshotChanged = 8,
-
-    /// [E009] No further unique ranking revision can be allocated.
-    ResultCountOverflow = 9,
+    /// [E007] An aggregate counter or payout total would overflow its integer type.
+    Overflow = 7,
 }
 
 /// The outcome of a single match, as reported by the escrow contract.
@@ -113,15 +105,6 @@ pub struct LeaderboardEntry {
     pub stats: PlayerStats,
 }
 
-/// One revision-checked leaderboard page. A revision is not a historical read:
-/// subsequent requests must use this token or restart if it has expired.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LeaderboardPage {
-    pub snapshot: u32,
-    pub entries: Vec<LeaderboardEntry>,
-}
-
 /// Storage keys.
 ///
 /// | Key                  | Tier       | Contents                              |
@@ -130,6 +113,7 @@ pub struct LeaderboardPage {
 /// | `Paused`             | Instance   | Whether recording results is blocked  |
 /// | `Stats(Address)`     | Persistent | [`PlayerStats`] for one address       |
 /// | `ResultCount`        | Instance   | Number of results recorded so far     |
+/// | `SettlementIds`      | Instance   | Settlement IDs already processed       |
 /// | `Sources(Address)`   | Instance   | Whether an address may submit results |
 /// | `Roster`             | Instance   | Every address that has a stats entry  |
 #[contracttype]
@@ -143,6 +127,8 @@ pub enum DataKey {
     Stats(Address),
     /// How many results have been recorded, used to bound the leaderboard.
     ResultCount,
+    /// Settlement identifiers already processed to prevent duplicate relayer submissions.
+    SettlementIds,
     /// Whether `Address` is authorised to submit results.
     Sources(Address),
     /// Every address that has a [`PlayerStats`] entry.

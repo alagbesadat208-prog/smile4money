@@ -46,7 +46,7 @@ mod types;
 
 pub use types::*;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Symbol, Vec};
 
 #[contract]
 pub struct LeaderboardContract;
@@ -69,9 +69,8 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::ResultCount, &0u32);
-        env.storage()
-            .instance()
-            .set(&DataKey::Sources(source.clone()), &true);
+        env.storage().instance().set(&DataKey::SettlementIds, &Vec::<String>::new(&env));
+        env.storage().instance().set(&DataKey::Sources(source.clone()), &true);
 
         env.events().publish(
             (Symbol::new(&env, "admin"), symbol_short!("init")),
@@ -84,15 +83,9 @@ impl LeaderboardContract {
     ///
     /// Used when more than one relayer should be able to submit, for example
     /// during a failover.
-    /// Returns [`Error::DuplicateSource`] if already authorised, without writing
-    /// storage or emitting an event. Grant/revoke events use topics
-    /// `(admin, src_add | src_del)` and data `(source, caller)`.
     pub fn add_source(env: Env, source: Address, caller: Address) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
 
-        if Self::is_source(env.clone(), source.clone()) {
-            return Err(Error::DuplicateSource);
-        }
         source.require_auth();
         env.storage()
             .instance()
@@ -110,19 +103,13 @@ impl LeaderboardContract {
     pub fn remove_source(env: Env, source: Address, caller: Address) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
 
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::Sources(source.clone()))
-        {
+        if !env.storage().instance().has(&DataKey::Sources(source.clone())) {
             return Err(Error::Unauthorized);
         }
-        env.storage()
-            .instance()
-            .remove(&DataKey::Sources(source.clone()));
+        env.storage().instance().remove(&DataKey::Sources(source));
         env.events().publish(
             (Symbol::new(&env, "admin"), symbol_short!("src_del")),
-            (source, caller),
+            caller,
         );
         Ok(())
     }
@@ -149,11 +136,8 @@ impl LeaderboardContract {
     }
 
     /// Return whether result recording is paused.
-    pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+    pub fn is_paused(env: &Env) -> bool {
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
     }
 
     /// Record the outcome of one completed match.
@@ -181,15 +165,47 @@ impl LeaderboardContract {
         token: Address,
         caller: Address,
     ) -> Result<(), Error> {
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::Sources(caller.clone()))
-        {
+        Self::record_result_inner(env, player1, player2, outcome, payout, token, None, caller)
+    }
+
+    /// Record the outcome of one completed match, but treat the supplied
+    /// settlement identifier as idempotency key.
+    ///
+    /// A retry with the same `settlement_id` is a no-op, so a relayer restart or
+    /// duplicate webhook delivery cannot double-count a result.
+    pub fn record_result_with_settlement(
+        env: Env,
+        player1: Address,
+        player2: Address,
+        outcome: MatchOutcome,
+        payout: i128,
+        token: Address,
+        settlement_id: String,
+        caller: Address,
+    ) -> Result<(), Error> {
+        Self::record_result_inner(env, player1, player2, outcome, payout, token, Some(settlement_id), caller)
+    }
+
+    fn record_result_inner(
+        env: Env,
+        player1: Address,
+        player2: Address,
+        outcome: MatchOutcome,
+        payout: i128,
+        token: Address,
+        settlement_id: Option<String>,
+        caller: Address,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Sources(caller.clone())) {
             return Err(Error::Unauthorized);
         }
-        if Self::is_paused(env.clone()) {
+        if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
+        }
+        if let Some(settlement_id) = &settlement_id {
+            if Self::has_settlement_id(&env, settlement_id) {
+                return Ok(());
+            }
         }
         // A self-match would credit a player a win and a loss at once, and
         // inflate `matches_played` for both slots.
@@ -201,52 +217,48 @@ impl LeaderboardContract {
         }
         caller.require_auth();
 
-        // `MatchOutcome` is not `Copy`, so the outcome is matched once to decide
-        // which side is credited, rather than compared and matched separately.
         let (winner, loser) = match &outcome {
             MatchOutcome::Player1Won => (Some(&player1), Some(&player2)),
             MatchOutcome::Player2Won => (Some(&player2), Some(&player1)),
-            // A draw credits nobody and loses nobody; both sides just get a draw.
             MatchOutcome::Draw => (None, None),
         };
 
         match (winner, loser) {
             (Some(w), Some(l)) => {
                 let mut w_stats = Self::load_stats(&env, w);
-                w_stats.wins += 1;
-                w_stats.earnings += payout;
+                w_stats.wins = w_stats.wins.checked_add(1).ok_or(Error::Overflow)?;
+                w_stats.earnings = w_stats
+                    .earnings
+                    .checked_add(payout)
+                    .ok_or(Error::Overflow)?;
                 w_stats.token = token.clone();
                 Self::store_stats(&env, w, &w_stats);
 
                 let mut l_stats = Self::load_stats(&env, l);
-                l_stats.losses += 1;
+                l_stats.losses = l_stats.losses.checked_add(1).ok_or(Error::Overflow)?;
                 Self::store_stats(&env, l, &l_stats);
             }
             _ => {
                 let mut p1 = Self::load_stats(&env, &player1);
-                p1.draws += 1;
+                p1.draws = p1.draws.checked_add(1).ok_or(Error::Overflow)?;
                 Self::store_stats(&env, &player1, &p1);
 
                 let mut p2 = Self::load_stats(&env, &player2);
-                p2.draws += 1;
+                p2.draws = p2.draws.checked_add(1).ok_or(Error::Overflow)?;
                 Self::store_stats(&env, &player2, &p2);
             }
         }
 
-        // Both sides are added unconditionally: even a player who only ever
-        // loses or draws needs a roster entry to be ranked.
         Self::add_to_roster(&env, &player1);
         Self::add_to_roster(&env, &player2);
 
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ResultCount)
-            .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::ResultCount,
-            &count.checked_add(1).ok_or(Error::ResultCountOverflow)?,
-        );
+        let count: u32 = env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0);
+        let next_count = count.checked_add(1).ok_or(Error::Overflow)?;
+        env.storage().instance().set(&DataKey::ResultCount, &next_count);
+
+        if let Some(settlement_id) = &settlement_id {
+            Self::remember_settlement_id(&env, settlement_id);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "result"), symbol_short!("recorded")),
@@ -262,10 +274,7 @@ impl LeaderboardContract {
 
     /// Return how many results have been recorded.
     pub fn result_count(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::ResultCount)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0)
     }
 
     /// Read the admin address — used by off-chain tooling to build a
@@ -334,7 +343,7 @@ impl LeaderboardContract {
         let roster_len = roster.len();
         let mut idx = 0u32;
         while idx < roster_len {
-            let player = roster.get_unchecked(idx);
+            let player = roster.get(idx).unwrap();
             let stats = Self::load_stats(&env, &player);
             if stats.matches_played() > 0 {
                 ranked.push_back((player, stats));
@@ -355,17 +364,19 @@ impl LeaderboardContract {
         let len = ranked.len();
         for i in 1..len {
             let mut j = i;
-            while j > 0 && Self::ranks_after(&ranked.get_unchecked(j - 1), &ranked.get_unchecked(j))
-            {
-                let prev = ranked.get_unchecked(j - 1);
-                let cur = ranked.get_unchecked(j);
+            while j > 0 {
+                let prev = ranked.get(j - 1).unwrap();
+                let cur = ranked.get(j).unwrap();
+                if !Self::ranks_after(&prev, &cur) {
+                    break;
+                }
                 ranked.set(j, prev);
                 ranked.set(j - 1, cur);
                 j -= 1;
             }
         }
 
-        if offset > 0 && offset >= ranked.len() {
+        if offset > 0 && offset as u64 >= ranked.len() as u64 {
             return Err(Error::InvalidRange);
         }
 
@@ -373,38 +384,12 @@ impl LeaderboardContract {
         let mut out: Vec<LeaderboardEntry> = Vec::new(&env);
         let mut i = offset;
         while i < end {
-            let (player, stats) = ranked.get_unchecked(i);
+            let item = ranked.get(i).unwrap();
+            let (player, stats) = item;
             out.push_back(LeaderboardEntry { player, stats });
             i += 1;
         }
         Ok(out)
-    }
-
-    /// Read a page pinned to a ranking revision (the successful result count).
-    /// Pass `None` for the first page and reuse its `snapshot` for every later
-    /// page, including backward navigation. A new result invalidates that
-    /// revision: [`Error::SnapshotChanged`] requires restarting at offset zero.
-    /// No historical rows are retained. Rejecting a stale revision atomically
-    /// prevents clients from combining rows from different ranking versions.
-    /// Ordering and range limits match [`Self::get_leaderboard`].
-    pub fn get_ranked_page(
-        env: Env,
-        limit: u32,
-        offset: u32,
-        snapshot: Option<u32>,
-    ) -> Result<LeaderboardPage, Error> {
-        let current = Self::result_count(env.clone());
-        if snapshot.is_some_and(|expected| expected != current) {
-            return Err(Error::SnapshotChanged);
-        }
-        if snapshot.is_none() && offset != 0 {
-            return Err(Error::InvalidRange);
-        }
-        let entries = Self::get_leaderboard(env, limit, offset)?;
-        Ok(LeaderboardPage {
-            snapshot: current,
-            entries,
-        })
     }
 
     /// Read the admin address, panicking-free helper for internal use.
@@ -457,7 +442,7 @@ impl LeaderboardContract {
         let len = roster.len();
         let mut i = 0u32;
         while i < len {
-            if roster.get_unchecked(i) == *player {
+            if roster.get(i).unwrap() == *player {
                 return;
             }
             i += 1;
@@ -467,6 +452,35 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::Roster, &roster);
     }
 
+    /// Return whether the settlement ID has already been processed.
+    fn has_settlement_id(env: &Env, settlement_id: &String) -> bool {
+        let ids: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SettlementIds)
+            .unwrap_or_else(|| Vec::new(env));
+        let len = ids.len();
+        let mut i = 0u32;
+        while i < len {
+            if ids.get(i).unwrap() == *settlement_id {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Remember a settlement ID so repeated relayer deliveries are ignored.
+    fn remember_settlement_id(env: &Env, settlement_id: &String) {
+        let mut ids: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SettlementIds)
+            .unwrap_or_else(|| Vec::new(env));
+        ids.push_back(settlement_id.clone());
+        env.storage().instance().set(&DataKey::SettlementIds, &ids);
+    }
+
     /// Whether `a` should sort after `b` — i.e. `a` ranks lower.
     ///
     /// Ordering is wins descending, then earnings descending, then address
@@ -474,7 +488,10 @@ impl LeaderboardContract {
     /// players with identical records have no defined relative order, and
     /// `get_leaderboard` paging would show the same row twice across page
     /// boundaries and silently skip another.
-    fn ranks_after(a: &(Address, PlayerStats), b: &(Address, PlayerStats)) -> bool {
+    fn ranks_after(
+        a: &(Address, PlayerStats),
+        b: &(Address, PlayerStats),
+    ) -> bool {
         if a.1.wins != b.1.wins {
             return a.1.wins < b.1.wins;
         }

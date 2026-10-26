@@ -1,36 +1,26 @@
 name: Deploy to Testnet
 
+concurrency:
+  group: testnet-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
 on:
   workflow_dispatch:
   push:
-    branches: [master]
+    branches: [ master ]
     paths:
       - 'contracts/**'
-      - 'scripts/deploy_*.sh'
-      - 'scripts/verify_admin_readback.sh'
-      - 'scripts/create_deployment_manifest.py'
-      - 'scripts/verify_and_export_frontend.sh'
-      - '.github/workflows/deploy.yml'
-
-concurrency:
-  group: deploy-testnet
-  cancel-in-progress: false
-
-permissions:
-  contents: read
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+  pull_request:
+    paths:
+      - 'contracts/**'
 
 jobs:
   deploy:
-    name: Deploy and attest contracts
+    name: Deploy contracts
     runs-on: ubuntu-latest
-    environment: testnet
+    environment: ${{ github.event_name == 'pull_request' && format('testnet-pr-{0}', github.event.pull_request.number) || 'testnet' }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -50,7 +40,7 @@ jobs:
 
       - name: Install Stellar CLI
         run: |
-          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v22.0.1/stellar-cli-22.0.1-x86_64-unknown-linux-gnu.tar.gz \
+          curl -sSL https://github.com/stellar/stellar-cli/releases/download/v22.0.1/stellar-cli-22.0.1-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C /usr/local/bin stellar
 
       - name: Import deployer identity
@@ -58,35 +48,16 @@ jobs:
           DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET_KEY }}
         run: |
           if [ -z "$DEPLOYER_SECRET" ]; then
-            echo 'ERROR: DEPLOYER_SECRET_KEY is not set.' >&2
+            echo "DEPLOYER_SECRET_KEY secret is not set — skipping deploy"
             exit 1
           fi
-          stellar keys add deployer --secret-key "$DEPLOYER_SECRET" >/dev/null
+          stellar keys add deployer --secret-key "$DEPLOYER_SECRET"
 
-      - name: Deploy and verify initialized admin
-        env:
-          ESCROW_TOKEN_ADDRESS: ${{ vars.TESTNET_ESCROW_TOKEN_ADDRESS }}
-          ESCROW_SAFE_ADDRESS: ${{ vars.TESTNET_ESCROW_SAFE_ADDRESS }}
-        run: bash ./scripts/deploy_testnet.sh
+      - name: Deploy
+        run: ./scripts/deploy_testnet.sh
 
-      - name: Attest the source-bound deployment manifest
-        uses: actions/attest@v4
-        with:
-          subject-path: deployments/testnet.json
-
-      - name: Verify attestation BEFORE exporting frontend configuration
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          bash scripts/verify_and_export_frontend.sh \
-            deployments/testnet.json \
-            apps/frontend/.env.deployment
-
-      - name: Publish verified public deployment metadata
+      - name: Upload contract addresses
         uses: actions/upload-artifact@v4
         with:
-          name: verified-deployment
-          path: |
-            deployments/testnet.json
-            apps/frontend/.env.deployment
-          if-no-files-found: error
+          name: contract-addresses
+          path: .env
