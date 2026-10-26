@@ -1,5 +1,6 @@
 import { providerGet, checkHttpStatus, quarantine, validateChronology } from './provider-validation.js';
 import { RateLimitError } from '../errors/RateLimitError.js';
+import { privateEnv } from '../config/private-env.js';
 
 /** Maps to the on-chain MatchResult enum. */
 export type MatchResult = 'Player1Wins' | 'Player2Wins' | 'Draw';
@@ -77,7 +78,7 @@ function sleep(ms: number): Promise<void> {
  * - Maps winner field to MatchResult (Player1 = white, Player2 = black).
  */
 export async function fetchLichessResult(gameId: string): Promise<GameResult> {
-  const token = process.env.LICHESS_API_TOKEN;
+  const token = privateEnv.lichessApiToken;
   const url = `https://lichess.org/api/game/${encodeURIComponent(gameId)}`;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {

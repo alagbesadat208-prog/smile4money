@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
+import { publicEnv } from '../config/public-env';
 
 interface TxHashProps {
   hash: string;
 }
 
-const network = import.meta.env.VITE_STELLAR_NETWORK ?? 'testnet';
+const network = publicEnv.stellarNetwork;
 
 export function TxHash({ hash }: TxHashProps) {
   const [copied, setCopied] = useState(false);

@@ -186,6 +186,20 @@ All secrets are managed through GitHub Actions Secrets. No secret values are eve
 - `Cargo.lock` is committed and kept up to date. Do not add `Cargo.lock` to `.gitignore`.
 - When updating a dependency, run the full CI suite locally before pushing.
 
+### Frontend and backend environment isolation
+
+The frontend public schema is defined in
+`apps/frontend/src/config/public-env.ts` and contains only `VITE_*` values.
+Backend credentials are defined in `apps/backend/src/config/private-env.ts` and
+must never be renamed with the `VITE_` prefix. Vite exposes `VITE_*` values in
+the browser bundle, so server-only names and values must stay in backend
+configuration.
+
+The frontend production build runs `npm run check:bundle-env`, which scans
+`dist/` for known server-only variable names and values and fails if any are
+present. The scan is also run in the frontend CI job after the production
+build.
+
 ---
 
 ## 8. Observability

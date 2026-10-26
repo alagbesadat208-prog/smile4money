@@ -32,6 +32,7 @@
  */
 
 import axios from 'axios';
+import { privateEnv } from '../config/private-env.js';
 import { getLichessLimiterSingleton } from './bottleneck-limiters.js';
 import logger from '../logger.js';
 import { resolveMultiplier, type EloMultiplierResult } from './elo-multiplier.js';
@@ -73,7 +74,7 @@ export class UserNotFoundError extends Error {
 
 /** Build the authenticated GET used for every Lichess call in this service. */
 function defaultGet<T>(url: string): Promise<T> {
-  const token = process.env.LICHESS_API_TOKEN;
+  const token = privateEnv.lichessApiToken;
   return axios
     .get<T>(url, {
       headers: {
