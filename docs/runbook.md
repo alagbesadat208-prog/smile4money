@@ -597,3 +597,24 @@ manual run asks for the record's path. Merge the record (and so the decision) be
 
 *This runbook is a living document. Update it whenever a procedure changes or a gap is discovered
 during an incident. The reviewing engineer is responsible for merging updates.*
+
+---
+
+## Production trust-boundary approval and CLI compatibility (#1958, #1959)
+
+Production token and oracle address changes must be proposed through the `Approve production token/oracle trust change` GitHub Actions workflow on a reviewed commit. The workflow does **not** itself deploy or modify a contract. It records the two reviewed **public** addresses, source SHA, run number, requester, and independent reviewer in the `production-trust-approval-<run_id>` release-evidence artifact.
+
+**Repository-owner setup (mandatory):** In **Settings → Environments**, create `production`, add independent **Required reviewers**, enable **Prevent self-review**, prevent administrator bypass if your plan permits, and restrict deployments to the protected `master` branch. These repository protection settings cannot be established by a pull request. Merely assigning `environment: production` without the protection rules is **not sufficient**. The authorization script queries GitHub for the actual configured rules and the approved workflow review; it refuses an unprotected environment, self-approval, unapproved/rejected run, unknown source SHA, or untrusted runner context.
+
+The deployment script runs `verify_production_approval.py` before reading or using any deployer identity or attempting network mutations. It requires `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, `GITHUB_RUN_ID`, `GITHUB_SHA`, `GITHUB_ACTOR`, `GITHUB_ACTIONS=true`, `PRODUCTION_TOKEN_ADDRESS`, `PRODUCTION_ORACLE_ADDRESS`, and `PRODUCTION_APPROVAL_EVIDENCE` set in the *same protected workflow run*. Direct manual mainnet deployment is intentionally denied. The signed-in operator cannot bypass this solely by setting an `APPROVED=true` variable. The reviewed addresses must be applied separately to the appropriate runtime/contract change; this workflow is approval evidence, **not proof that the submitted token/oracle was changed on-chain**. Additional operational review is required for an on-chain oracle rotation or token policy release.
+
+The repository uses Soroban Rust SDK `22.0.11`; `scripts/check_stellar_compat.sh` declares a supported Stellar CLI major range of **22 through 27** and a contract SDK target of **protocol 22**. It rejects an older/unrecognized CLI, queries `getNetwork` and `getLatestLedger` before any deployment mutation to confirm network passphrase and active protocol compatibility, and checks that both built WASMs' environment metadata and interfaces can be decoded. These are **read-only preflight checks**, not proof a transaction will be accepted. An RPC endpoint can still be malicious or become stale after the check. The pinned testnet CI CLI `22.0.1` will be rejected whenever the active network protocol is newer; upgrade the CI CLI only after verifying compatibility. The current testnet CI pins Stellar CLI `22.0.1`.
+
+Offline checks (no installations/deployments):
+
+```bash
+python3 -m unittest discover -s tests -p 'test_production_approval.py'
+python3 -m unittest discover -s tests -p 'test_stellar_compat.py'
+```
+
+The production workflow is approval-only: it does not import private keys, install tooling or trigger an irreversible mainnet transaction. A separate protected deployment workflow must be configured by the owner to run the actual mainnet script within an approved run. The proof is per run/source SHA, not reusable across subsequent workflows.
