@@ -1,4 +1,6 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { WagerHistory } from './WagerHistory';
+import { deployment } from '../deployment';
+import { useEffect, useState, useCallback } from 'react';
 import type { WalletStatus } from '../types';
 import {
   DEFAULT_HISTORY_CACHE_TTL_MS,
@@ -6,15 +8,13 @@ import {
   setHistoryCacheEntry,
 } from './history-cache';
 
+const HORIZON_URL = deployment.horizonUrl;
 const PAGE_SIZE = 20;
 
 interface HistoryProps {
   walletState: WalletStatus;
   publicKey?: string | null;
   cacheTtlMs?: number;
-  network?: string;
-  contractId?: string;
-  horizonUrl?: string;
 }
 
 interface HorizonTransaction {
@@ -39,11 +39,10 @@ interface HorizonResponse {
 
 export interface HistoryRow {
   id: string;
-  matchId: string;
-  opponent: string;
-  stake: string;
-  result: string;
-  payout: string;
+  hash: string;
+  source: string;
+  fee: string;
+  status: string;
   date: string;
 }
 
@@ -56,21 +55,13 @@ function parseCursor(href: string): string | null {
   }
 }
 
-function mapRecord(record: HorizonTransaction, publicKey: string): HistoryRow {
-  const matchId =
-    record.memo && !Number.isNaN(Number(record.memo)) ? record.memo : '—';
-  const opponent =
-    record.source_account === publicKey ? 'Unknown' : record.source_account;
-  const stake = record.fee_charged ? `${record.fee_charged} stroops` : '—';
-  const result = record.successful ? 'Success' : 'Failed';
-  const payout = record.successful ? 'Confirmed' : 'Failed';
+function mapRecord(record: HorizonTransaction): HistoryRow {
   return {
     id: record.hash,
-    matchId,
-    opponent,
-    stake,
-    result,
-    payout,
+    hash: record.hash,
+    source: record.source_account,
+    fee: `${record.fee_charged} stroops`,
+    status: record.successful ? 'Success' : 'Failed',
     date: new Date(record.created_at).toLocaleString(),
   };
 }
@@ -79,20 +70,7 @@ export function History({
   walletState,
   publicKey,
   cacheTtlMs = DEFAULT_HISTORY_CACHE_TTL_MS,
-  network = import.meta.env.VITE_STELLAR_NETWORK ?? 'testnet',
-  contractId = import.meta.env.VITE_ESCROW_CONTRACT_ID ?? '',
-  horizonUrl = network === 'mainnet'
-    ? 'https://horizon.stellar.org'
-    : 'https://horizon-testnet.stellar.org',
 }: HistoryProps) {
-  const scopeKey = JSON.stringify([publicKey, network, contractId, horizonUrl, walletState]);
-  const currentScope = useRef<string | null>(scopeKey);
-  useEffect(() => {
-    currentScope.current = scopeKey;
-    return () => {
-      currentScope.current = null;
-    };
-  }, [scopeKey]);
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -115,7 +93,7 @@ export function History({
       }
       setError(null);
 
-      const url = new URL(`${horizonUrl}/accounts/${publicKey}/transactions`);
+      const url = new URL(`${HORIZON_URL}/accounts/${publicKey}/transactions`);
       url.searchParams.set('limit', String(PAGE_SIZE));
       url.searchParams.set('order', 'desc');
       if (cursor) url.searchParams.set('cursor', cursor);
@@ -126,10 +104,9 @@ export function History({
           throw new Error('Unable to load transaction history');
         }
         const data = (await response.json()) as HorizonResponse;
-        if (currentScope.current !== scopeKey) return;
         const records: HorizonTransaction[] = data._embedded?.records ?? [];
 
-        const rows = records.map((r) => mapRecord(r, publicKey));
+        const rows = records.map((r) => mapRecord(r));
 
         setHistory((prev) => (append ? [...prev, ...rows] : rows));
 
@@ -140,33 +117,26 @@ export function History({
         const derived = nextHref ? parseCursor(nextHref) : null;
         setNextCursor(records.length < PAGE_SIZE ? null : derived);
         if (!append) {
-          setHistoryCacheEntry(
-            publicKey,
-            { network, contractId },
-            {
-              history: rows,
-              nextCursor: records.length < PAGE_SIZE ? null : derived,
-              fetchedAt: Date.now(),
-            },
-          );
+          setHistoryCacheEntry(publicKey, {
+            history: rows,
+            nextCursor: records.length < PAGE_SIZE ? null : derived,
+            fetchedAt: Date.now(),
+          });
         }
       } catch (err) {
-        if (currentScope.current !== scopeKey) return;
         setError(err instanceof Error ? err.message : 'Failed to load history');
       } finally {
-        if (currentScope.current === scopeKey) {
-          if (append) {
-            setLoadingMore(false);
-          } else {
-            setLoading(false);
-          }
+        if (append) {
+          setLoadingMore(false);
+        } else {
+          setLoading(false);
         }
       }
     },
-    [publicKey, network, contractId, horizonUrl, scopeKey],
+    [publicKey],
   );
 
-  // Reset and reload whenever the wallet or deployment changes.
+  // Reset and reload whenever the connected wallet changes.
   useEffect(() => {
     if (walletState !== 'connected' || !publicKey) {
       setHistory([]);
@@ -176,22 +146,20 @@ export function History({
       return;
     }
 
-    setLoadingMore(false);
-    setLoading(false);
-    setError(null);
-    const cached = getHistoryCacheEntry(publicKey, { network, contractId });
+    const cached = getHistoryCacheEntry(publicKey);
     const hasFreshCache = cached && Date.now() - cached.fetchedAt < cacheTtlMs;
     if (cached) {
       setHistory(cached.history);
       setNextCursor(cached.nextCursor);
     } else {
-      setHistory([]);
       setNextCursor(null);
     }
     if (!cached || !hasFreshCache) {
       void fetchPage(null, false, Boolean(cached));
     }
-  }, [publicKey, walletState, cacheTtlMs, fetchPage, network, contractId]);
+    // fetchPage is stable (memoised on publicKey); re-run when publicKey or
+    // walletState changes.
+  }, [publicKey, walletState, cacheTtlMs, fetchPage]);
 
   function handleLoadMore() {
     if (nextCursor && !loadingMore) {
@@ -203,14 +171,16 @@ export function History({
     return (
       <section className="history-page" data-testid="history-page">
         <h2>Transaction History</h2>
-        <p>Please connect your wallet to view match history.</p>
+        <p>Please connect your wallet to view history.</p>
       </section>
     );
   }
 
   return (
     <section className="history-page" data-testid="history-page">
-      <h2>Match History</h2>
+      {publicKey && <WagerHistory key={publicKey} wallet={publicKey} />}
+      <h2>Network Transaction Details</h2>
+      <p>Network fees and transaction status do not establish wager outcomes.</p>
 
       {loading && <p data-testid="history-loading">Loading history…</p>}
 
@@ -221,7 +191,7 @@ export function History({
       )}
 
       {!loading && !error && history.length === 0 && (
-        <p data-testid="history-empty">No matches found for this wallet.</p>
+        <p data-testid="history-empty">No network transactions found for this wallet.</p>
       )}
 
       {!loading && history.length > 0 && (
@@ -230,22 +200,20 @@ export function History({
             <table className="history-table" data-testid="history-table">
               <thead>
                 <tr>
-                  <th>Match ID</th>
-                  <th>Opponent</th>
-                  <th>Stake</th>
-                  <th>Result</th>
-                  <th>Payout</th>
+                  <th>Transaction hash</th>
+                  <th>Source account</th>
+                  <th>Network fee</th>
+                  <th>Transaction status</th>
                   <th>Date</th>
                 </tr>
               </thead>
               <tbody>
                 {history.map((row) => (
                   <tr key={row.id} data-testid="history-row">
-                    <td>{row.matchId}</td>
-                    <td>{row.opponent}</td>
-                    <td>{row.stake}</td>
-                    <td>{row.result}</td>
-                    <td>{row.payout}</td>
+                    <td>{row.hash}</td>
+                    <td>{row.source}</td>
+                    <td>{row.fee}</td>
+                    <td>{row.status}</td>
                     <td>{row.date}</td>
                   </tr>
                 ))}
@@ -271,7 +239,7 @@ export function History({
 
           {loadingMore && (
             <p data-testid="history-loading-more" aria-live="polite">
-              Loading more matches…
+              Loading more transactions…
             </p>
           )}
         </>
