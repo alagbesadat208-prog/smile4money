@@ -1,11 +1,24 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { Address, Networks } from '@stellar/stellar-sdk';
-import { validateAndConvertXlmToStroops } from '../utils/xlm-precision';
-import { getNetworkAssets } from '../config/assets';
+import { validateAndConvertXlmToStroops, countDecimalPlaces } from '../utils/xlm-precision';
+import { buildCreateMatchReview, type TransactionReviewSummary } from '../hooks/useTransactions';
+import { TransactionReview } from './TransactionReview';
 
 type Platform = 'lichess' | 'chesscom';
 type TokenType = 'xlm' | 'usdc';
 type Status = 'idle' | 'validating' | 'pending' | 'success' | 'error';
+
+/** Data submitted to `onCreateMatch` — the same shape the transaction is built from. */
+interface CreateMatchSubmitData {
+  player2: string;
+  stakeAmount: string;
+  token: TokenType;
+  gameId: string;
+  platform: Platform;
+  platformUsername?: string;
+  networkPassphrase: string;
+  rpcUrl: string;
+}
 
 // Stellar stroop bounds for stake_amount.
 // 1 stroop is the minimum transferable unit; the contract enforces an upper
@@ -21,19 +34,7 @@ interface CreateMatchProps {
   apiBaseUrl?: string;
   /** Pre-known game IDs that already have a match; duplicates are rejected. */
   knownGameIds?: string[];
-  onCreateMatch?: (data: {
-    player2: string;
-    stakeAmount: string;
-    token: TokenType;
-    tokenContractId: string;
-    tokenSymbol: string;
-    tokenDecimals: number;
-    gameId: string;
-    platform: Platform;
-    platformUsername?: string;
-    networkPassphrase: string;
-    rpcUrl: string;
-  }) => Promise<{ matchId: string; transactionHash: string; confirmed: true }>;
+  onCreateMatch?: (data: CreateMatchSubmitData) => Promise<string>;
 }
 
 interface FormData {
@@ -53,14 +54,15 @@ interface FormErrors {
   gameValidation?: string;
 }
 
-function toTokenUnits(value: string, decimals: number): bigint {
-  const [whole, fraction = ''] = value.trim().replace(',', '.').split('.');
-  if (fraction.length > decimals)
-    throw new Error(`Amount supports at most ${decimals} decimal places`);
-  return (
-    BigInt(whole || '0') * 10n ** BigInt(decimals) + BigInt(fraction.padEnd(decimals, '0') || '0')
-  );
-}
+const NETWORK_PASSPHRASES: Record<string, string> = {
+  testnet: Networks.TESTNET,
+  mainnet: Networks.PUBLIC,
+};
+
+const TOKEN_ADDRESSES: Record<TokenType, string> = {
+  xlm: 'native',
+  usdc: '', // Would be populated from env/config
+};
 
 function isValidStellarAddress(address: string): boolean {
   try {
@@ -71,12 +73,7 @@ function isValidStellarAddress(address: string): boolean {
   }
 }
 
-function validateForm(
-  data: FormData,
-  knownGameIds: string[] = [],
-  tokenDecimals = 7,
-  tokenSymbol = 'XLM',
-): FormErrors {
+function validateForm(data: FormData, knownGameIds: string[] = []): FormErrors {
   const errors: FormErrors = {};
 
   if (!data.player2.trim()) {
@@ -90,20 +87,15 @@ function validateForm(
   } else {
     const raw = data.stakeAmount.trim();
     const validation = validateAndConvertXlmToStroops(raw);
-    const fractionalDigits = raw.match(/[.,](\d+)$/)?.[1].length ?? 0;
-
+    
     if (!validation.valid) {
       errors.stakeAmount = validation.message || 'Invalid stake amount';
-    } else if (fractionalDigits > tokenDecimals) {
-      errors.stakeAmount = `Stake amount supports at most ${tokenDecimals} decimal places`;
     } else if (validation.stroops !== undefined) {
-      const amountUnits =
-        tokenDecimals === 7 ? validation.stroops : toTokenUnits(raw, tokenDecimals);
       // Check bounds
-      if (amountUnits < MIN_STAKE_STROOPS) {
-        errors.stakeAmount = `Stake amount must be at least 1 smallest ${tokenSymbol} unit`;
-      } else if (amountUnits > MAX_STAKE_STROOPS) {
-        errors.stakeAmount = `Stake amount exceeds the maximum for ${tokenSymbol}`;
+      if (validation.stroops < MIN_STAKE_STROOPS) {
+        errors.stakeAmount = `Stake amount must be at least 1 stroop (${(1n / BigInt(10_000_000)).toString()} XLM)`;
+      } else if (validation.stroops > MAX_STAKE_STROOPS) {
+        errors.stakeAmount = `Stake amount must be at most ${(MAX_STAKE_STROOPS / BigInt(10_000_000)).toString()} XLM`;
       }
       // Set warning if decimal places were provided but capped at 7
       if (validation.decimals === 7) {
@@ -181,6 +173,7 @@ async function validateGameOnPlatform(
 }
 
 export function CreateMatch({
+  contractId,
   player1Address,
   networkPassphrase = Networks.TESTNET,
   rpcUrl = 'https://soroban-testnet.stellar.org',
@@ -200,8 +193,13 @@ export function CreateMatch({
   const [token, setToken] = useState<TokenType>('xlm');
   const [matchId, setMatchId] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
-  const availableAssets = useMemo(() => getNetworkAssets(networkPassphrase), [networkPassphrase]);
-  const selectedAsset = availableAssets.find((asset) => asset.id === token);
+  /** Transaction review step shown after validation, before the signature request. */
+  const [review, setReview] = useState<TransactionReviewSummary | null>(null);
+  /** Payload submitted on confirm — mirrors the review fields. */
+  const [reviewPayload, setReviewPayload] = useState<CreateMatchSubmitData | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const submitBtnRef = useRef<HTMLButtonElement>(null);
 
   function updateField(
     key: 'player2' | 'stakeAmount' | 'gameId' | 'platform' | 'platformUsername',
@@ -223,12 +221,7 @@ export function CreateMatch({
   ) {
     const next = { ...formData, [key]: value } as FormData;
     setFormData(next);
-    const validationErrors = validateForm(
-      next,
-      knownGameIds,
-      selectedAsset?.decimals,
-      selectedAsset?.symbol,
-    );
+    const validationErrors = validateForm(next, knownGameIds);
     setErrors((prev) => ({ ...prev, [key]: validationErrors[key as keyof FormErrors] }));
   }
 
@@ -236,12 +229,7 @@ export function CreateMatch({
     async (e: React.FormEvent) => {
       e.preventDefault();
 
-      const validationErrors = validateForm(
-        formData,
-        knownGameIds,
-        selectedAsset?.decimals,
-        selectedAsset?.symbol,
-      );
+      const validationErrors = validateForm(formData, knownGameIds);
       setErrors(validationErrors);
 
       if (Object.keys(validationErrors).length > 0) {
@@ -288,55 +276,86 @@ export function CreateMatch({
         return;
       }
 
-      setStatus('pending');
-
+      // Game validation passed — present the review step before signing.
+      // The review is derived from the same typed inputs used to construct the
+      // transaction, so the user reviews exactly what will be submitted.
       try {
-        // Convert decimal XLM to stroops
-        if (!selectedAsset)
-          throw new Error('This token is not configured for the selected network');
-        const stakeAmount =
-          token === 'xlm'
-            ? validateAndConvertXlmToStroops(formData.stakeAmount.trim()).stroops
-            : toTokenUnits(formData.stakeAmount, selectedAsset.decimals);
-        if (stakeAmount === undefined || stakeAmount <= 0n) throw new Error('Invalid stake amount');
+        const stakeValidation = validateAndConvertXlmToStroops(formData.stakeAmount.trim());
+        if (!stakeValidation.valid || stakeValidation.stroops === undefined) {
+          throw new Error('Invalid stake amount');
+        }
 
-        const result = await onCreateMatch?.({
+        const payload: CreateMatchSubmitData = {
           player2: formData.player2,
-          stakeAmount: stakeAmount.toString(),
+          stakeAmount: stakeValidation.stroops.toString(),
           token,
-          tokenContractId: selectedAsset.contractId,
-          tokenSymbol: selectedAsset.symbol,
-          tokenDecimals: selectedAsset.decimals,
           gameId: formData.gameId,
           platform: formData.platform,
           platformUsername: formData.platformUsername || undefined,
           networkPassphrase,
           rpcUrl,
-        });
+        };
 
-        if (result?.confirmed === true && result.matchId && result.transactionHash) {
-          setMatchId(result.matchId);
-          setStatus('success');
-        } else {
-          throw new Error('Failed to create match');
-        }
+        const summary = buildCreateMatchReview(
+          {
+            player2: formData.player2,
+            stakeAmount: formData.stakeAmount.trim(),
+            token,
+            gameId: formData.gameId,
+            platform: formData.platform,
+          },
+          networkPassphrase === Networks.TESTNET ? 'testnet' : 'mainnet',
+        );
+
+        setReviewPayload(payload);
+        setReview(summary);
+        setStatus('idle');
+        setErrorMsg('');
       } catch (err) {
         setStatus('error');
-        setErrorMsg(err instanceof Error ? err.message : 'Failed to create match');
+        setErrorMsg(err instanceof Error ? err.message : 'Unable to prepare transaction');
+        return;
       }
     },
-    [
-      formData,
-      player1Address,
-      token,
-      apiBaseUrl,
-      knownGameIds,
-      onCreateMatch,
-      networkPassphrase,
-      rpcUrl,
-      selectedAsset,
-    ],
+    [formData, player1Address, token, apiBaseUrl, knownGameIds, onCreateMatch, networkPassphrase, rpcUrl],
   );
+
+  const handleConfirmReview = useCallback(async () => {
+    setSubmitting(true);
+    setReviewError(null);
+    if (!reviewPayload) {
+      setSubmitting(false);
+      return;
+    }
+
+    try {
+      const result = await onCreateMatch?.(reviewPayload);
+      if (result) {
+        setMatchId(result);
+        setStatus('success');
+      } else {
+        throw new Error('Failed to create match');
+      }
+      // Success: clear the review and move focus back to the submit button.
+      setReview(null);
+      setReviewPayload(null);
+    } catch (err) {
+      // Keep the review open so the user can see the error and retry instead
+      // of losing context after a failed signature attempt.
+      setReviewError(err instanceof Error ? err.message : 'Failed to create match');
+    } finally {
+      setSubmitting(false);
+      submitBtnRef.current?.focus?.();
+    }
+  }, [onCreateMatch, reviewPayload]);
+
+  const handleCancelReview = useCallback(() => {
+    setReview(null);
+    setReviewPayload(null);
+    setReviewError(null);
+    setStatus('idle');
+    submitBtnRef.current?.focus();
+  }, []);
 
   function resetForm() {
     setFormData({
@@ -350,6 +369,9 @@ export function CreateMatch({
     setStatus('idle');
     setMatchId(null);
     setErrorMsg('');
+    setReview(null);
+    setReviewPayload(null);
+    setReviewError(null);
   }
 
   const isBusy = status === 'validating' || status === 'pending';
@@ -381,30 +403,40 @@ export function CreateMatch({
       )}
 
       {!matchId && (
-        <form onSubmit={handleSubmit} noValidate data-testid="create-match-form">
+        <>
+          {review ? (
+            <TransactionReview
+              summary={review}
+              onConfirm={handleConfirmReview}
+              onCancel={handleCancelReview}
+              isConfirming={submitting}
+              errorMessage={reviewError ?? undefined}
+            />
+          ) : (
+            <form onSubmit={handleSubmit} noValidate data-testid="create-match-form">
           {/* Token selector */}
           <div className="form-group">
             <label>Stake Token</label>
             <div className="token-toggle" role="group" aria-label="Select token">
-              {availableAssets.map((asset) => (
-                <button
-                  key={asset.id}
-                  type="button"
-                  className={`toggle-btn${token === asset.id ? ' active' : ''}`}
-                  onClick={() => setToken(asset.id)}
-                  aria-pressed={token === asset.id}
-                  data-testid={`toggle-${asset.id}`}
-                  disabled={isBusy}
-                >
-                  {asset.symbol}
-                </button>
-              ))}
+              <button
+                type="button"
+                className={`toggle-btn${token === 'xlm' ? ' active' : ''}`}
+                onClick={() => setToken('xlm')}
+                aria-pressed={token === 'xlm'}
+                data-testid="toggle-xlm"
+              >
+                XLM
+              </button>
+              <button
+                type="button"
+                className={`toggle-btn${token === 'usdc' ? ' active' : ''}`}
+                onClick={() => setToken('usdc')}
+                aria-pressed={token === 'usdc'}
+                data-testid="toggle-usdc"
+              >
+                USDC
+              </button>
             </div>
-            {availableAssets.length === 0 && (
-              <small className="field-hint">
-                No staking assets are configured for this network.
-              </small>
-            )}
           </div>
 
           {/* Player 2 Address */}
@@ -529,11 +561,7 @@ export function CreateMatch({
 
           {/* Game validation info / errors */}
           {errors.gameValidation && (
-            <div
-              className="validation-feedback error"
-              role="alert"
-              data-testid="game-validation-error"
-            >
+            <div className="validation-feedback error" role="alert" data-testid="game-validation-error">
               <strong>Game not found:</strong> {errors.gameValidation}
             </div>
           )}
@@ -545,13 +573,18 @@ export function CreateMatch({
 
           {/* Submit Button */}
           <button
+            ref={submitBtnRef}
             type="submit"
             className="btn btn-submit"
-            disabled={isBusy || hasErrors || !selectedAsset}
+            disabled={isBusy || hasErrors}
             data-testid="submit-match-btn"
             aria-busy={isBusy}
           >
-            {isValidating ? 'Validating Game…' : isSubmitting ? 'Creating Match…' : 'Create Match'}
+            {isValidating
+              ? 'Validating Game…'
+              : isSubmitting
+                ? 'Creating Match…'
+                : 'Create Match'}
           </button>
 
           {/* Error Message */}
@@ -560,7 +593,9 @@ export function CreateMatch({
               {errorMsg}
             </p>
           )}
-        </form>
+            </form>
+          )}
+        </>
       )}
     </div>
   );

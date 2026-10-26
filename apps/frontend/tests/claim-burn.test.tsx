@@ -169,6 +169,19 @@ describe('ClaimBurn — confirmation flow', () => {
   });
 });
 
+describe('ClaimBurn — keyboard', () => {
+  it('cancels the confirmation overlay on Escape', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<ClaimBurn walletState="connected" />);
+    fireEvent.change(screen.getByTestId('amount-input'), { target: { value: '10' } });
+    fireEvent.click(screen.getByTestId('submit-btn'));
+    await screen.findByTestId('confirm-overlay');
+    await user.keyboard('{Escape}');
+    expect(screen.queryByTestId('confirm-overlay')).not.toBeInTheDocument();
+    expect(screen.getByTestId('submit-btn')).toBeInTheDocument();
+  });
+});
+
 describe('ClaimBurn — submit and error handling', () => {
   it('calls onClaim with entered amount on submit', async () => {
     const onClaim = vi.fn().mockResolvedValue({ hash: 'confirmed-hash', confirmed: true });

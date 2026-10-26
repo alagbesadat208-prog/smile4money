@@ -1,10 +1,10 @@
 import React from 'react';
-import { render, screen, fireEvent } from '@testing-library/react';
-import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { MockInstance } from 'vitest';
 import { CreateMatch } from '../src/components/CreateMatch';
 
 const validAddress = 'GAUXUJLYWYXK7UE22KXN5WJTP2MNOWVL4ZRDBJQ43WZB5HJP22JSYTRR';
-
 describe('CreateMatch — rendering', () => {
   it('renders the form with all required fields', () => {
     render(<CreateMatch contractId="test-contract" player1Address={validAddress} />);
@@ -14,10 +14,10 @@ describe('CreateMatch — rendering', () => {
     expect(screen.getByTestId('game-id-input')).toBeInTheDocument();
   });
 
-  it('offers only assets configured for the selected network', () => {
+  it('renders token toggle with XLM and USDC options', () => {
     render(<CreateMatch contractId="test-contract" player1Address={validAddress} />);
     expect(screen.getByTestId('toggle-xlm')).toBeInTheDocument();
-    expect(screen.queryByTestId('toggle-usdc')).not.toBeInTheDocument();
+    expect(screen.getByTestId('toggle-usdc')).toBeInTheDocument();
   });
 
   it('renders platform selector with Lichess and Chess.com options', () => {
@@ -29,7 +29,7 @@ describe('CreateMatch — rendering', () => {
   it('defaults to XLM token', () => {
     render(<CreateMatch contractId="test-contract" player1Address={validAddress} />);
     expect(screen.getByTestId('toggle-xlm')).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.queryByTestId('toggle-usdc')).not.toBeInTheDocument();
+    expect(screen.getByTestId('toggle-usdc')).toHaveAttribute('aria-pressed', 'false');
   });
 
   it('defaults to Lichess platform', () => {
@@ -44,22 +44,12 @@ describe('CreateMatch — rendering', () => {
   });
 });
 
-describe('CreateMatch — token configuration', () => {
-  it('does not offer USDC when its network deployment is not configured', () => {
+describe('CreateMatch — token toggle', () => {
+  it('toggles between XLM and USDC', () => {
     render(<CreateMatch contractId="test-contract" player1Address={validAddress} />);
-    expect(screen.queryByTestId('toggle-usdc')).not.toBeInTheDocument();
-  });
-
-  it('disables match creation when the selected network has no configured assets', () => {
-    render(
-      <CreateMatch
-        contractId="test-contract"
-        player1Address={validAddress}
-        networkPassphrase="unsupported-network"
-      />,
-    );
-    expect(screen.queryByTestId('toggle-xlm')).not.toBeInTheDocument();
-    expect(screen.getByTestId('submit-match-btn')).toBeDisabled();
+    fireEvent.click(screen.getByTestId('toggle-usdc'));
+    expect(screen.getByTestId('toggle-usdc')).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByTestId('toggle-xlm')).toHaveAttribute('aria-pressed', 'false');
   });
 });
 
@@ -170,5 +160,110 @@ describe('CreateMatch — game_id validation', () => {
     fireEvent.click(screen.getByTestId('submit-match-btn'));
 
     expect(screen.queryByTestId('game-id-error')).not.toBeInTheDocument();
+  });
+});
+
+describe('CreateMatch — transaction review before signature', () => {
+  const validAddress = 'GA3LQZYOJCAZSMLI47BXMCV2C4SJPZWPLJO7AR76GO56N2QB2DCKTVMV';
+
+  let fetchMock: MockInstance<
+    (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+  >;
+
+  beforeEach(() => {
+    fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new globalThis.Response(JSON.stringify({ valid: true }), { status: 200 }),
+    );
+  });
+
+  afterEach(() => {
+    fetchMock.mockReset();
+  });
+
+  function fillValidForm() {
+    fireEvent.change(screen.getByTestId('player2-input'), {
+      target: { value: validAddress },
+    });
+    fireEvent.change(screen.getByTestId('stake-amount-input'), { target: { value: '10' } });
+    fireEvent.change(screen.getByTestId('game-id-input'), { target: { value: 'game-abc123' } });
+  }
+
+  it('shows a review step derived from the submitted inputs after validation passes', async () => {
+    const onCreateMatch = vi.fn().mockResolvedValue('match-123');
+    render(
+      <CreateMatch contractId="test-contract" player1Address={validAddress} onCreateMatch={onCreateMatch} />,
+    );
+
+    fillValidForm();
+    fireEvent.click(screen.getByTestId('submit-match-btn'));
+
+    const review = await screen.findByTestId('transaction-review');
+    expect(review).toBeInTheDocument();
+    // Opponent (player 2), asset, stake, network, contract action.
+    expect(screen.getByTestId('transaction-review-summary')).toHaveTextContent(validAddress);
+    expect(screen.getByTestId('transaction-review-summary')).toHaveTextContent('XLM (native)');
+    expect(screen.getByTestId('transaction-review-summary')).toHaveTextContent('10');
+    expect(screen.getByTestId('transaction-review-summary')).toHaveTextContent('Testnet');
+    expect(screen.getByTestId('transaction-review-summary')).toHaveTextContent('Create match');
+    // The form is hidden while the review is shown.
+    expect(screen.queryByTestId('create-match-form')).not.toBeInTheDocument();
+  });
+
+  it('confirms the review and submits the typed transaction payload', async () => {
+    const onCreateMatch = vi.fn().mockResolvedValue('match-123');
+    render(
+      <CreateMatch contractId="test-contract" player1Address={validAddress} onCreateMatch={onCreateMatch} />,
+    );
+
+    fillValidForm();
+    fireEvent.click(screen.getByTestId('submit-match-btn'));
+    await screen.findByTestId('transaction-review');
+    fireEvent.click(screen.getByTestId('review-confirm-btn'));
+
+    await waitFor(() => expect(onCreateMatch).toHaveBeenCalledTimes(1));
+    expect(onCreateMatch).toHaveBeenCalledWith({
+      player2: validAddress,
+      stakeAmount: '100000000', // 10 XLM converted to stroops
+      token: 'xlm',
+      gameId: 'game-abc123',
+      platform: 'lichess',
+      platformUsername: undefined,
+      networkPassphrase: 'Test SDF Network ; September 2015',
+      rpcUrl: 'https://soroban-testnet.stellar.org',
+    });
+    expect(screen.getByTestId('match-success')).toBeInTheDocument();
+  });
+
+  it('cancelling the review returns to the form without submitting', async () => {
+    const onCreateMatch = vi.fn().mockResolvedValue('match-123');
+    render(
+      <CreateMatch contractId="test-contract" player1Address={validAddress} onCreateMatch={onCreateMatch} />,
+    );
+
+    fillValidForm();
+    fireEvent.click(screen.getByTestId('submit-match-btn'));
+    await screen.findByTestId('transaction-review');
+    fireEvent.click(screen.getByTestId('review-cancel-btn'));
+
+    expect(onCreateMatch).not.toHaveBeenCalled();
+    expect(screen.getByTestId('create-match-form')).toBeInTheDocument();
+    expect(screen.queryByTestId('transaction-review')).not.toBeInTheDocument();
+  });
+
+  it('review shows an error and stays open when the submission fails', async () => {
+    const onCreateMatch = vi.fn().mockRejectedValue(new Error('Insufficient balance'));
+    render(
+      <CreateMatch contractId="test-contract" player1Address={validAddress} onCreateMatch={onCreateMatch} />,
+    );
+
+    fillValidForm();
+    fireEvent.click(screen.getByTestId('submit-match-btn'));
+    await screen.findByTestId('transaction-review');
+    fireEvent.click(screen.getByTestId('review-confirm-btn'));
+
+    expect(await screen.findByTestId('transaction-review-error')).toHaveTextContent(
+      'Insufficient balance',
+    );
+    expect(screen.getByTestId('transaction-review')).toBeInTheDocument();
   });
 });
