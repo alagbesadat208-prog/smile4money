@@ -66,23 +66,27 @@ pub struct PlayerStats {
     pub draws: u32,
     /// Total amount won, in the token's smallest unit.
     pub earnings: i128,
-    /// Address of the token `earnings` is denominated in.
-    pub token: Address,
+       /// Address of the token `earnings` is denominated in.
+    ///
+    /// `None` means no earnings have been recorded yet, so there is no
+    /// denomination. It is set to `Some(token)` when the first result is recorded.
+    pub token: Option<Address>,
 }
 
 impl PlayerStats {
     /// A zeroed record for a player who has not been seen.
     ///
-    /// Written by hand rather than derived from `Default` because `Address` has
-    /// no `Default` impl. Returning a zeroed record (rather than `None`) keeps
-    /// `get_stats` total — a caller never has to handle an absent player.
-    pub fn empty(token: &Address) -> Self {
+    /// `token` is `None`: no earnings exist yet, so no denomination is claimed.
+    /// Returning a zeroed record keeps `get_stats` total — a caller never has to
+    /// handle an absent player — and `token == None` is the unambiguous marker
+    /// for "nothing recorded".
+    pub fn empty() -> Self {
         PlayerStats {
             wins: 0,
             losses: 0,
             draws: 0,
             earnings: 0,
-            token: token.clone(),
+            token: None,
         }
     }
 

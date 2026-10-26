@@ -226,7 +226,7 @@ impl LeaderboardContract {
                 let mut w_stats = Self::load_stats(&env, w);
                 w_stats.wins += 1;
                 w_stats.earnings += payout;
-                w_stats.token = token.clone();
+                w_stats.token = Some(token.clone());
                 Self::store_stats(&env, w, &w_stats);
 
                 let mut l_stats = Self::load_stats(&env, l);
@@ -269,7 +269,7 @@ impl LeaderboardContract {
         Ok(())
     }
 
-    /// Read one player's record. Returns zeros for a player never seen.
+    /// Read one player's record. A player never seen gets zeros and `token == None`.
     pub fn get_stats(env: Env, player: Address) -> PlayerStats {
         Self::load_stats(&env, &player)
     }
@@ -412,7 +412,7 @@ impl LeaderboardContract {
         env.storage()
             .persistent()
             .get(&DataKey::Stats(player.clone()))
-            .unwrap_or_else(|| PlayerStats::empty(player))
+            .unwrap_or_else(|| PlayerStats::empty())
     }
 
     /// Write a player's stats and bump their TTL.
