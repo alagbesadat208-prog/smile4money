@@ -4,7 +4,7 @@ mod errors;
 mod types;
 
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, String, Symbol, Vec};
 use types::{Bracket, DataKey, Node, NodeState, Slot};
 
 /// ~30 days at 5s/ledger. Used as both the TTL threshold and the extend-to value.
@@ -12,6 +12,9 @@ const BRACKET_TTL_LEDGERS: u32 = 518_400;
 
 /// Largest supported bracket: 256 first round sides, 8 rounds.
 pub const MAX_BRACKET_SIZE: u32 = 256;
+
+/// Maximum allowed byte length for an external `game_id` string.
+pub const MAX_GAME_ID_LEN: u32 = 64;
 
 /// Default review window in ledgers (~10 minutes at 5s/ledger) during which a
 /// reported match result remains in [`NodeState::UnderReview`] and can be
@@ -37,6 +40,22 @@ pub const DEFAULT_REVIEW_WINDOW_LEDGERS: u32 = 120;
 /// * An **unfilled node** still has a vacant side. It is neither a bye nor a
 ///   void: it is simply not decided yet and cannot be played.
 ///
+/// ## Node Game Identifiers
+///
+/// Each playable node can be bound to a unique external `game_id` within its
+/// tournament via [`BracketContract::set_node_game_id`] or when reporting a
+/// result via [`BracketContract::submit_result_with_game_id`]:
+///
+/// * Duplicate `game_id` values within the same tournament are rejected with
+///   [`Error::DuplicateGameId`].
+/// * Empty or oversized (`> 64` bytes) identifiers are rejected with
+///   [`Error::InvalidGameId`].
+/// * Once a node is finalized ([`NodeState::Resolved`]), its `game_id` is
+///   immutable and any attempt to replace it fails with
+///   [`Error::AlreadyResolved`].
+/// * Reporting a result with a `game_id` that disagrees with the node's bound
+///   identifier fails with [`Error::GameIdMismatch`].
+///
 /// ## Distinct-Participant Invariant
 ///
 /// No participant may occupy more than one slot in a bracket or both sides of
@@ -55,11 +74,11 @@ pub const DEFAULT_REVIEW_WINDOW_LEDGERS: u32 = 120;
 ///
 /// ## Result Review Window
 ///
-/// Reporting a match outcome via [`BracketContract::submit_result`] does not
-/// immediately advance the player. Instead, the node enters
-/// [`NodeState::UnderReview`] with a deadline of
-/// `env.ledger().sequence() + bracket.review_window_ledgers` (defaulting to
-/// [`DEFAULT_REVIEW_WINDOW_LEDGERS`] and configurable via
+/// Reporting a match outcome via [`BracketContract::submit_result`] or
+/// [`BracketContract::submit_result_with_game_id`] does not immediately advance
+/// the player. Instead, the node enters [`NodeState::UnderReview`] with a
+/// deadline of `env.ledger().sequence() + bracket.review_window_ledgers`
+/// (defaulting to [`DEFAULT_REVIEW_WINDOW_LEDGERS`] and configurable via
 /// [`BracketContract::set_review_config`]):
 ///
 /// * While `env.ledger().sequence() < review_deadline`:
@@ -84,9 +103,11 @@ pub const DEFAULT_REVIEW_WINDOW_LEDGERS: u32 = 120;
 ///   - [`BracketContract::create_seeded_bracket`]
 ///   - [`BracketContract::create_paid_bracket`]
 ///   - [`BracketContract::set_review_config`]
+///   - [`BracketContract::set_node_game_id`]
 ///   - [`BracketContract::register`]
 ///   - [`BracketContract::lock_registration`]
 ///   - [`BracketContract::submit_result`]
+///   - [`BracketContract::submit_result_with_game_id`]
 ///   - [`BracketContract::amend_result`]
 ///   - [`BracketContract::finalize_result`]
 ///   - [`BracketContract::advance_bye`]
@@ -98,8 +119,8 @@ pub const DEFAULT_REVIEW_WINDOW_LEDGERS: u32 = 120;
 ///     incomplete bracket so participants remain able to withdraw even after
 ///     emergency mode is lifted.
 ///   - [`BracketContract::unpause`] — admin can lift emergency mode.
-///   - Read queries (`is_paused`, `get_bracket`, `get_node`, `get_node_state`,
-///     `get_champion`).
+///   - Read queries (`is_paused`, `get_bracket`, `get_node`,
+///     `get_node_by_game_id`, `get_node_state`, `get_champion`).
 #[contract]
 pub struct BracketContract;
 
@@ -257,6 +278,58 @@ impl BracketContract {
         Ok(())
     }
 
+    /// Associate a unique external `game_id` with a playable bracket node —
+    /// bracket admin only.
+    ///
+    /// * Rejects empty or oversized (`> MAX_GAME_ID_LEN`) identifiers with
+    ///   [`Error::InvalidGameId`].
+    /// * Rejects `game_id` values already used in the same bracket with
+    ///   [`Error::DuplicateGameId`].
+    /// * Rejects attempts to replace a finalized ([`NodeState::Resolved`])
+    ///   node's `game_id` with [`Error::AlreadyResolved`].
+    /// * Rejects non-playable (`ByeAdvance`, `Void`) or unfilled
+    ///   (`AwaitingParticipants`) nodes with [`Error::NotPlayable`] /
+    ///   [`Error::SlotVacant`].
+    pub fn set_node_game_id(
+        env: Env,
+        bracket_id: u64,
+        node_id: u64,
+        game_id: String,
+        caller: Address,
+    ) -> Result<(), Error> {
+        if Self::paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        Self::validate_game_id(&game_id)?;
+
+        let bracket = Self::load_bracket(&env, bracket_id)?;
+        if caller != bracket.admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        if bracket.cancelled {
+            return Err(Error::BracketCancelled);
+        }
+
+        let mut node = Self::load_node(&env, bracket_id, node_id)?;
+        match Self::node_state(&node, &bracket)? {
+            NodeState::AwaitingParticipants => return Err(Error::SlotVacant),
+            NodeState::ByeAdvance(_) | NodeState::Void => return Err(Error::NotPlayable),
+            NodeState::Resolved(_) => return Err(Error::AlreadyResolved),
+            NodeState::Ready | NodeState::UnderReview(_, _) => {}
+        }
+
+        Self::bind_game_id(&env, bracket_id, &mut node, game_id.clone())?;
+        Self::save_node(&env, &node);
+
+        env.events().publish(
+            (Symbol::new(&env, "bracket"), symbol_short!("game_id")),
+            (bracket_id, node_id, game_id),
+        );
+
+        Ok(())
+    }
+
     /// Register `participant` in the next free side of the first round.
     ///
     /// Sides are handed out in order of the first vacant slot. A participant
@@ -376,53 +449,26 @@ impl BracketContract {
         winner: Address,
         caller: Address,
     ) -> Result<(), Error> {
-        if Self::paused(&env) {
-            return Err(Error::ContractPaused);
-        }
+        Self::submit_result_internal(&env, bracket_id, node_id, None, winner, caller)
+    }
 
-        let bracket = Self::load_bracket(&env, bracket_id)?;
-        if caller != bracket.admin {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
-        if bracket.cancelled {
-            return Err(Error::BracketCancelled);
-        }
-
-        let mut node = Self::load_node(&env, bracket_id, node_id)?;
-        match Self::node_state(&node, &bracket)? {
-            // The node is not decided yet, it is not a bye either.
-            NodeState::AwaitingParticipants => return Err(Error::SlotVacant),
-            // A bye or a void node is never played.
-            NodeState::ByeAdvance(_) | NodeState::Void => return Err(Error::NotPlayable),
-            NodeState::UnderReview(_, _) | NodeState::Resolved(_) => {
-                return Err(Error::AlreadyResolved)
-            }
-            NodeState::Ready => {}
-        }
-
-        let is_participant = matches!(&node.slot1, Slot::Filled(a) if *a == winner)
-            || matches!(&node.slot2, Slot::Filled(a) if *a == winner);
-        if !is_participant {
-            return Err(Error::InvalidWinner);
-        }
-
-        let deadline = env
-            .ledger()
-            .sequence()
-            .checked_add(bracket.review_window_ledgers)
-            .ok_or(Error::Overflow)?;
-
-        node.pending_winner = Some(winner.clone());
-        node.review_deadline = Some(deadline);
-        Self::save_node(&env, &node);
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("reported")),
-            (bracket_id, node_id, winner, deadline),
-        );
-
-        Ok(())
+    /// Report the provisional winner of a match while verifying or persisting
+    /// the node's external `game_id`.
+    ///
+    /// * If the node already has a `game_id`, `game_id` must match it or the
+    ///   call fails with [`Error::GameIdMismatch`].
+    /// * If the node does not yet have a `game_id`, `game_id` is validated for
+    ///   uniqueness within the bracket (`Error::DuplicateGameId`) and stored on
+    ///   the node.
+    pub fn submit_result_with_game_id(
+        env: Env,
+        bracket_id: u64,
+        node_id: u64,
+        game_id: String,
+        winner: Address,
+        caller: Address,
+    ) -> Result<(), Error> {
+        Self::submit_result_internal(&env, bracket_id, node_id, Some(game_id), winner, caller)
     }
 
     /// Amend a provisional match result while its review window is still open.
@@ -659,6 +705,16 @@ impl BracketContract {
         Self::load_node(&env, bracket_id, node_id)
     }
 
+    /// Read a node by its bound external `game_id` within `bracket_id`.
+    pub fn get_node_by_game_id(env: Env, bracket_id: u64, game_id: String) -> Result<Node, Error> {
+        let node_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GameId(bracket_id, game_id))
+            .ok_or(Error::NotFound)?;
+        Self::load_node(&env, bracket_id, node_id)
+    }
+
     /// Read the state of a node.
     ///
     /// The state tells a bye apart from a node that is still waiting for
@@ -693,6 +749,107 @@ impl BracketContract {
         }
         caller.require_auth();
         Ok(admin)
+    }
+
+    fn validate_game_id(game_id: &String) -> Result<(), Error> {
+        if game_id.is_empty() || game_id.len() > MAX_GAME_ID_LEN {
+            return Err(Error::InvalidGameId);
+        }
+        Ok(())
+    }
+
+    fn bind_game_id(
+        env: &Env,
+        bracket_id: u64,
+        node: &mut Node,
+        game_id: String,
+    ) -> Result<(), Error> {
+        let key = DataKey::GameId(bracket_id, game_id.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::DuplicateGameId);
+        }
+
+        if let Some(ref previous_game_id) = node.game_id {
+            let old_key = DataKey::GameId(bracket_id, previous_game_id.clone());
+            env.storage().persistent().remove(&old_key);
+        }
+
+        env.storage().persistent().set(&key, &node.node_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BRACKET_TTL_LEDGERS, BRACKET_TTL_LEDGERS);
+        node.game_id = Some(game_id);
+        Ok(())
+    }
+
+    fn submit_result_internal(
+        env: &Env,
+        bracket_id: u64,
+        node_id: u64,
+        game_id: Option<String>,
+        winner: Address,
+        caller: Address,
+    ) -> Result<(), Error> {
+        if Self::paused(env) {
+            return Err(Error::ContractPaused);
+        }
+
+        let bracket = Self::load_bracket(env, bracket_id)?;
+        if caller != bracket.admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        if bracket.cancelled {
+            return Err(Error::BracketCancelled);
+        }
+
+        let mut node = Self::load_node(env, bracket_id, node_id)?;
+        match Self::node_state(&node, &bracket)? {
+            // The node is not decided yet, it is not a bye either.
+            NodeState::AwaitingParticipants => return Err(Error::SlotVacant),
+            // A bye or a void node is never played.
+            NodeState::ByeAdvance(_) | NodeState::Void => return Err(Error::NotPlayable),
+            NodeState::UnderReview(_, _) | NodeState::Resolved(_) => {
+                return Err(Error::AlreadyResolved)
+            }
+            NodeState::Ready => {}
+        }
+
+        let is_participant = matches!(&node.slot1, Slot::Filled(a) if *a == winner)
+            || matches!(&node.slot2, Slot::Filled(a) if *a == winner);
+        if !is_participant {
+            return Err(Error::InvalidWinner);
+        }
+
+        if let Some(provided_game_id) = game_id {
+            Self::validate_game_id(&provided_game_id)?;
+            match &node.game_id {
+                Some(existing) if *existing != provided_game_id => {
+                    return Err(Error::GameIdMismatch);
+                }
+                Some(_) => {}
+                None => {
+                    Self::bind_game_id(env, bracket_id, &mut node, provided_game_id)?;
+                }
+            }
+        }
+
+        let deadline = env
+            .ledger()
+            .sequence()
+            .checked_add(bracket.review_window_ledgers)
+            .ok_or(Error::Overflow)?;
+
+        node.pending_winner = Some(winner.clone());
+        node.review_deadline = Some(deadline);
+        Self::save_node(env, &node);
+
+        env.events().publish(
+            (Symbol::new(env, "bracket"), symbol_short!("reported")),
+            (bracket_id, node_id, winner, deadline),
+        );
+
+        Ok(())
     }
 
     fn assign_node_side(node: &mut Node, side: u32, participant: Address) -> Result<(), Error> {
@@ -760,6 +917,7 @@ impl BracketContract {
                     index,
                     slot1: Slot::Vacant,
                     slot2: Slot::Vacant,
+                    game_id: None,
                     pending_winner: None,
                     review_deadline: None,
                     winner: None,
@@ -798,6 +956,7 @@ impl BracketContract {
                 if node.winner.is_some()
                     || node.pending_winner.is_some()
                     || node.review_deadline.is_some()
+                    || node.game_id.is_some()
                 {
                     return Err(Error::MalformedNode);
                 }
@@ -807,6 +966,11 @@ impl BracketContract {
                 if p1 == p2 {
                     // Nobody plays against themselves.
                     return Err(Error::MalformedNode);
+                }
+                if let Some(ref gid) = node.game_id {
+                    if Self::validate_game_id(gid).is_err() {
+                        return Err(Error::MalformedNode);
+                    }
                 }
                 match (&node.winner, &node.pending_winner, node.review_deadline) {
                     (Some(w), None, None) if w == p1 || w == p2 => {
@@ -824,8 +988,9 @@ impl BracketContract {
                 if node.winner.is_some()
                     || node.pending_winner.is_some()
                     || node.review_deadline.is_some()
+                    || node.game_id.is_some()
                 {
-                    // A bye node is never played, so it cannot carry a winner.
+                    // A bye node is never played, so it cannot carry a winner or game_id.
                     return Err(Error::MalformedNode);
                 }
                 Ok(NodeState::ByeAdvance(p.clone()))
@@ -835,6 +1000,7 @@ impl BracketContract {
                 if node.winner.is_some()
                     || node.pending_winner.is_some()
                     || node.review_deadline.is_some()
+                    || node.game_id.is_some()
                 {
                     return Err(Error::MalformedNode);
                 }

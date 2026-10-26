@@ -2,7 +2,7 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Env, Vec,
+    vec, Address, Env, String, Vec,
 };
 
 fn setup() -> (Env, Address, BracketContractClient<'static>, Address) {
@@ -627,4 +627,121 @@ fn prop_distinct_participants_across_all_supported_bracket_sizes_and_byes() {
             assert!(found);
         }
     }
+}
+
+#[test]
+fn test_persist_unique_game_id_and_reject_duplicates_or_finalized_replacement() {
+    let (env, _contract_id, client, admin) = setup();
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+    let p4 = Address::generate(&env);
+
+    // 4-slot bracket with 3 participants: node 0 is Ready (p1 vs p2), node 1 is a Bye (p3).
+    let bracket_id = client.create_bracket(&4);
+    client.register(&bracket_id, &p1);
+    client.register(&bracket_id, &p2);
+    client.register(&bracket_id, &p3);
+
+    let g1 = String::from_str(&env, "lichess-match-001");
+    let g1_updated = String::from_str(&env, "lichess-match-001-rematch");
+    let g2 = String::from_str(&env, "lichess-match-002");
+    let empty_id = String::from_str(&env, "");
+    let oversized_id = String::from_str(
+        &env,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefX",
+    );
+
+    // Unfilled node (node 1 before lock has a Vacant slot) rejects setting a game ID.
+    assert_eq!(
+        client.try_set_node_game_id(&bracket_id, &1, &g1, &admin),
+        Err(Ok(Error::SlotVacant))
+    );
+
+    client.lock_registration(&bracket_id, &admin);
+
+    // Bye node (node 1 after lock) is not playable and rejects setting a game ID.
+    assert_eq!(
+        client.try_set_node_game_id(&bracket_id, &1, &g1, &admin),
+        Err(Ok(Error::NotPlayable))
+    );
+
+    // Invalid (empty or >64 byte) game IDs are rejected.
+    assert_eq!(
+        client.try_set_node_game_id(&bracket_id, &0, &empty_id, &admin),
+        Err(Ok(Error::InvalidGameId))
+    );
+    assert_eq!(
+        client.try_set_node_game_id(&bracket_id, &0, &oversized_id, &admin),
+        Err(Ok(Error::InvalidGameId))
+    );
+
+    // Bind g1 to playable node 0 and verify persistence and lookup.
+    client.set_node_game_id(&bracket_id, &0, &g1, &admin);
+    assert_eq!(client.get_node(&bracket_id, &0).game_id, Some(g1.clone()));
+    assert_eq!(client.get_node_by_game_id(&bracket_id, &g1).node_id, 0);
+
+    // Duplicate assignment of the same game ID in the same bracket is rejected.
+    assert_eq!(
+        client.try_set_node_game_id(&bracket_id, &0, &g1, &admin),
+        Err(Ok(Error::DuplicateGameId))
+    );
+
+    // Before finalization, replacing node 0's game ID with a new unique ID is allowed
+    // and frees the previous game ID.
+    client.set_node_game_id(&bracket_id, &0, &g1_updated, &admin);
+    assert_eq!(
+        client.get_node(&bracket_id, &0).game_id,
+        Some(g1_updated.clone())
+    );
+    assert_eq!(
+        client.try_get_node_by_game_id(&bracket_id, &g1),
+        Err(Ok(Error::NotFound))
+    );
+
+    // Submitting a result with a mismatched game ID is rejected.
+    assert_eq!(
+        client.try_submit_result_with_game_id(&bracket_id, &0, &g2, &p1, &admin),
+        Err(Ok(Error::GameIdMismatch))
+    );
+
+    // Submitting a result with the matching stored game ID succeeds.
+    client.submit_result_with_game_id(&bracket_id, &0, &g1_updated, &p1, &admin);
+    advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
+    client.finalize_result(&bracket_id, &0);
+
+    // Once node 0 is finalized (Resolved), replacing its game ID is rejected with AlreadyResolved.
+    assert_eq!(
+        client.try_set_node_game_id(&bracket_id, &0, &g2, &admin),
+        Err(Ok(Error::AlreadyResolved))
+    );
+    assert_eq!(
+        client.get_node(&bracket_id, &0).game_id,
+        Some(g1_updated.clone())
+    );
+
+    // Final node (node 2) is now Ready (p1 vs p3). Attempting to reuse node 0's
+    // game ID (`g1_updated`) on node 2 in the same tournament is rejected with DuplicateGameId.
+    assert_eq!(
+        client.try_set_node_game_id(&bracket_id, &2, &g1_updated, &admin),
+        Err(Ok(Error::DuplicateGameId))
+    );
+    assert_eq!(
+        client.try_submit_result_with_game_id(&bracket_id, &2, &g1_updated, &p1, &admin),
+        Err(Ok(Error::DuplicateGameId))
+    );
+
+    // Submitting node 2's result with a fresh unique game ID (`g2`) persists `g2` on node 2.
+    client.submit_result_with_game_id(&bracket_id, &2, &g2, &p1, &admin);
+    assert_eq!(client.get_node(&bracket_id, &2).game_id, Some(g2.clone()));
+    assert_eq!(client.get_node_by_game_id(&bracket_id, &g2).node_id, 2);
+
+    // A separate tournament bracket can independently use `g1_updated`.
+    let other_bracket = client.create_seeded_bracket(&2, &vec![&env, p3.clone(), p4.clone()]);
+    client.lock_registration(&other_bracket, &admin);
+    client.set_node_game_id(&other_bracket, &0, &g1_updated, &admin);
+    assert_eq!(
+        client.get_node(&other_bracket, &0).game_id,
+        Some(g1_updated)
+    );
 }
