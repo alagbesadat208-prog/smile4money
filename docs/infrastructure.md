@@ -186,96 +186,31 @@ All secrets are managed through GitHub Actions Secrets. No secret values are eve
 - `Cargo.lock` is committed and kept up to date. Do not add `Cargo.lock` to `.gitignore`.
 - When updating a dependency, run the full CI suite locally before pushing.
 
-### Frontend and backend environment isolation
+### GitHub Actions pinning
 
-The frontend public schema is defined in
-`apps/frontend/src/config/public-env.ts` and contains only `VITE_*` values.
-Backend credentials are defined in `apps/backend/src/config/private-env.ts` and
-must never be renamed with the `VITE_` prefix. Vite exposes `VITE_*` values in
-the browser bundle, so server-only names and values must stay in backend
-configuration.
+Every third-party action in `.github/workflows/` must use a full 40-character
+commit SHA rather than a mutable tag or branch. The `action-pins` job in
+`.github/workflows/ci.yml` runs `scripts/check-github-action-pins.sh` on every
+push and pull request and rejects any unpinned reference. Local actions are
+allowed to use a relative path.
 
-The frontend production build runs `npm run check:bundle-env`, which scans
-`dist/` for known server-only variable names and values and fails if any are
-present. The scan is also run in the frontend CI job after the production
-build.
+Dependabot checks GitHub Actions weekly and opens update pull requests. Review
+the referenced commit and its release notes before merging; update the version
+comment beside the SHA when the action release changes. If an urgent security
+update is needed, update the SHA in a dedicated pull request and run the full
+CI suite before merging.
 
 ---
 
 ## 8. Observability
 
-Settlement age monitoring is available (see 8.1). Contract event indexing and Oracle uptime monitoring are not yet configured; this is acceptable for testnet but must be addressed before mainnet launch.
+No monitoring or alerting is currently configured. This is acceptable for testnet but must be addressed before mainnet launch.
 
 ### Planned work (pre-mainnet)
 
 - **Contract event indexing:** Set up a Stellar Horizon or custom event listener to index `match.created`, `match.completed`, `match.cancelled`, and `oracle.result` events. These events are already emitted by the contracts.
 - **Oracle health check:** The Oracle service should expose a `/health` endpoint. A simple uptime monitor (e.g., GitHub Actions scheduled ping, or an external service) should alert if the Oracle goes down.
 - **Deployment verification:** After each deploy, run a smoke test that calls `get_match` on a known match ID (or creates a test match) to confirm the deployed contract is responsive.
-
-### 8.1 Settlement age monitoring
-
-A process can be healthy while active matches silently wait too long for a game result or for the chain. The settlement age monitor (`apps/backend/src/services/settlement-age-monitor.ts`) records when each match reaches each stage and publishes age percentiles and threshold alerts. It is **observability only**: it records timestamps, logs metrics and raises alerts. It never changes what is submitted and never reverses or settles anything.
-
-**Stages** (the first timestamp recorded for a match wins):
-
-| Stage | Recorded when |
-|-------|---------------|
-| `activated` | The backend starts tracking the match (its polling job was created). Synced from the polling store on every publish tick. |
-| `provider_result` | The chess platform reported a final result (`onGameCompleted`). |
-| `submission_started` | The first attempt to put the result on-chain begins. |
-| `chain_confirmed` | The result is confirmed on-chain (the submission handler succeeded, or the result already existed). |
-
-**Segments.** Each segment is measured and alerted on separately, so a slow chess platform is never confused with a slow chain submission:
-
-| Segment | From | To | Default threshold |
-|---------|------|----|-------------------|
-| `provider_wait` | `activated` | `provider_result` | 24 hours |
-| `submission_lag` | `provider_result` | `submission_started` | 10 minutes |
-| `chain_delay` | `submission_started` | `chain_confirmed` | 15 minutes |
-| `total` | `activated` | `chain_confirmed` | 48 hours |
-
-`chain_delay` includes retry back-off, because it runs from the first submission attempt until confirmation.
-
-**Published metrics.** Every publish interval (default 60 seconds) one structured log line is written: message `settlement_age_metrics`, field `metric: "settlement_age"`. It contains:
-
-- `completed.<segment>`: count, p50, p90, p95, p99 and max (ms) over the most recent completed matches (default window 200).
-- `open.<segment>`: the same percentiles for matches still waiting, measured from when they entered the segment they are currently in, plus `overThreshold` and `stuckMatchIds`.
-- `openMatches`, `completedInWindow`, `abandoned`, `evicted`, `alerts` and the active `thresholds`.
-
-Set `HEALTH_INCLUDE_SETTLEMENT=true` to also return the same snapshot as `settlement` from the `/health` endpoint.
-
-**Alerts.**
-
-| Alert id | Raised when |
-|----------|-------------|
-| `<segment>_stuck` | At least one waiting match is older than the segment threshold. Carries the count, the oldest age and up to 5 match ids. |
-| `<segment>_slow_p95` | The p95 of recently completed matches is above the threshold (needs at least `SETTLEMENT_AGE_MIN_SAMPLES` samples). |
-
-Each alert is logged once when raised (`settlement_age_alert_raised`, level error) and once when it clears (`settlement_age_alert_cleared`, level info), not once per tick.
-
-**Reading the alerts.**
-
-- `provider_wait_*`: the game is not finished or the chess platform is not answering. Check the platform status pages in the contact list (section 7 of the runbook) and the polling logs.
-- `submission_lag_*`: the game finished but the backend has not started submitting. Check that the submission pipeline and retry worker are running.
-- `chain_delay_*`: a submission was started but is not confirmed. Check Stellar RPC health, the circuit breaker state and `oracle_dlq_depth`.
-- `total_*`: a match is old overall. Use the other alerts to find which segment it is stuck in.
-
-**Configuration** (invalid values stop the server at startup):
-
-| Environment variable | Default |
-|----------------------|---------|
-| `SETTLEMENT_AGE_MONITOR_ENABLED` | `true` |
-| `SETTLEMENT_AGE_PUBLISH_INTERVAL_MS` | 60000 |
-| `SETTLEMENT_AGE_PROVIDER_WAIT_MS` | 86400000 |
-| `SETTLEMENT_AGE_SUBMISSION_LAG_MS` | 600000 |
-| `SETTLEMENT_AGE_CHAIN_DELAY_MS` | 900000 |
-| `SETTLEMENT_AGE_TOTAL_MS` | 172800000 |
-| `SETTLEMENT_AGE_COMPLETED_WINDOW` | 200 |
-| `SETTLEMENT_AGE_MIN_SAMPLES` | 5 |
-| `SETTLEMENT_AGE_MAX_TRACKED` | 10000 |
-| `HEALTH_INCLUDE_SETTLEMENT` | `false` |
-
-Matches that time out or are moved to the dead-letter queue are dropped from tracking and counted in `abandoned`, so they stop aging.
 
 ---
 
@@ -335,47 +270,3 @@ These items are not yet implemented and represent the next infrastructure work t
 | `environments.toml` | Network RPC URLs and passphrases |
 | `.env.example` | Template for environment variables |
 | `rust-toolchain.toml` | Pinned Rust toolchain |
-
-### SQLite production concurrency
-
-SQLite supports **one backend process in one replica**, with database files on a
-local persistent volume. Each connection uses WAL journal mode and a busy timeout
-of 5,000 ms; existing bounded lock retries remain enabled. Concurrent requests
-within that process are supported; SQLite serializes their writes. WAL permits
-readers alongside the single active writer. Do not place these files on a network
-filesystem or share them across containers/hosts.
-
-Set `SQLITE_CONCURRENCY_MODE=single-process` (the default), `BACKEND_REPLICAS=1`,
-and `WEB_CONCURRENCY=1`. Startup rejects another mode or a declared process/replica
-count other than one, for every SQLite store. Set `SQLITE_BUSY_TIMEOUT_MS` to an
-integer from 1 through 60,000 to change the per-connection wait. Deployment
-manifests must declare the real replica/worker counts: the service cannot discover
-undeclared replicas. This restriction covers matches, rate limits, queue, and
-circuit-breaker state, even if `QUEUE_STORE` uses another backend. Scaling requires
-migrating all local stores and coordinating workers first.
-
-### Oracle signer rotation
-
-Mount the current Stellar secret seed in a secret-manager-owned file and set
-`ORACLE_SIGNER_SECRET_FILE` to its path. Restrict file access to the service user.
-Set `STELLAR_RPC_URL` and `CONTRACT_ORACLE` for the deployed oracle. The service
-loads the seed at startup and before each submission attempt, then reads the
-contract's active `InstanceState.admin` from RPC and compares it to the public
-key. Missing, malformed, unauthorized keys or an unavailable role lookup fail
-closed before submission. A pending admin proposal is insufficient.
-
-Complete the contract's `propose_admin` / `accept_admin` transfer and atomically
-replace the mounted secret file with the new seed. Pause workers during the
-transfer if uninterrupted attempts matter; failures in the transition leave jobs
-queued. Restarting is unnecessary for a running worker to pick up the file.
-Jobs contain submission data only, never a seed or signer address; do not rewrite
-or discard pending jobs. The retry worker removes a job only after its handler
-succeeds and does not create a replacement job on failure.
-
-The transport prepares `submit_result` with Soroban RPC, signs with that attempt's
-validated key, and confirms the transaction before removing the job. On an
-ambiguous timeout the job stays queued; the next attempt queries `has_result`
-before submitting again. Set `STELLAR_NETWORK=testnet` (default) or `mainnet`, or
-provide `STELLAR_NETWORK_PASSPHRASE` explicitly for a custom network. The source
-account must be funded, and the deployed contract must use the current oracle
-`InstanceState` storage layout.

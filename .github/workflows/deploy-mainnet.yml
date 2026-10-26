@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Issue #125: no mainnet deploy without a release review that records
       # every readiness gate and a GO decision (docs/runbook.md §8).
@@ -26,13 +26,13 @@ jobs:
         run: python3 scripts/check_release_review.py "$REVIEW"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
         with:
           toolchain: 1.88.0
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: actions/cache@v3
+        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           path: |
             ~/.cargo/registry
