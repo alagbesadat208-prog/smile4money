@@ -69,7 +69,9 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::ResultCount, &0u32);
-        env.storage().instance().set(&DataKey::Sources(source.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::Sources(source.clone()), &true);
 
         env.events().publish(
             (Symbol::new(&env, "admin"), symbol_short!("init")),
@@ -102,7 +104,11 @@ impl LeaderboardContract {
     pub fn remove_source(env: Env, source: Address, caller: Address) -> Result<(), Error> {
         Self::require_admin(&env, &caller)?;
 
-        if !env.storage().instance().has(&DataKey::Sources(source.clone())) {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Sources(source.clone()))
+        {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().remove(&DataKey::Sources(source));
@@ -135,8 +141,11 @@ impl LeaderboardContract {
     }
 
     /// Return whether result recording is paused.
-    pub fn is_paused(env: Env) -> bool {
-        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+    pub fn is_paused(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Record the outcome of one completed match.
@@ -164,7 +173,11 @@ impl LeaderboardContract {
         token: Address,
         caller: Address,
     ) -> Result<(), Error> {
-        if !env.storage().instance().has(&DataKey::Sources(caller.clone())) {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Sources(caller.clone()))
+        {
             return Err(Error::Unauthorized);
         }
         if Self::is_paused(&env) {
@@ -193,8 +206,25 @@ impl LeaderboardContract {
             (Some(w), Some(l)) => {
                 let mut w_stats = Self::load_stats(&env, w);
                 w_stats.wins += 1;
-                w_stats.earnings += payout;
-                w_stats.token = token.clone();
+                let mut asset_index = 0;
+                let mut asset_found = false;
+                while asset_index < w_stats.earnings_by_asset.len() {
+                    let mut earnings = w_stats.earnings_by_asset.get(asset_index).unwrap();
+                    if earnings.token == token {
+                        earnings.amount =
+                            earnings.amount.checked_add(payout).ok_or(Error::Overflow)?;
+                        w_stats.earnings_by_asset.set(asset_index, earnings);
+                        asset_found = true;
+                        break;
+                    }
+                    asset_index += 1;
+                }
+                if !asset_found {
+                    w_stats.earnings_by_asset.push_back(AssetEarnings {
+                        token: token.clone(),
+                        amount: payout,
+                    });
+                }
                 Self::store_stats(&env, w, &w_stats);
 
                 let mut l_stats = Self::load_stats(&env, l);
@@ -217,7 +247,11 @@ impl LeaderboardContract {
         Self::add_to_roster(&env, &player1);
         Self::add_to_roster(&env, &player2);
 
-        let count: u32 = env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ResultCount)
+            .unwrap_or(0);
         env.storage()
             .instance()
             .set(&DataKey::ResultCount, &count.saturating_add(1));
@@ -236,7 +270,10 @@ impl LeaderboardContract {
 
     /// Return how many results have been recorded.
     pub fn result_count(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::ResultCount).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::ResultCount)
+            .unwrap_or(0)
     }
 
     /// Read the admin address — used by off-chain tooling to build a
@@ -248,7 +285,7 @@ impl LeaderboardContract {
             .ok_or(Error::NotInitialized)
     }
 
-    /// Return a page of the leaderboard, ranked by wins then earnings.
+    /// Return a page of the leaderboard, ranked by wins and address.
     ///
     /// Paging is `offset`-based. `limit` is capped at [`MAX_PAGE_SIZE`], so a
     /// caller asking for more gets one full page rather than a response too
@@ -256,15 +293,13 @@ impl LeaderboardContract {
     ///
     /// ## Ranking and its limits
     ///
-    /// Rows are ordered by **wins** descending, then `earnings` descending,
-    /// then address ascending as a tie-break. The final tie-break matters: two
+    /// Rows are ordered by **wins** descending, then address ascending. The
+    /// address tie-break matters: two
     /// players with identical records must come back in a stable order, or
     /// paging would show duplicates on one page and skip rows on the next.
     ///
-    /// The earnings tie-break is only meaningful **within a single token** —
-    /// a raw stroop count of USDC and one of XLM are not comparable numbers.
-    /// The `token` field is returned on every row so a caller can group or
-    /// label by currency rather than silently adding unlike units together.
+    /// Earnings are returned separately by token and are never compared across
+    /// denominations when ranking.
     ///
     /// Only players with at least one completed match appear. A caller paging
     /// to the end gets a short page rather than an error, which is the normal
@@ -305,7 +340,7 @@ impl LeaderboardContract {
         let roster_len = roster.len();
         let mut idx = 0u32;
         while idx < roster_len {
-            let player = roster.get(idx);
+            let player = roster.get(idx).unwrap();
             let stats = Self::load_stats(&env, &player);
             if stats.matches_played() > 0 {
                 ranked.push_back((player, stats));
@@ -313,8 +348,7 @@ impl LeaderboardContract {
             idx += 1;
         }
 
-        // Insertion sort, descending by (wins, earnings) with an ascending
-        // address tie-break.
+        // Insertion sort, descending by wins with an ascending address tie-break.
         //
         // Why not sort in Rust and worry about cost? Because `Vec::sort` is
         // unavailable in `no_std` for Soroban's ordered collections, and
@@ -326,9 +360,12 @@ impl LeaderboardContract {
         let len = ranked.len();
         for i in 1..len {
             let mut j = i;
-            while j > 0 && Self::ranks_after(&ranked.get(j - 1), &ranked.get(j)) {
-                let prev = ranked.get(j - 1);
-                let cur = ranked.get(j);
+            while j > 0 {
+                let prev = ranked.get(j - 1).unwrap();
+                let cur = ranked.get(j).unwrap();
+                if !Self::ranks_after(&prev, &cur) {
+                    break;
+                }
                 ranked.set(j, prev);
                 ranked.set(j - 1, cur);
                 j -= 1;
@@ -339,11 +376,11 @@ impl LeaderboardContract {
             return Err(Error::InvalidRange);
         }
 
-        let end = core::cmp::min(ranked.len(), offset.saturating_add(limit) as usize);
+        let end = core::cmp::min(ranked.len(), offset.saturating_add(limit));
         let mut out: Vec<LeaderboardEntry> = Vec::new(&env);
-        let mut i = offset as usize;
+        let mut i = offset;
         while i < end {
-            let (player, stats) = ranked.get(i);
+            let (player, stats) = ranked.get(i).unwrap();
             out.push_back(LeaderboardEntry { player, stats });
             i += 1;
         }
@@ -369,7 +406,7 @@ impl LeaderboardContract {
         env.storage()
             .persistent()
             .get(&DataKey::Stats(player.clone()))
-            .unwrap_or_else(|| PlayerStats::empty(player))
+            .unwrap_or_else(|| PlayerStats::empty(env))
     }
 
     /// Write a player's stats and bump their TTL.
@@ -400,7 +437,7 @@ impl LeaderboardContract {
         let len = roster.len();
         let mut i = 0u32;
         while i < len {
-            if roster.get(i) == *player {
+            if roster.get(i).unwrap() == *player {
                 return;
             }
             i += 1;
@@ -417,15 +454,9 @@ impl LeaderboardContract {
     /// players with identical records have no defined relative order, and
     /// `get_leaderboard` paging would show the same row twice across page
     /// boundaries and silently skip another.
-    fn ranks_after(
-        a: &(Address, PlayerStats),
-        b: &(Address, PlayerStats),
-    ) -> bool {
+    fn ranks_after(a: &(Address, PlayerStats), b: &(Address, PlayerStats)) -> bool {
         if a.1.wins != b.1.wins {
             return a.1.wins < b.1.wins;
-        }
-        if a.1.earnings != b.1.earnings {
-            return a.1.earnings < b.1.earnings;
         }
         a.0 > b.0
     }

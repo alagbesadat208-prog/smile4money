@@ -1,5 +1,13 @@
 import { useEffect, useState } from 'react';
-import { Account, Operation, TransactionBuilder, nativeToScVal, rpc, scValToNative } from '@stellar/stellar-sdk';
+import {
+  Account,
+  Networks,
+  Operation,
+  TransactionBuilder,
+  nativeToScVal,
+  rpc,
+  scValToNative,
+} from '@stellar/stellar-sdk';
 import { APP_NETWORK_CONFIG } from '../config/network';
 
 /**
@@ -33,8 +41,7 @@ export interface LeaderboardStats {
   wins: number;
   losses: number;
   draws: number;
-  earnings: string;
-  token: string;
+  earnings_by_asset: { token: string; amount: string }[];
 }
 
 export interface LeaderboardEntry {
@@ -77,10 +84,16 @@ export function decodeEntries(retval: unknown): LeaderboardEntry[] {
         wins: Number(stats.wins ?? 0),
         losses: Number(stats.losses ?? 0),
         draws: Number(stats.draws ?? 0),
-        // `i128` decodes to a BigInt. Keep the raw string for display so large
-        // earnings figures are not mangled by Number precision loss.
-        earnings: String(stats.earnings ?? '0'),
-        token: String(stats.token ?? ''),
+        earnings_by_asset: Array.isArray(stats.earnings_by_asset)
+          ? stats.earnings_by_asset.map((asset) => {
+              const value = asset as Record<string, unknown>;
+              // `i128` decodes to BigInt; retain exact decimal precision.
+              return {
+                token: String(value.token ?? ''),
+                amount: String(value.amount ?? '0'),
+              };
+            })
+          : [],
       },
     };
   });
@@ -254,13 +267,13 @@ export function Leaderboard({
                     <td>{entry.stats.losses}</td>
                     <td>{entry.stats.draws}</td>
                     <td>
-                      {formatAmount(entry.stats.earnings)}
-                      {entry.stats.token && (
-                        <span className="address-small">
-                          {' '}
-                          {shortAddress(entry.stats.token)}
-                        </span>
-                      )}
+                      {entry.stats.earnings_by_asset.length === 0
+                        ? '0'
+                        : entry.stats.earnings_by_asset.map((asset) => (
+                            <span key={asset.token} title={asset.token}>
+                              {formatAmount(asset.amount)} {shortAddress(asset.token)}{' '}
+                            </span>
+                          ))}
                     </td>
                   </tr>
                 ))}
