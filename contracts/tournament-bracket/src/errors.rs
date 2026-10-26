@@ -51,4 +51,6 @@ pub enum Error {
     ReviewWindowExpired = 23,
     /// The configured review window duration is invalid (must be > 0).
     InvalidReviewWindow = 24,
+    /// A participant would occupy both sides of a match or appear more than once.
+    DuplicateParticipant = 25,
 }

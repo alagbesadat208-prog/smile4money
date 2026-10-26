@@ -2,7 +2,7 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    vec, Address, Env, Vec,
 };
 
 fn setup() -> (Env, Address, BracketContractClient<'static>, Address) {
@@ -487,4 +487,144 @@ fn test_cancel_bracket_while_paused_allows_exits() {
     client.unpause(&admin);
     client.withdraw(&bracket_id, &p2);
     assert_eq!(client.get_bracket(&bracket_id).registered, 0);
+}
+
+#[test]
+fn test_construction_and_advancement_reject_identical_participants_in_both_slots() {
+    let (env, contract_id, client, admin) = setup();
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+
+    // 1. Seeded bracket construction rejects identical participants in the same match.
+    assert_eq!(
+        client.try_create_seeded_bracket(&2, &vec![&env, p1.clone(), p1.clone()]),
+        Err(Ok(Error::DuplicateParticipant))
+    );
+
+    // 2. Seeded bracket construction rejects duplicate participants across matches.
+    assert_eq!(
+        client.try_create_seeded_bracket(&4, &vec![&env, p1.clone(), p2.clone(), p1.clone()]),
+        Err(Ok(Error::DuplicateParticipant))
+    );
+
+    // 3. Incremental registration rejects duplicate participant in the second slot.
+    let bracket_id = client.create_bracket(&4);
+    client.register(&bracket_id, &p1);
+    assert_eq!(
+        client.try_register(&bracket_id, &p1),
+        Err(Ok(Error::AlreadyRegistered))
+    );
+
+    // 4. Advancement rejects placing a participant into a parent node whose opposite
+    //    slot already holds the same participant.
+    client.register(&bracket_id, &p2);
+    client.register(&bracket_id, &p3);
+    client.lock_registration(&bracket_id, &admin);
+
+    // Parent node 2 currently has slot2 = Filled(p3) (via bye from node 1) and slot1 = Vacant.
+    // If node 0 is corrupted to carry p3 vs p2 and p3 is finalized, advancing p3 into
+    // parent node 2 slot1 would place p3 on both sides of node 2 and must fail with
+    // Error::DuplicateParticipant.
+    env.as_contract(&contract_id, || {
+        let mut node0 = BracketContract::load_node(&env, bracket_id, 0).unwrap();
+        node0.slot1 = Slot::Filled(p3.clone());
+        node0.slot2 = Slot::Filled(p2.clone());
+        BracketContract::save_node(&env, &node0);
+    });
+
+    client.submit_result(&bracket_id, &0, &p3, &admin);
+    advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
+    assert_eq!(
+        client.try_finalize_result(&bracket_id, &0),
+        Err(Ok(Error::DuplicateParticipant))
+    );
+
+    // Verify parent node 2 was never mutated to hold p3 on both sides.
+    let final_node = client.get_node(&bracket_id, &2);
+    assert_eq!(final_node.slot1, Slot::Vacant);
+    assert_eq!(final_node.slot2, Slot::Filled(p3));
+}
+
+#[test]
+fn prop_distinct_participants_across_all_supported_bracket_sizes_and_byes() {
+    let (env, _contract_id, client, admin) = setup();
+    let sizes: [u32; 8] = [2, 4, 8, 16, 32, 64, 128, 256];
+
+    for size in sizes {
+        // Exercise multiple bye distributions for each supported power-of-two size:
+        // single entrant (all byes), sparse/odd entrant count (mixed byes and void nodes),
+        // and three-quarters full.
+        let entrant_counts: [u32; 3] = [1, (size / 2) + 1, size - 1];
+
+        for count in entrant_counts {
+            let mut participants: Vec<Address> = Vec::new(&env);
+            for _ in 0..count {
+                participants.push_back(Address::generate(&env));
+            }
+
+            let bracket_id = client.create_seeded_bracket(&size, &participants);
+            client.lock_registration(&bracket_id, &admin);
+
+            let bracket = client.get_bracket(&bracket_id);
+            for round in 0..bracket.rounds {
+                let nodes_in_round = size >> (round + 1);
+                let round_offset = size - (size >> round);
+                let mut seen_in_round: Vec<Address> = Vec::new(&env);
+
+                for index in 0..nodes_in_round {
+                    let node_id = (round_offset + index) as u64;
+                    let node = client.get_node(&bracket_id, &node_id);
+
+                    // Invariant 1: No node ever holds the same participant in slot1 and slot2.
+                    if let (Slot::Filled(a), Slot::Filled(b)) = (&node.slot1, &node.slot2) {
+                        assert_ne!(a, b, "duplicate participant in node {}", node_id);
+                    }
+
+                    // Invariant 2: No participant appears more than once in the same round.
+                    for slot in [&node.slot1, &node.slot2] {
+                        if let Slot::Filled(addr) = slot {
+                            for i in 0..seen_in_round.len() {
+                                assert_ne!(
+                                    seen_in_round.get(i).unwrap(),
+                                    *addr,
+                                    "participant duplicated in round {}",
+                                    round
+                                );
+                            }
+                            seen_in_round.push_back(addr.clone());
+                        }
+                    }
+
+                    // Resolve any playable match so winners advance into the next round.
+                    if client.get_node_state(&bracket_id, &node_id) == NodeState::Ready {
+                        let winner = match (&node.slot1, &node.slot2) {
+                            (Slot::Filled(p1), Slot::Filled(p2)) => {
+                                if (index + round) % 2 == 0 {
+                                    p1.clone()
+                                } else {
+                                    p2.clone()
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                        client.submit_result(&bracket_id, &node_id, &winner, &admin);
+                        advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
+                        client.finalize_result(&bracket_id, &node_id);
+                    }
+                }
+            }
+
+            // A champion must be crowned from the registered participants.
+            let champion = client.get_champion(&bracket_id);
+            let mut found = false;
+            for i in 0..participants.len() {
+                if participants.get(i).unwrap() == champion {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found);
+        }
+    }
 }

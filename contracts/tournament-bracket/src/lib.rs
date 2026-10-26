@@ -4,14 +4,14 @@ mod errors;
 mod types;
 
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol, Vec};
 use types::{Bracket, DataKey, Node, NodeState, Slot};
 
 /// ~30 days at 5s/ledger. Used as both the TTL threshold and the extend-to value.
 const BRACKET_TTL_LEDGERS: u32 = 518_400;
 
 /// Largest supported bracket: 256 first round sides, 8 rounds.
-const MAX_BRACKET_SIZE: u32 = 256;
+pub const MAX_BRACKET_SIZE: u32 = 256;
 
 /// Default review window in ledgers (~10 minutes at 5s/ledger) during which a
 /// reported match result remains in [`NodeState::UnderReview`] and can be
@@ -37,9 +37,21 @@ pub const DEFAULT_REVIEW_WINDOW_LEDGERS: u32 = 120;
 /// * An **unfilled node** still has a vacant side. It is neither a bye nor a
 ///   void: it is simply not decided yet and cannot be played.
 ///
-/// A node whose recorded sides and recorded winner disagree is malformed and
-/// every operation on it fails with [`Error::MalformedNode`] instead of
-/// guessing what the state was meant to be.
+/// ## Distinct-Participant Invariant
+///
+/// No participant may occupy more than one slot in a bracket or both sides of
+/// the same node:
+///
+/// * Bracket construction ([`BracketContract::create_seeded_bracket`]) and
+///   registration ([`BracketContract::register`]) reject duplicate participant
+///   addresses and prevent identical addresses from being placed into `slot1`
+///   and `slot2`.
+/// * Advancement ([`BracketContract::write_parent_slot`]) verifies that the
+///   opposite side of the parent node does not already hold the advancing
+///   participant, failing with [`Error::DuplicateParticipant`] before mutating
+///   storage.
+/// * Any stored node whose `slot1` and `slot2` hold the same participant is
+///   rejected as [`Error::MalformedNode`].
 ///
 /// ## Result Review Window
 ///
@@ -69,6 +81,7 @@ pub const DEFAULT_REVIEW_WINDOW_LEDGERS: u32 = 120;
 ///
 /// * **Blocked while paused** ([`Error::ContractPaused`]):
 ///   - [`BracketContract::create_bracket`]
+///   - [`BracketContract::create_seeded_bracket`]
 ///   - [`BracketContract::create_paid_bracket`]
 ///   - [`BracketContract::set_review_config`]
 ///   - [`BracketContract::register`]
@@ -142,6 +155,47 @@ impl BracketContract {
     /// and the last round holds the final.
     pub fn create_bracket(env: Env, size: u32) -> Result<u64, Error> {
         Self::create_bracket_internal(&env, size, None, 0)
+    }
+
+    /// Create a bracket pre-seeded with `participants` in round `0`.
+    ///
+    /// Rejects duplicate participant addresses (including identical addresses
+    /// across both slots of any node) with [`Error::DuplicateParticipant`].
+    pub fn create_seeded_bracket(
+        env: Env,
+        size: u32,
+        participants: Vec<Address>,
+    ) -> Result<u64, Error> {
+        if participants.len() > size {
+            return Err(Error::BracketFull);
+        }
+
+        // Reject any duplicate participant before creating or mutating state.
+        let count = participants.len();
+        for i in 0..count {
+            let p_i = participants.get(i).unwrap();
+            for j in (i + 1)..count {
+                let p_j = participants.get(j).unwrap();
+                if p_i == p_j {
+                    return Err(Error::DuplicateParticipant);
+                }
+            }
+        }
+
+        let bracket_id = Self::create_bracket_internal(&env, size, None, 0)?;
+        let mut bracket = Self::load_bracket(&env, bracket_id)?;
+
+        for side in 0..count {
+            let participant = participants.get(side).unwrap();
+            let node_id = Self::node_id(size, 0, side / 2);
+            let mut node = Self::load_node(&env, bracket_id, node_id)?;
+            Self::assign_node_side(&mut node, side % 2, participant)?;
+            Self::save_node(&env, &node);
+            bracket.registered += 1;
+        }
+
+        Self::save_bracket(&env, &bracket);
+        Ok(bracket_id)
     }
 
     /// Create a bracket with an escrowed `entry_fee` in `token` per participant.
@@ -232,12 +286,7 @@ impl BracketContract {
         let side = Self::first_vacant_side(&env, &bracket)?.ok_or(Error::BracketFull)?;
         let node_id = Self::node_id(bracket.size, 0, side / 2);
         let mut node = Self::load_node(&env, bracket_id, node_id)?;
-        let value = Slot::Filled(participant.clone());
-        if side % 2 == 0 {
-            node.slot1 = value;
-        } else {
-            node.slot2 = value;
-        }
+        Self::assign_node_side(&mut node, side % 2, participant.clone())?;
 
         if let Some(ref token_addr) = bracket.token {
             if bracket.entry_fee > 0 {
@@ -646,6 +695,19 @@ impl BracketContract {
         Ok(admin)
     }
 
+    fn assign_node_side(node: &mut Node, side: u32, participant: Address) -> Result<(), Error> {
+        let opposite = if side == 0 { &node.slot2 } else { &node.slot1 };
+        if matches!(opposite, Slot::Filled(existing) if *existing == participant) {
+            return Err(Error::DuplicateParticipant);
+        }
+        if side == 0 {
+            node.slot1 = Slot::Filled(participant);
+        } else {
+            node.slot2 = Slot::Filled(participant);
+        }
+        Ok(())
+    }
+
     fn create_bracket_internal(
         env: &Env,
         size: u32,
@@ -836,6 +898,9 @@ impl BracketContract {
     }
 
     /// Write the contribution of a node into the side of its parent it feeds.
+    ///
+    /// Enforces the invariant that the two sides of a parent node never hold
+    /// identical participant addresses.
     fn write_parent_slot(
         env: &Env,
         bracket_id: u64,
@@ -844,13 +909,19 @@ impl BracketContract {
         value: Slot,
     ) -> Result<(), Error> {
         let mut parent = Self::load_node(env, bracket_id, parent_id)?;
-        let current = if side == 0 {
-            parent.slot1.clone()
+        let (current, opposite) = if side == 0 {
+            (&parent.slot1, &parent.slot2)
         } else {
-            parent.slot2.clone()
+            (&parent.slot2, &parent.slot1)
         };
 
-        match (&current, &value) {
+        if let (Slot::Filled(incoming), Slot::Filled(other)) = (&value, opposite) {
+            if incoming == other {
+                return Err(Error::DuplicateParticipant);
+            }
+        }
+
+        match (current, &value) {
             (Slot::Vacant, _) => {}
             // Already propagated.
             (Slot::Bye, Slot::Bye) => return Ok(()),
