@@ -5,7 +5,7 @@
 //!
 //! An entrant pays their entry fee exactly once. Winners advance from round to
 //! round on oracle result submission, and the champion receives the entire prize
-//! pool (`entry_fee × player_count`) when the final is decided.
+//! pool (`entry_fee × player_count`) through a separate claim after the final.
 //!
 //! ## Bracket shape
 //!
@@ -42,22 +42,18 @@ mod types;
 pub use constants::*;
 
 use errors::Error;
-use soroban_sdk::{
-    contract, contractimpl, symbol_short, token, Address, Env, String, Symbol, TryFromVal, Vec,
-};
-use types::{DataKey, MatchNode, NodeStatus, Tournament, TournamentState};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, String, Symbol, Vec};
+use types::{DataKey, MatchNode, NodeStatus, Settlement, Tournament, TournamentState};
 
 /// Return `true` if `addr` is the all-zeros Stellar account key.
 ///
 /// A zero address is the canonical burn address and is never a valid participant.
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
-    // The all-zeros Stellar account key encodes to this strkey.
-    // We construct the Address via the ScAddress XDR path since
-    // TryFromVal<Env, String> is not implemented for Address.
-    use soroban_sdk::xdr::{AccountId, PublicKey, ScAddress, Uint256};
-    let zero_key = Uint256([0u8; 32]);
-    let sc_addr = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(zero_key)));
-    let zero_address = Address::try_from_val(env, &sc_addr).expect("invalid zero address");
+    // Use the public strkey constructor, which is available in WASM too.
+    let zero_address = Address::from_string(&String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
     addr == &zero_address
 }
 
@@ -132,7 +128,7 @@ impl TournamentBracket {
         Ok(t.entry_fee * t.player_count as i128)
     }
 
-    /// How many entrants have paid their entry fee so far.
+    /// Funded entrants; after cancellation, the number of outstanding refunds.
     pub fn get_funded_count(env: &Env, tournament_id: u64) -> Result<u32, Error> {
         let t = Self::load_tournament(env, tournament_id)?;
         Ok(t.funded_count)
@@ -446,8 +442,8 @@ impl TournamentBracket {
     ///
     /// If the node is not the final, its winner is written into the parent node
     /// and the parent becomes `AwaitingResult` once both its slots are filled. If
-    /// it *is* the final, the tournament completes and the champion is paid the
-    /// whole prize pool in this same call.
+    /// it *is* the final, the tournament completes and allocates the whole prize
+    /// pool. `claim_prize` pays it separately; no token is called here.
     ///
     /// # Errors
     ///
@@ -521,7 +517,7 @@ impl TournamentBracket {
             return Ok(());
         }
 
-        // The final: crown the champion and pay the whole pot. No payout happens
+        // The final: crown the champion and allocate the whole pot. No payout happens
         // before this point — an earlier-round winner keeps their fee in the pot.
         t.champion = Some(winner.clone());
         t.state = TournamentState::Completed;
@@ -529,9 +525,7 @@ impl TournamentBracket {
         Self::save_tournament(&env, &t);
 
         let payout = t.entry_fee * t.player_count as i128;
-        Self::ensure_reserve_for_payout(&env, &t.token, payout)?;
-        let client = token::Client::new(&env, &t.token);
-        client.transfer(&env.current_contract_address(), &winner, &payout);
+        Self::allocate_settlement(&env, tournament_id, payout, 1)?;
 
         Self::bump_instance_ttl(&env);
         env.events().publish(
@@ -541,7 +535,7 @@ impl TournamentBracket {
         Ok(())
     }
 
-    /// Abandon a tournament that has not started and refund every funded entrant.
+    /// Abandon a tournament that has not started and allocate funded refunds.
     ///
     /// Admin only, and only while the tournament is still in
     /// [`Registration`](TournamentState::Registration) — i.e. no match has been
@@ -565,9 +559,14 @@ impl TournamentBracket {
             return Err(Error::TournamentInProgress);
         }
 
-        // Recorded before the refund, which zeroes the counter.
+        // Terminal state freezes funding flags. Claims read one node each.
         let refunded = t.funded_count;
-        Self::refund_all(&env, &mut t)?;
+        Self::allocate_settlement(
+            &env,
+            tournament_id,
+            t.entry_fee * refunded as i128,
+            refunded,
+        )?;
         t.state = TournamentState::Cancelled;
         t.completed_ledger = Some(env.ledger().sequence());
         Self::save_tournament(&env, &t);
@@ -580,7 +579,7 @@ impl TournamentBracket {
         Ok(())
     }
 
-    /// Refund everyone once the tournament has clearly stalled.
+    /// Allocate refunds once the tournament has clearly stalled.
     ///
     /// Callable by **anyone** once `TIMEOUT_LEDGERS` have elapsed since the
     /// tournament was created, so a stalled bracket can never hold player funds
@@ -606,9 +605,14 @@ impl TournamentBracket {
             return Err(Error::TimeoutNotReached);
         }
 
-        // Recorded before the refund, which zeroes the counter.
+        // Terminal state freezes funding flags. Claims read one node each.
         let refunded = t.funded_count;
-        Self::refund_all(&env, &mut t)?;
+        Self::allocate_settlement(
+            &env,
+            tournament_id,
+            t.entry_fee * refunded as i128,
+            refunded,
+        )?;
         t.state = TournamentState::Cancelled;
         t.completed_ledger = Some(env.ledger().sequence());
         Self::save_tournament(&env, &t);
@@ -619,6 +623,61 @@ impl TournamentBracket {
             (tournament_id, refunded, caller),
         );
         Ok(())
+    }
+
+    /// Legacy terminal records have no allocation and cannot be paid again.
+    pub fn get_settlement(env: &Env, tournament_id: u64) -> Result<Settlement, Error> {
+        Self::load_tournament(env, tournament_id)?;
+        env.storage()
+            .persistent()
+            .get(&DataKey::Settlement(tournament_id))
+            .ok_or(Error::SettlementNotFound)
+    }
+
+    /// Anyone may relay the claim, but funds go only to the recorded champion.
+    pub fn claim_prize(env: Env, tournament_id: u64) -> Result<i128, Error> {
+        let t = Self::load_tournament(&env, tournament_id)?;
+        if t.state != TournamentState::Completed {
+            return Err(Error::InvalidState);
+        }
+        let champion = t.champion.clone().ok_or(Error::InvalidState)?;
+        Self::pay_claim(&env, &t, &champion, 1, t.entry_fee * t.player_count as i128)
+    }
+
+    /// Claim one refund with its round-zero node index: one node read and one
+    /// transfer, independent of field size. The destination cannot be redirected.
+    pub fn claim_refund(
+        env: Env,
+        tournament_id: u64,
+        node_index: u32,
+        recipient: Address,
+    ) -> Result<i128, Error> {
+        let mut t = Self::load_tournament(&env, tournament_id)?;
+        if t.state != TournamentState::Cancelled {
+            return Err(Error::InvalidState);
+        }
+        let node = Self::load_node(&env, tournament_id, 0, node_index)?;
+        let (slot, funded) = if node.player1.as_ref() == Some(&recipient) {
+            (node_index * 2, node.funded1)
+        } else if node.player2.as_ref() == Some(&recipient) {
+            (node_index * 2 + 1, node.funded2)
+        } else {
+            return Err(Error::PlayerNotRegistered);
+        };
+        if !funded {
+            return Err(Error::NothingToClaim);
+        }
+        // Funding flags remain immutable. Replay protection is in the shared
+        // settlement bitmap, including bit 63 for the maximum field.
+        let bit = 1u64 << slot;
+        let settlement = Self::get_settlement(&env, tournament_id)?;
+        if settlement.claimed & bit != 0 {
+            return Err(Error::AlreadyClaimed);
+        }
+        t.funded_count = t.funded_count.checked_sub(1).ok_or(Error::NothingToClaim)?;
+        let paid = Self::pay_claim(&env, &t, &recipient, bit, t.entry_fee)?;
+        Self::save_node(&env, node);
+        Ok(paid)
     }
 
     // ---------------------------- internals ----------------------------
@@ -698,9 +757,8 @@ impl TournamentBracket {
     /// Reject a payout that would drop the contract below
     /// [`ESCROW_RESERVE_BUFFER_STROOPS`].
     ///
-    /// Without this a `transfer` could fail at the Stellar protocol layer with a
-    /// reserve-induced `op_under_min_balance`, leaving the tournament marked
-    /// `Completed` with the champion unpaid. Same guard as the escrow contract.
+    /// A failed guard leaves claim progress unchanged so the recipient can
+    /// retry after reserve funding. Same buffer as the escrow contract.
     fn ensure_reserve_for_payout(
         env: &Env,
         token: &Address,
@@ -714,35 +772,67 @@ impl TournamentBracket {
         Ok(())
     }
 
-    /// Refund every entrant who has paid, and clear their funded flags.
-    fn refund_all(env: &Env, t: &mut Tournament) -> Result<(), Error> {
-        if t.funded_count == 0 {
-            return Ok(());
+    fn allocate_settlement(env: &Env, id: u64, total: i128, count: u32) -> Result<(), Error> {
+        if env.storage().persistent().has(&DataKey::Settlement(id)) {
+            return Err(Error::TournamentFinished);
         }
-        Self::ensure_reserve_for_payout(env, &t.token, t.entry_fee * t.funded_count as i128)?;
-
-        let contract = env.current_contract_address();
-        let client = token::Client::new(env, &t.token);
-        let mut i = 0u32;
-        while i < t.player_count / 2 {
-            let mut node = Self::load_node(env, t.id, 0, i)?;
-            if node.funded1 {
-                if let Some(p) = node.player1.clone() {
-                    client.transfer(&contract, &p, &t.entry_fee);
-                }
-                node.funded1 = false;
-            }
-            if node.funded2 {
-                if let Some(p) = node.player2.clone() {
-                    client.transfer(&contract, &p, &t.entry_fee);
-                }
-                node.funded2 = false;
-            }
-            Self::save_node(env, node);
-            i += 1;
-        }
-        t.funded_count = 0;
+        Self::save_settlement(
+            env,
+            id,
+            &Settlement {
+                total,
+                remaining: total,
+                unclaimed: count,
+                claimed: 0,
+            },
+        );
+        env.events().publish(
+            (Symbol::new(env, "tournament"), symbol_short!("allocated")),
+            (id, total, count),
+        );
         Ok(())
+    }
+
+    fn save_settlement(env: &Env, id: u64, settlement: &Settlement) {
+        let key = DataKey::Settlement(id);
+        env.storage().persistent().set(&key, settlement);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+    }
+
+    fn pay_claim(
+        env: &Env,
+        t: &Tournament,
+        recipient: &Address,
+        bit: u64,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        let mut settlement = Self::get_settlement(env, t.id)?;
+        if settlement.claimed & bit != 0 {
+            return Err(Error::AlreadyClaimed);
+        }
+        if amount <= 0 || settlement.remaining < amount || settlement.unclaimed == 0 {
+            return Err(Error::NothingToClaim);
+        }
+        settlement.claimed |= bit;
+        settlement.remaining -= amount;
+        settlement.unclaimed -= 1;
+        // Effects precede token calls; failures roll back progress for retry.
+        Self::save_settlement(env, t.id, &settlement);
+        Self::save_tournament(env, t);
+        Self::ensure_reserve_for_payout(env, &t.token, amount)?;
+        token::Client::new(env, &t.token).transfer(
+            &env.current_contract_address(),
+            recipient,
+            &amount,
+        );
+        Self::bump_instance_ttl(env);
+        env.events().publish(
+            (Symbol::new(env, "tournament"), symbol_short!("claimed")),
+            (t.id, recipient.clone(), amount),
+        );
+        Ok(amount)
     }
 
     fn load_tournament(env: &Env, tournament_id: u64) -> Result<Tournament, Error> {

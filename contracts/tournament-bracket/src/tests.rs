@@ -1,13 +1,8 @@
 extern crate std;
 
-use std::format;
-
 use super::*;
 use soroban_sdk::{
-    testutils::{
-        storage::{Instance as _, Persistent as _},
-        Address as _, Ledger as _,
-    },
+    testutils::{Address as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
     vec, Address, Env, String, Vec,
 };
@@ -17,13 +12,6 @@ const FEE: i128 = 100;
 
 /// Balances before any fees are paid, so expected deltas are easy to read.
 const STARTING_BALANCE: i128 = 10_000;
-
-fn test_env() -> Env {
-    // Assertions inspect values directly; snapshot files are not used.
-    Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
-        capture_snapshot_at_drop: false,
-    })
-}
 
 /// A deployed bracket plus the addresses and token needed to drive it.
 struct Fixture<'a> {
@@ -39,19 +27,20 @@ struct Fixture<'a> {
 
 impl<'a> Fixture<'a> {
     fn with_field(player_count: usize) -> Self {
-        let env = test_env();
+        let env = Env::default();
+        // Keep the test token alive across the timeout ledger jump. Production
+        // callers restore archived entries as part of transaction preparation.
+        env.ledger()
+            .with_mut(|info| info.min_persistent_entry_ttl = MATCH_TTL_LEDGERS);
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
         let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        token_id
+            .issuer()
+            .set_flag(soroban_sdk::testutils::IssuerFlags::RevocableFlag);
         let token = token_id.address();
-        // Time-travel tests need the external token instance to stay live too.
-        env.as_contract(&token, || {
-            env.storage()
-                .instance()
-                .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
-        });
 
         let contract = env.register(TournamentBracket, ());
         let client = TournamentBracketClient::new(&env, &contract);
@@ -112,184 +101,8 @@ fn asset<'a>(env: &'a Env, token: &Address) -> StellarAssetClient<'a> {
     StellarAssetClient::new(env, token)
 }
 
-// Retention changes rent metadata, never the permanent settlement records.
-fn assert_retention_preserves_settlement(f: &Fixture, id: u64) {
-    let tournament = f.client.get_tournament(&id);
-    let before = f.env.as_contract(&f.contract, || {
-        (
-            f.env.storage().persistent().all(),
-            f.env.storage().instance().all(),
-        )
-    });
-    let balances: std::vec::Vec<_> = f.players.iter().map(|p| f.balance(&p)).collect();
-    let reserve = f.balance(&f.contract);
-    f.env
-        .ledger()
-        .set_sequence_number(f.env.ledger().sequence() + 100);
-    // No mock authorization: any transaction payer can maintain the records.
-    f.env.mock_auths(&[]);
-    for _ in 0..2 {
-        f.client.extend_record_ttl(&id);
-        assert!(f.env.auths().is_empty());
-        assert_eq!(f.client.get_tournament(&id), tournament);
-        f.env.as_contract(&f.contract, || {
-            assert_eq!(f.env.storage().persistent().all(), before.0);
-            assert_eq!(f.env.storage().instance().all(), before.1);
-            assert!(f.env.storage().instance().get_ttl() >= MATCH_TTL_LEDGERS);
-            assert!(
-                f.env
-                    .storage()
-                    .persistent()
-                    .get_ttl(&DataKey::Tournament(id))
-                    >= MATCH_TTL_LEDGERS
-            );
-            for round in 0..tournament.rounds {
-                for index in 0..(tournament.player_count >> (round + 1)) {
-                    assert!(
-                        f.env
-                            .storage()
-                            .persistent()
-                            .get_ttl(&DataKey::Node(id, round, index))
-                            >= MATCH_TTL_LEDGERS
-                    );
-                }
-            }
-        });
-        assert_eq!(f.balance(&f.contract), reserve);
-        assert_eq!(
-            f.players
-                .iter()
-                .map(|p| f.balance(&p))
-                .collect::<std::vec::Vec<_>>(),
-            balances
-        );
-    }
-}
-
-#[test]
-fn retention_preserves_champion_payout_and_all_match_facts() {
-    let f = Fixture::four_players();
-    let id = f.create_and_fund_all();
-    f.client
-        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
-    f.client
-        .submit_match_result(&id, &0, &1, &game_id(&f.env, 2), &f.seed(1));
-    f.client
-        .submit_match_result(&id, &1, &0, &game_id(&f.env, 3), &f.seed(0));
-    let tournament = f.client.get_tournament(&id);
-    assert_retention_preserves_settlement(&f, id);
-    // Renewed records remain queryable beyond their original live-until ledger.
-    f.env
-        .ledger()
-        .set_sequence_number(tournament.completed_ledger.unwrap() + MATCH_TTL_LEDGERS + 1);
-    assert_eq!(f.client.get_tournament(&id), tournament);
-    assert_eq!(f.client.get_champion(&id), f.seed(0));
-    assert_eq!(f.client.get_node(&id, &0, &0).winner, Some(f.seed(0)));
-    assert_eq!(f.client.get_node(&id, &1, &0).winner, Some(f.seed(0)));
-    f.env.mock_all_auths();
-    assert_eq!(
-        f.client.try_claim_timeout(&id, &f.seed(0)),
-        Err(Ok(Error::TournamentFinished))
-    );
-    assert_eq!(
-        f.client
-            .try_submit_match_result(&id, &1, &0, &game_id(&f.env, 4), &f.seed(1)),
-        Err(Ok(Error::TournamentFinished))
-    );
-}
-
-#[test]
-fn retention_preserves_partial_refund_and_other_tournaments() {
-    let f = Fixture::four_players();
-    let id = f.client.create_tournament(&FEE, &f.players);
-    f.client.deposit(&id, &f.seed(0));
-    f.client.cancel_tournament(&id);
-    let other = f.client.create_tournament(&FEE, &f.players);
-    let other_ttl = f.env.as_contract(&f.contract, || {
-        f.env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Tournament(other))
-    });
-    assert_retention_preserves_settlement(&f, id);
-    assert_eq!(f.balance(&f.seed(0)), STARTING_BALANCE);
-    assert_eq!(f.client.get_tournament(&id).funded_count, 0);
-    f.env.as_contract(&f.contract, || {
-        assert_eq!(
-            f.env
-                .storage()
-                .persistent()
-                .get_ttl(&DataKey::Tournament(other)),
-            other_ttl - 100
-        );
-    });
-}
-
-#[test]
-fn retention_preserves_timeout_refunds() {
-    let f = Fixture::four_players();
-    let id = f.create_and_fund_all();
-    f.client
-        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
-    f.env.ledger().set_sequence_number(TIMEOUT_LEDGERS + 1);
-    f.client.claim_timeout(&id, &f.seed(0));
-    assert_retention_preserves_settlement(&f, id);
-}
-
-#[test]
-fn retention_rejects_unknown_and_unsettled_records() {
-    let f = Fixture::with_field(2);
-    assert_eq!(
-        f.client.try_extend_record_ttl(&0),
-        Err(Ok(Error::TournamentNotFound))
-    );
-    let id = f.client.create_tournament(&FEE, &f.players);
-    assert_eq!(
-        f.client.try_extend_record_ttl(&id),
-        Err(Ok(Error::InvalidState))
-    );
-    for player in f.players.iter() {
-        f.client.deposit(&id, &player);
-    }
-    assert_eq!(
-        f.client.try_extend_record_ttl(&id),
-        Err(Ok(Error::InvalidState))
-    );
-}
-
-#[test]
-fn retention_covers_all_63_nodes_of_the_largest_bracket() {
-    let f = Fixture::with_field(MAX_PLAYERS as usize);
-    let id = f.client.create_tournament(&FEE, &f.players);
-    f.client.cancel_tournament(&id);
-    assert_retention_preserves_settlement(&f, id);
-}
-
-#[test]
-fn retention_never_recreates_missing_records() {
-    let f = Fixture::four_players();
-    let id = f.client.create_tournament(&FEE, &f.players);
-    f.client.cancel_tournament(&id);
-    f.env.as_contract(&f.contract, || {
-        f.env
-            .storage()
-            .persistent()
-            .remove(&DataKey::Node(id, 0, 0))
-    });
-    let before = f
-        .env
-        .as_contract(&f.contract, || f.env.storage().persistent().all());
-    assert_eq!(
-        f.client.try_extend_record_ttl(&id),
-        Err(Ok(Error::NodeNotFound))
-    );
-    f.env.as_contract(&f.contract, || {
-        assert_eq!(f.env.storage().persistent().all(), before)
-    });
-}
-
 fn game_id(env: &Env, n: u32) -> String {
-    String::from_str(env, &format!("game-{}", n))
+    String::from_str(env, &std::format!("game-{}", n))
 }
 
 // ----------------------- full bracket progression -----------------------
@@ -391,6 +204,14 @@ fn four_player_tournament_progresses_to_a_paid_champion() {
     f.client
         .submit_match_result(&id, &1, &0, &game_id(&f.env, 3), &s0);
 
+    // Finalization only allocates; a separate call transfers the prize.
+    assert_eq!(f.balance(&s0), STARTING_BALANCE - FEE);
+    assert_eq!(f.client.get_settlement(&id).remaining, FEE * 4);
+    assert_eq!(f.client.claim_prize(&id), FEE * 4);
+    assert_eq!(
+        f.client.try_claim_prize(&id),
+        Err(Ok(Error::AlreadyClaimed))
+    );
     // Champion takes the whole 4 x FEE pot.
     assert_eq!(f.balance(&s0), STARTING_BALANCE - FEE + FEE * 4);
     assert_eq!(f.balance(&s1), STARTING_BALANCE - FEE);
@@ -424,6 +245,7 @@ fn two_player_tournament_is_a_single_match() {
     f.client
         .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &b);
 
+    f.client.claim_prize(&id);
     assert_eq!(f.client.get_champion(&id), b);
     assert_eq!(f.balance(&b), STARTING_BALANCE - FEE + FEE * 2);
     assert_eq!(f.balance(&a), STARTING_BALANCE - FEE);
@@ -512,7 +334,7 @@ fn field_size_bounds_are_enforced() {
     );
     f.client.get_node(&id, &0, &31);
 
-    let env = test_env();
+    let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(admin.clone());
@@ -552,7 +374,7 @@ fn single_player_field_is_rejected() {
 
 #[test]
 fn duplicate_entrants_are_rejected() {
-    let env = test_env();
+    let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(admin.clone());
@@ -561,13 +383,7 @@ fn duplicate_entrants_are_rejected() {
     client.initialize(&admin, &admin, &token_id.address());
 
     let dup = Address::generate(&env);
-    let players = vec![
-        &env,
-        dup.clone(),
-        dup.clone(),
-        Address::generate(&env),
-        Address::generate(&env),
-    ];
+    let players = vec![&env, dup.clone(), dup.clone()];
     assert_eq!(
         client.try_create_tournament(&FEE, &players),
         Err(Ok(Error::DuplicatePlayer))
@@ -576,7 +392,7 @@ fn duplicate_entrants_are_rejected() {
 
 #[test]
 fn zero_address_entrant_is_rejected() {
-    let env = test_env();
+    let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(admin.clone());
@@ -772,6 +588,9 @@ fn admin_cancels_an_unstarted_tournament_and_refunds_everyone() {
         f.client.get_tournament(&id).state,
         TournamentState::Cancelled
     );
+    assert_eq!(f.balance(&f.seed(0)), STARTING_BALANCE - FEE);
+    f.client.claim_refund(&id, &0, &f.seed(3));
+    f.client.claim_refund(&id, &0, &f.seed(0));
     // Both payers are made whole; the two who never paid are untouched.
     for i in 0..4u32 {
         assert_eq!(f.balance(&f.seed(i)), STARTING_BALANCE, "seed {}", i);
@@ -787,6 +606,7 @@ fn a_cancelled_tournament_rejects_further_entries() {
     f.client.deposit(&id, &f.seed(0));
 
     f.client.cancel_tournament(&id);
+    f.client.claim_refund(&id, &0, &f.seed(0));
 
     assert_eq!(f.balance(&f.seed(0)), STARTING_BALANCE);
     assert_eq!(
@@ -838,6 +658,10 @@ fn claim_timeout_refunds_everyone_after_the_window() {
         .ledger()
         .set_sequence_number(f.client.get_tournament(&id).created_ledger + TIMEOUT_LEDGERS + 1);
     f.client.claim_timeout(&id, &stranger);
+    for node in 0..2u32 {
+        f.client.claim_refund(&id, &node, &f.seed(node));
+        f.client.claim_refund(&id, &node, &f.seed(3 - node));
+    }
 
     assert_eq!(
         f.client.get_tournament(&id).state,
@@ -913,4 +737,209 @@ fn tournaments_are_isolated_from_one_another() {
         f.client.get_tournament(&first).state,
         TournamentState::InProgress
     );
+}
+
+// --------------------- resumable settlement ---------------------
+
+#[test]
+fn refund_claims_validate_entitlement_and_cannot_reset_progress() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.deposit(&id, &f.seed(0));
+    assert_eq!(
+        f.client.try_claim_refund(&id, &0, &f.seed(0)),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(f.client.try_claim_prize(&id), Err(Ok(Error::InvalidState)));
+    f.client.cancel_tournament(&id);
+    assert_eq!(f.client.get_settlement(&id).total, FEE);
+    assert_eq!(
+        f.client.try_claim_refund(&id, &0, &f.seed(3)),
+        Err(Ok(Error::NothingToClaim))
+    );
+    assert_eq!(
+        f.client.try_claim_refund(&id, &1, &f.seed(0)),
+        Err(Ok(Error::PlayerNotRegistered))
+    );
+    assert_eq!(
+        f.client.try_claim_refund(&id, &2, &f.seed(0)),
+        Err(Ok(Error::NodeNotFound))
+    );
+    assert_eq!(
+        f.client
+            .try_claim_refund(&id, &0, &Address::generate(&f.env)),
+        Err(Ok(Error::PlayerNotRegistered))
+    );
+    assert_eq!(f.client.claim_refund(&id, &0, &f.seed(0)), FEE);
+    assert_eq!(
+        f.client.try_claim_refund(&id, &0, &f.seed(0)),
+        Err(Ok(Error::AlreadyClaimed))
+    );
+    let settled = f.client.get_settlement(&id);
+    assert_eq!(settled.remaining, 0);
+    assert_eq!(settled.unclaimed, 0);
+    assert!(f.client.try_cancel_tournament(&id).is_err());
+    assert!(f.client.try_claim_timeout(&id, &f.seed(0)).is_err());
+    assert_eq!(f.client.get_settlement(&id), settled);
+}
+
+#[test]
+fn failed_refund_transfer_rolls_back_and_can_be_retried() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.deposit(&id, &f.seed(0));
+    f.client.deposit(&id, &f.seed(3));
+    asset(&f.env, &f.token).set_authorized(&f.seed(0), &false);
+    // A blocked recipient cannot prevent allocation or another recipient's claim.
+    f.client.cancel_tournament(&id);
+    let allocated = f.client.get_settlement(&id);
+    assert!(f.client.try_claim_refund(&id, &0, &f.seed(0)).is_err());
+    assert_eq!(f.client.get_settlement(&id), allocated);
+    assert_eq!(f.client.get_funded_count(&id), 2);
+    f.client.claim_refund(&id, &0, &f.seed(3));
+    asset(&f.env, &f.token).set_authorized(&f.seed(0), &true);
+    f.client.claim_refund(&id, &0, &f.seed(0));
+    assert_eq!(f.balance(&f.seed(0)), STARTING_BALANCE);
+    assert_eq!(f.client.get_settlement(&id).remaining, 0);
+    assert_eq!(f.client.get_funded_count(&id), 0);
+}
+
+#[test]
+fn reserve_failure_preserves_prize_and_legacy_records_cannot_pay_again() {
+    let f = Fixture::with_field(2);
+    let id = f.create_and_fund_all();
+    TokenClient::new(&f.env, &f.token).transfer(
+        &f.contract,
+        &f.admin,
+        &ESCROW_RESERVE_BUFFER_STROOPS,
+    );
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    let allocated = f.client.get_settlement(&id);
+    assert_eq!(
+        f.client.try_claim_prize(&id),
+        Err(Ok(Error::InsufficientReserve))
+    );
+    assert_eq!(f.client.get_settlement(&id), allocated);
+    asset(&f.env, &f.token).mint(&f.contract, &ESCROW_RESERVE_BUFFER_STROOPS);
+    f.env.mock_auths(&[]); // A relayer needs no recipient signature; destination is fixed.
+    f.client.claim_prize(&id);
+    assert_eq!(f.balance(&f.seed(0)), STARTING_BALANCE + FEE);
+    // Pre-upgrade terminal records have no allocation marker and were paid inline.
+    f.env.as_contract(&f.contract, || {
+        f.env
+            .storage()
+            .persistent()
+            .remove(&DataKey::Settlement(id));
+    });
+    assert_eq!(
+        f.client.try_claim_prize(&id),
+        Err(Ok(Error::SettlementNotFound))
+    );
+}
+
+/// Each measured call starts with the SDK's default CPU/memory limits. Setup
+/// is excluded. These native host-cost regressions do not replace WASM/network
+/// simulation when choosing production transaction resource declarations.
+fn report_budget(env: &Env, operation: &str) {
+    std::println!(
+        "{}: CPU={} memory={}",
+        operation,
+        env.cost_estimate().budget().cpu_instruction_cost(),
+        env.cost_estimate().budget().memory_bytes_cost()
+    );
+}
+
+#[test]
+fn maximum_field_timeout_and_all_64_claims_fit_per_call_budget() {
+    let f = Fixture::with_field(64);
+    f.env.cost_estimate().budget().reset_unlimited();
+    let id = f.create_and_fund_all();
+    f.env
+        .ledger()
+        .set_sequence_number(f.client.get_tournament(&id).created_ledger + TIMEOUT_LEDGERS + 1);
+    let caller = f.seed(0);
+    f.env.cost_estimate().budget().reset_default();
+    f.client.claim_timeout(&id, &caller);
+    report_budget(&f.env, "64-player timeout allocation");
+    assert_eq!(f.client.get_settlement(&id).remaining, 64 * FEE);
+    f.env.mock_auths(&[]);
+    // Reverse slot order exercises bit 63 first and resumes after every payment.
+    for slot in (0..64u32).rev() {
+        let node = slot / 2;
+        let recipient = f.seed(if slot % 2 == 0 { node } else { 63 - node });
+        f.env.cost_estimate().budget().reset_default();
+        assert_eq!(f.client.claim_refund(&id, &node, &recipient), FEE);
+        report_budget(&f.env, "64-player individual refund");
+        let settlement = f.client.get_settlement(&id);
+        assert_eq!(settlement.remaining, slot as i128 * FEE);
+        assert_eq!(settlement.unclaimed, slot);
+        assert_eq!(f.balance(&recipient), STARTING_BALANCE);
+        assert_eq!(
+            f.client.try_claim_refund(&id, &node, &recipient),
+            Err(Ok(Error::AlreadyClaimed))
+        );
+    }
+    let settled = f.client.get_settlement(&id);
+    assert_eq!(settled.claimed, u64::MAX);
+    assert_eq!(settled.total, FEE * 64);
+    assert_eq!(f.client.get_funded_count(&id), 0);
+    assert_eq!(f.balance(&f.contract), ESCROW_RESERVE_BUFFER_STROOPS);
+}
+
+#[test]
+fn maximum_field_finalization_and_prize_fit_per_call_budget() {
+    let f = Fixture::with_field(64);
+    f.env.cost_estimate().budget().reset_unlimited();
+    let id = f.create_and_fund_all();
+    for round in 0..5u32 {
+        for index in 0..(64 >> (round + 1)) {
+            let winner = f.client.get_node(&id, &round, &index).player1.unwrap();
+            f.client.submit_match_result(
+                &id,
+                &round,
+                &index,
+                &game_id(&f.env, round * 32 + index),
+                &winner,
+            );
+        }
+    }
+    let winner = f.client.get_node(&id, &5, &0).player1.unwrap();
+    let game = game_id(&f.env, 999);
+    f.env.cost_estimate().budget().reset_default();
+    f.client.submit_match_result(&id, &5, &0, &game, &winner);
+    report_budget(&f.env, "64-player final allocation");
+    assert_eq!(f.balance(&winner), STARTING_BALANCE - FEE);
+    f.env.cost_estimate().budget().reset_default();
+    assert_eq!(f.client.claim_prize(&id), 64 * FEE);
+    report_budget(&f.env, "64-player prize claim");
+    assert_eq!(f.balance(&winner), STARTING_BALANCE + 63 * FEE);
+    assert_eq!(f.client.get_settlement(&id).remaining, 0);
+    assert_eq!(f.balance(&f.contract), ESCROW_RESERVE_BUFFER_STROOPS);
+}
+
+#[test]
+fn maximum_field_partial_cancel_and_empty_cancel_allocate_only_funded_fees() {
+    let f = Fixture::with_field(64);
+    f.env.cost_estimate().budget().reset_unlimited();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    for seed in 0..63 {
+        f.client.deposit(&id, &f.seed(seed));
+    }
+    f.env.cost_estimate().budget().reset_default();
+    f.client.cancel_tournament(&id);
+    report_budget(&f.env, "64-player partial cancellation");
+    assert_eq!(f.client.get_settlement(&id).total, 63 * FEE);
+    assert_eq!(f.client.get_settlement(&id).unclaimed, 63);
+    assert_eq!(
+        f.client.try_claim_refund(&id, &0, &f.seed(63)),
+        Err(Ok(Error::NothingToClaim))
+    );
+    f.client.claim_refund(&id, &31, &f.seed(32));
+    assert_eq!(f.client.get_settlement(&id).claimed, 1u64 << 63);
+    f.env.cost_estimate().budget().reset_unlimited();
+    let empty = f.client.create_tournament(&FEE, &f.players);
+    f.client.cancel_tournament(&empty);
+    assert_eq!(f.client.get_settlement(&empty).total, 0);
+    assert_eq!(f.client.get_settlement(&empty).unclaimed, 0);
 }

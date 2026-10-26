@@ -76,7 +76,7 @@ one thing that most needs to be an on-chain invariant.
 
 **Decision:** each entrant pays `entry_fee` exactly once, at
 [`deposit`]. No per-match payouts happen during the tournament. When the final
-is decided, the champion receives the entire pot,
+is decided, the champion is allocated the entire pot,
 `entry_fee × player_count`.
 
 This is the part that most needs to be stated explicitly, because the obvious
@@ -91,12 +91,14 @@ the pot and is only realised if they go on to win the whole thing. This makes
 the invariant a one-liner:
 
 ```
-sum(entry fees held) == entry_fee × funded_count   at all times
-contract token balance - escrow_reserve == entry_fee × funded_count   once funded
+live tournament pot == entry_fee * funded_count
+allocated tournament pot still held == settlement.remaining
 ```
 
-after the final: `contract balance - reserve == 0` and the champion's balance
-rises by `entry_fee × player_count`.
+After the champion claims, the settlement's remaining amount is zero and the
+champion's balance rises by `entry_fee * player_count`. Across tournaments the
+contract holds live funded pots plus outstanding settlement balances, the reserve,
+and any unsolicited transfers.
 
 ### 4. Winners advance on oracle result submission
 
@@ -113,7 +115,7 @@ advanced by the same transaction that records the result.
 - If the node is not in the final, its winner is written into the parent node
   and the parent becomes `AwaitingResult` once both its slots are filled.
 - If the node *is* the final, the tournament becomes `Completed` and the pot is
-  transferred to the champion in the same call.
+  allocated to the champion; `claim_prize` transfers it in a separate call.
 
 No dispute window is added here. A tournament node is not a match between two
 parties with money at risk in the way an escrow match is — nothing is released
@@ -127,10 +129,10 @@ ADR-001 specifies for `EscrowContract`.
 ### 5. Nobody can lock the pot
 
 A tournament that stalls must not be able to hold player money indefinitely. Two
-exit paths, both refunding every funded entrant in full:
+exit paths, both allocating a full refund for every funded entrant:
 
 - [`cancel_tournament`] — admin, while the tournament is still `Registration`
-  (i.e. no match has been decided). Cheap and immediate.
+  (i.e. no match has been decided). Allocation is immediate; each recipient collects separately.
 - [`claim_timeout`] — callable by **anyone** once `TIMEOUT_LEDGERS` have elapsed
   since the tournament was created. This is the trustless backstop, and mirrors
   `EscrowContract::claim_timeout`, which is likewise permissionless.
@@ -141,6 +143,69 @@ a player refuses to play (rematch deadline, walkover, seeding penalty) is real
 policy and is deliberately out of scope here. Until it exists, a stalled
 tournament resolves in favour of *everyone getting their money back*, which is
 the safe direction to be wrong in.
+
+### 6. Resumable settlement (#1880)
+
+The current policy has one champion, not a configurable prize list. The old
+unbounded payment loop was the refund path. Finalization, cancellation and
+timeout now allocate once without token calls or a scan over recipients. Each
+claim reads a constant number of records and performs at most one transfer.
+
+| API | Caller / destination | Result |
+| --- | --- | --- |
+| `get_settlement(id)` | Read-only | `total`, `remaining`, `unclaimed`, `claimed` bitmap |
+| `claim_prize(id)` | Anyone; destination is the recorded champion | Whole allocated pot, once |
+| `claim_refund(id, node_index, recipient)` | Anyone; recipient must be a funded entrant of round-0 node `node_index` | One entry fee, once |
+
+For refunds, obtain the recipient's round-0 node from the bracket. Slot
+`2 * node_index` is player1; `2 * node_index + 1` is player2. Those slots map to
+the 64-bit claimed bitmap. Prize settlement uses bit 0. The claim transaction
+needs no recipient signature and cannot redirect payment. A relayer can resume
+in any order by reading the bitmap; a duplicate returns `AlreadyClaimed` without
+transferring funds. A failed reserve check or token transfer rolls back all claim
+progress and can be retried. A blocked recipient does not block other claims.
+
+`Completed` / `Cancelled` now mean bracket progression is terminal, not that all
+money moved. `unclaimed == 0` and `remaining == 0` indicate settlement completion.
+For cancelled tournaments, `funded_count` counts outstanding refunds and decreases
+on successful claims. Round-0 funding flags remain immutable entitlement evidence.
+
+Events `champion`, `cancelled`, and `timeout` retain their payloads but now describe
+allocation. New `("tournament", "allocated")` data is `(id, total, recipient_count)`;
+`("tournament", "claimed")` data is `(id, recipient, amount)` and is emitted only
+on successful payment. Indexers must use `claimed` events to record transfers.
+
+**Upgrade/integration:** existing entrypoint signatures and Tournament/MatchNode
+layouts are unchanged. The new persistent `DataKey::Settlement(id)` is additive;
+no existing records need rewriting. Legacy terminal records have no settlement
+marker because they already paid inline, and new claims reject them with
+`SettlementNotFound`. Active records allocate when next finalized. Deploy the new
+WASM and update clients/relayers for the payout timing change together; regenerate
+bindings for the three new entrypoints and error codes 39-41. This is a behavioral
+compatibility change even though existing call signatures remain valid.
+
+Settlement state and replay bits share one persistent record and TTL, extended on
+every successful claim. Tournament and referenced refund node TTLs are refreshed
+as well. Archived records must be restored using Soroban's restoration workflow
+before claiming; never recreate missing allocations or clear their bitmap. Terminal
+state guards prevent allocation from restarting. There is no claim-expiry confiscation.
+
+Build the tournament for `wasm32v1-none` on the pinned Rust 1.88 toolchain:
+
+```sh
+rustup target add wasm32v1-none
+cargo build -p smile4money-tournament-bracket --target wasm32v1-none --release
+```
+
+The default `wasm32-unknown-unknown` target on this toolchain emits reference-types
+instructions that the SDK 22 host rejects; the MVP-compatible target avoids them.
+
+Tests cover the maximum 64-player field: timeout allocation plus all 64 independent
+refunds, partial cancellation, final prize allocation and claim, replay protection,
+invalid entitlement and transfer/reserve failure recovery. Resource tests reset the
+SDK default CPU/memory budget for each measured call. Native host measurements
+underestimate WASM execution and are not production network simulation; deployment
+must still simulate claims to set network-specific resource declarations.
 
 ## Consequences
 

@@ -28,12 +28,12 @@ pub enum TournamentState {
     /// Every entrant has paid, so the first round is under way.
     InProgress,
 
-    /// The final has been decided and the prize pool has been paid to the
-    /// champion. **Terminal.**
+    /// The final has been decided and the prize is allocated to the champion.
+    /// Claims may remain outstanding. **Terminal for bracket progression.**
     Completed,
 
     /// The tournament was abandoned before a champion emerged. Every funded
-    /// entrant has been refunded. **Terminal.**
+    /// entrant may claim their refund. **Terminal for bracket progression.**
     Cancelled,
 }
 
@@ -65,18 +65,54 @@ pub enum NodeStatus {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Tournament {
-    id: u64,
-    admin: Address,
-    token: Address,
-    entry_fee: i128,
-    player_count: u32,
-    minimum_entrants: u32,
-    rounds: u32,
-    funded_count: u32,
-    state: TournamentState,
-    champion: Option<Address>,
-    created_ledger: u32,
-    completed_ledger: Option<u32>,
+    /// Unique, auto-incrementing identifier. Assigned from the `TournamentCount`
+    /// counter at `create_tournament` time.
+    pub id: u64,
+
+    /// The administrator who created this tournament. Only this address may
+    /// `cancel_tournament` while the tournament is still in `Registration`.
+    pub admin: Address,
+
+    /// The SEP-41 token the entry fees are paid in and the prize pool is paid out
+    /// in. Fixed at `initialize` time for the whole contract.
+    pub token: Address,
+
+    /// The fee each entrant pays, in the smallest unit of [`token`](Tournament::token).
+    ///
+    /// The total prize pool is `entry_fee × player_count`. It is paid to the
+    /// champion in one claim after the final is decided — no per-match payouts
+    /// happen during the tournament, because paying each match's winner
+    /// `2 × entry_fee` would drain the whole pot in the first round.
+    pub entry_fee: i128,
+
+    /// Number of entrants. Always a power of two in `[2, 64]`, so no entrant ever
+    /// receives a bye.
+    pub player_count: u32,
+
+    /// Number of rounds, i.e. `log2(player_count)`. Round 0 is the first round
+    /// and round `rounds - 1` is the final.
+    pub rounds: u32,
+
+    /// How many entrants have paid their entry fee so far. Reaches
+    /// `player_count` when the tournament moves to
+    /// [`InProgress`](TournamentState::InProgress). After cancellation, counts
+    /// funded entrants whose refund has not yet been claimed.
+    pub funded_count: u32,
+
+    /// The current lifecycle state. See [`TournamentState`].
+    pub state: TournamentState,
+
+    /// The winner of the tournament, set when the final is decided.
+    /// `None` until then, and forever on a `Cancelled` tournament.
+    pub champion: Option<Address>,
+
+    /// The ledger at which `create_tournament` ran. `claim_timeout` measures
+    /// `TIMEOUT_LEDGERS` from here.
+    pub created_ledger: u32,
+
+    /// The ledger at which the tournament reached a terminal state.
+    /// `None` while it is still running.
+    pub completed_ledger: Option<u32>,
 }
 
 /// One match in the bracket: a node in the single-elimination tree.
@@ -154,4 +190,20 @@ pub enum DataKey {
 
     /// The SEP-41 token address configured at `initialize` time.
     Token,
+
+    /// Allocation totals and resumable claim progress.
+    Settlement(u64),
+}
+
+/// Allocation created exactly once when a tournament becomes terminal. The
+/// claimed bitmap shares this record's lifetime: no individual claim marker can
+/// expire while funds remain claimable. Refund bit 2*i is node i's first player;
+/// bit 2*i+1 is its second player (round zero).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Settlement {
+    pub total: i128,
+    pub remaining: i128,
+    pub unclaimed: u32,
+    pub claimed: u64,
 }

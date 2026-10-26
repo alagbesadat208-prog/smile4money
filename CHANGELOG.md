@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-#### Smart Contract — Tournament Bracket
-- Permissionless `extend_record_ttl` for settled tournament records and a permanent, restorable retention policy; renewal preserves settlement facts and token balances (#1882).
+#### Tournament settlement
+- Resumable prize/refund allocation and one-recipient `claim_prize` / `claim_refund` calls, with `get_settlement` progress tracking and duplicate-claim protection (#1880).
+- **Payout timing change:** final results, cancellation and timeout now allocate funds; clients must submit separate claims and use settlement progress to distinguish allocation from payment. Existing terminal records cannot be claimed again. See [settlement integration notes](docs/adr/003-tournament-bracket.md#6-resumable-settlement-1880).
 
 #### Smart Contract — Escrow
 - `safe_address` parameter in `initialize`: immutable destination for `emergency_drain`, preventing a compromised admin from draining funds to an arbitrary address (#86)
