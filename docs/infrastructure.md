@@ -32,34 +32,6 @@ Environments are defined in `environments.toml`. Four environments are recognize
 | `futurenet` | Preview of upcoming Stellar features | `https://rpc-futurenet.stellar.org` |
 | `mainnet` | Production | `https://soroban-mainnet.stellar.org` |
 
-### Single source of truth for network and contract metadata
-
-`environments.toml` is the only place a network's identity is defined: its name, passphrase,
-Soroban RPC and Horizon endpoints, friendbot, and deployed contract ids (`[<env>.contracts]`).
-Every other consumer is generated from it or checked against it by `scripts/network_config.py`.
-The **Validate Environments** workflow runs `--check` on every change to a consumer.
-
-| Consumer | How it stays in sync |
-|---|---|
-| `apps/frontend/src/config/networks.generated.ts` | Generated (`python scripts/network_config.py --write`). Components read it through `src/config/network.ts` (`APP_NETWORK_CONFIG`, `configForWallet`) |
-| `apps/backend/src/config/networks.generated.ts` | Generated. `src/config/network.ts` resolves `STELLAR_NETWORK` against it and `server.ts` calls it at startup |
-| `.env.example` | Checked: `STELLAR_NETWORK` / `VITE_STELLAR_NETWORK` must exist and agree, each `*_RPC_URL` must be that network's endpoint, and non-placeholder `CONTRACT_*` values must match the table |
-| `scripts/deploy_testnet.sh`, `scripts/deploy_mainnet.sh` | Checked: `RPC_URL` and `NETWORK_PASSPHRASE` must match the table |
-| Any other file in `apps/*/src` | Checked: hard-coding an RPC/Horizon URL or passphrase, or using `Networks.TESTNET`/`PUBLIC`, fails |
-
-Conflicting identities are rejected in two places:
-
-- **In the table itself.** A passphrase can't be listed under the wrong network name, and a local
-  network can't claim a public passphrase. No two environments may share an endpoint or a
-  contract id, and an RPC URL can't name another network.
-- **At backend startup.** For example, `STELLAR_NETWORK=mainnet` with the testnet RPC URL, a
-  passphrase from another network, or another network's contract id all fail.
-
-An operator can still point `STELLAR_RPC_URL` at a private node for the *same* network.
-
-To deploy a contract or add a network, edit `environments.toml`, run
-`python scripts/network_config.py --write`, and commit the regenerated files with it.
-
 ### Environment promotion path
 
 ```
@@ -201,15 +173,9 @@ All secrets are managed through GitHub Actions Secrets. No secret values are eve
 
 ## 7. Toolchain and Dependency Pinning
 
-Which **combinations** of protocol, SDK and wallet are supported, and how upgrades are tested
-ahead of time, is defined in [compatibility.md](compatibility.md). The CI **Compatibility Matrix**
-job fails if any pin below drifts from it.
-
 | Tool | Pinned version | Location |
 |------|---------------|----------|
-| Rust | 1.88.0 | `rust-toolchain.toml`, all workflow files |
-| soroban-sdk | 22.0.11 | `Cargo.toml` `[workspace.dependencies]` |
-| @stellar/stellar-sdk | 16.0.1 | `apps/backend/package.json`, `apps/frontend/package.json` |
+| Rust | 1.81.0 | `rust-toolchain.toml`, all workflow files |
 | WASM target | `wasm32-unknown-unknown` | `rust-toolchain.toml` |
 | Stellar CLI | v22.0.1 | `deploy.yml` install step |
 | `cargo-audit` | 0.21.0 | `audit.yml` install step |
@@ -231,44 +197,6 @@ No monitoring or alerting is currently configured. This is acceptable for testne
 - **Contract event indexing:** Set up a Stellar Horizon or custom event listener to index `match.created`, `match.completed`, `match.cancelled`, and `oracle.result` events. These events are already emitted by the contracts.
 - **Oracle health check:** The Oracle service should expose a `/health` endpoint. A simple uptime monitor (e.g., GitHub Actions scheduled ping, or an external service) should alert if the Oracle goes down.
 - **Deployment verification:** After each deploy, run a smoke test that calls `get_match` on a known match ID (or creates a test match) to confirm the deployed contract is responsive.
-
-### 8.1 Trace context propagation
-
-The backend follows [W3C Trace Context](https://www.w3.org/TR/trace-context/) so one trace id
-follows a match from the HTTP request that started it, through durable queue work, to the
-provider and Stellar RPC calls that work makes, including retries hours later and after a
-restart.
-
-| Hop | How the trace continues | Code |
-|-----|-------------------------|------|
-| Browser → API | The frontend sends a fresh `traceparent` on backend calls (never to Horizon or other third parties) | `apps/frontend/src/utils/trace-context.ts` |
-| API request | `traceContext()` middleware continues a valid incoming `traceparent` (or starts a trace) and echoes the server span in the `traceparent` response header | `apps/backend/src/middleware/trace-context.ts` |
-| Logs | Every structured log line inside a context carries `trace_id`, `span_id` and `parent_span_id` | `apps/backend/src/logger.ts`, `apps/backend/src/queue.ts` |
-| Polling job | `PollingJobStore.createJob` stores the creating request's context; each poll runs as a child span of it | `apps/backend/src/services/polling.ts` |
-| Oracle DLQ | `writeToDlq` stores `{ traceparent, tracestate }` with the entry (SQLite column `traceContext`, Mongo field, in-memory). Each retry resumes it as a new child span under the original trace id | `apps/backend/src/queue.ts`, `apps/backend/src/store/*-queue-store.ts` |
-| Provider calls | Lichess and Chess.com requests send `traceparent`/`tracestate` | `apps/backend/src/fetchers/*.ts` |
-| Stellar RPC | An axios interceptor on the shared RPC client adds the headers | `apps/backend/src/services/stellar.ts` |
-
-**Finding a trace.** Take the `traceparent` from the API response (or the `trace_id` on any log line), then
-filter logs on `trace_id`. DLQ retries keep the trace id and show as sibling spans with the same
-`parent_span_id`.
-
-**Older entries.** DLQ rows written before this existed have no stored context (the SQLite column
-is added on startup). They, and any row whose stored value is corrupt, get a fresh trace on retry
-rather than failing.
-
-**What a trace may contain.** Random trace and span ids, the sampling flag, and a sanitised
-`tracestate`. Nothing else: no request bodies, wallet addresses, Stellar secret keys, JWTs or
-provider tokens. `tracestate` is the only client-controlled field, so `sanitizeTraceState` drops
-any member that is malformed, has a credential-like key (`token`, `secret`, `auth`, `apikey`, …), or
-holds a Stellar secret seed, a JWT or a Lichess token, and enforces the spec's 32-member and
-512-character limits. `tests/tracing/trace-context.test.ts` sends a hostile `tracestate` and asserts
-that none of those values reach the stored entry, the logs or outbound headers. The provider API
-token is only ever sent in `Authorization`.
-
-**Exporting spans.** This is propagation only; nothing is exported yet. An OpenTelemetry collector
-that reads `traceparent` (or a log pipeline grouping on `trace_id`) can stitch the hops together.
-Adding an exporter later needs no change to what is persisted.
 
 ---
 
@@ -328,5 +256,47 @@ These items are not yet implemented and represent the next infrastructure work t
 | `environments.toml` | Network RPC URLs and passphrases |
 | `.env.example` | Template for environment variables |
 | `rust-toolchain.toml` | Pinned Rust toolchain |
-| `compatibility-matrix.json` | Supported and candidate version combinations ([compatibility.md](compatibility.md)) |
-| `.github/workflows/compatibility.yml` | Weekly/on-demand compatibility build of every combination |
+
+### SQLite production concurrency
+
+SQLite supports **one backend process in one replica**, with database files on a
+local persistent volume. Each connection uses WAL journal mode and a busy timeout
+of 5,000 ms; existing bounded lock retries remain enabled. Concurrent requests
+within that process are supported; SQLite serializes their writes. WAL permits
+readers alongside the single active writer. Do not place these files on a network
+filesystem or share them across containers/hosts.
+
+Set `SQLITE_CONCURRENCY_MODE=single-process` (the default), `BACKEND_REPLICAS=1`,
+and `WEB_CONCURRENCY=1`. Startup rejects another mode or a declared process/replica
+count other than one, for every SQLite store. Set `SQLITE_BUSY_TIMEOUT_MS` to an
+integer from 1 through 60,000 to change the per-connection wait. Deployment
+manifests must declare the real replica/worker counts: the service cannot discover
+undeclared replicas. This restriction covers matches, rate limits, queue, and
+circuit-breaker state, even if `QUEUE_STORE` uses another backend. Scaling requires
+migrating all local stores and coordinating workers first.
+
+### Oracle signer rotation
+
+Mount the current Stellar secret seed in a secret-manager-owned file and set
+`ORACLE_SIGNER_SECRET_FILE` to its path. Restrict file access to the service user.
+Set `STELLAR_RPC_URL` and `CONTRACT_ORACLE` for the deployed oracle. The service
+loads the seed at startup and before each submission attempt, then reads the
+contract's active `InstanceState.admin` from RPC and compares it to the public
+key. Missing, malformed, unauthorized keys or an unavailable role lookup fail
+closed before submission. A pending admin proposal is insufficient.
+
+Complete the contract's `propose_admin` / `accept_admin` transfer and atomically
+replace the mounted secret file with the new seed. Pause workers during the
+transfer if uninterrupted attempts matter; failures in the transition leave jobs
+queued. Restarting is unnecessary for a running worker to pick up the file.
+Jobs contain submission data only, never a seed or signer address; do not rewrite
+or discard pending jobs. The retry worker removes a job only after its handler
+succeeds and does not create a replacement job on failure.
+
+The transport prepares `submit_result` with Soroban RPC, signs with that attempt's
+validated key, and confirms the transaction before removing the job. On an
+ambiguous timeout the job stays queued; the next attempt queries `has_result`
+before submitting again. Set `STELLAR_NETWORK=testnet` (default) or `mainnet`, or
+provide `STELLAR_NETWORK_PASSPHRASE` explicitly for a custom network. The source
+account must be funded, and the deployed contract must use the current oracle
+`InstanceState` storage layout.

@@ -199,7 +199,8 @@ export function computeIdentityHash(
   player2Address: string,
 ): string {
   const normalizeUsername = (name: string) => (name || '').trim().toLowerCase();
-  const normalizeAddress = (address: string) => (address || '').trim().toUpperCase();
+  const normalizeAddress = (address: string) =>
+    (address || '').trim().toUpperCase();
 
   const material = [
     normalizeUsername(player1Username),
@@ -226,7 +227,8 @@ export function verifyIdentityHash(match: MatchRecord): VerificationResult {
   if (!match.player1Username || !match.player2Username) {
     return {
       valid: false,
-      error: 'Match has a stored identityHash but is missing the usernames needed to recompute it',
+      error:
+        'Match has a stored identityHash but is missing the usernames needed to recompute it',
     };
   }
 
@@ -277,3 +279,12 @@ export function verifyIdentityHash(match: MatchRecord): VerificationResult {
  * The verification logic now matches usernames to colors without modifying
  * the identity map. See verifyPlayerIdentities() for details.
  */
+
+/** Erase off-chain identity linkage for the authenticated wallet. */
+export async function unlinkPlayerIdentities(
+  store: { unlinkIdentities(address: string): Promise<number> },
+  authenticatedAddress: string,
+): Promise<number> {
+  if (!authenticatedAddress) throw new Error('Authenticated wallet required');
+  return store.unlinkIdentities(authenticatedAddress);
+}

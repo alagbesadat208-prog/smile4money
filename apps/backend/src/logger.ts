@@ -1,4 +1,55 @@
-import { traceLogFields } from './tracing/trace-context.js';
+import { LOG_EVENTS } from './log-events.js';
+
+const NUMERIC_FIELDS = new Set([
+  'status',
+  'duration_ms',
+  'count',
+  'store_count',
+  'attempt',
+  'attempts',
+  'max_retries',
+  'retry_delay_ms',
+  'nextRetryDelayMs',
+  'totalAttempts',
+  'port',
+  'value',
+  'remaining',
+  'cooldown',
+  'failureCount',
+  'durationMs',
+]);
+const ENUM_FIELDS: Record<string, readonly string[]> = {
+  method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
+  platform: ['lichess', 'chessdotcom'],
+  state: ['CLOSED', 'OPEN', 'HALF_OPEN'],
+  store: ['sqlite', 'memory', 'mongodb'],
+  sqlite_error_code: ['SQLITE_BUSY', 'SQLITE_LOCKED'],
+  metric: ['oracle_dlq_depth'],
+};
+
+/** Unknown fields and all arbitrary strings/errors are masked at the sink. */
+export function safeLogContext(
+  context: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(context)
+      .filter(
+        ([key]) =>
+          NUMERIC_FIELDS.has(key) ||
+          Object.prototype.hasOwnProperty.call(ENUM_FIELDS, key),
+      )
+      .map(([key, value]) => [
+        key,
+        NUMERIC_FIELDS.has(key) &&
+        typeof value === 'number' &&
+        Number.isFinite(value)
+          ? value
+          : typeof value === 'string' && ENUM_FIELDS[key]?.includes(value)
+            ? value
+            : '[REDACTED]',
+      ]),
+  );
+}
 
 /**
  * Simple JSON logger for structured logging.
@@ -11,17 +62,13 @@ interface LogContext {
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-const LEVEL_ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+const LEVEL_ORDER: Record<LogLevel, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+};
 
-/**
- * Resolve the minimum log level that should actually be emitted (#1722).
- *
- * Explicit `LOG_LEVEL` always wins. Otherwise defaults to `info` in
- * production (so DEBUG-level output — including the request-body logging in
- * `middleware/request-logging.ts`, which may contain fields considered
- * sensitive even after redaction — never reaches production logs by
- * accident) and `debug` everywhere else.
- */
 function configuredLevel(): LogLevel {
   const raw = (process.env.LOG_LEVEL || '').toLowerCase();
   if (raw === 'debug' || raw === 'info' || raw === 'warn' || raw === 'error') {
@@ -44,11 +91,8 @@ class Logger {
       timestamp: new Date().toISOString(),
       level,
       service: 'smile4money-backend',
-      message,
-      // #123 — trace_id/span_id of the active W3C trace context, so log
-      // lines from a request, its queued work and its retries join up.
-      ...traceLogFields(),
-      ...context,
+      message: LOG_EVENTS.has(message) ? message : 'log_event',
+      ...safeLogContext(context),
     };
     console.log(JSON.stringify(logEntry));
   }

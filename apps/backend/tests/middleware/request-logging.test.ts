@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { requestLogging, redactSensitiveFields } from '../../src/middleware/request-logging.js';
+import { requestLogging } from '../../src/middleware/request-logging.js';
 
 function captureConsoleLog(): string[] {
   const lines: string[] = [];
@@ -38,37 +38,6 @@ function appWithLogging() {
   return app;
 }
 
-describe('redactSensitiveFields', () => {
-  it('replaces known-sensitive keys with a redaction marker', () => {
-    const result = redactSensitiveFields({
-      player1: 'GPLAYER1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-      player2: 'GPLAYER2BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
-      username: 'alice',
-      gameId: 'game-123',
-      stakeAmount: 100,
-    }) as Record<string, unknown>;
-
-    expect(result.player1).toBe('[REDACTED]');
-    expect(result.player2).toBe('[REDACTED]');
-    expect(result.username).toBe('[REDACTED]');
-    // Non-sensitive fields pass through unchanged.
-    expect(result.gameId).toBe('game-123');
-    expect(result.stakeAmount).toBe(100);
-  });
-
-  it('is case-insensitive on key names', () => {
-    const result = redactSensitiveFields({ Player1: 'GABC', WalletAddress: 'GXYZ' }) as Record<string, unknown>;
-    expect(result.Player1).toBe('[REDACTED]');
-    expect(result.WalletAddress).toBe('[REDACTED]');
-  });
-
-  it('passes through non-object bodies unchanged', () => {
-    expect(redactSensitiveFields(null)).toBeNull();
-    expect(redactSensitiveFields(undefined)).toBeUndefined();
-    expect(redactSensitiveFields('a string')).toBe('a string');
-  });
-});
-
 describe('requestLogging middleware', () => {
   const originalLogLevel = process.env.LOG_LEVEL;
   const originalNodeEnv = process.env.NODE_ENV;
@@ -86,9 +55,11 @@ describe('requestLogging middleware', () => {
     delete process.env.LOG_LEVEL;
     const lines = captureConsoleLog();
 
-    await request(appWithLogging())
-      .post('/echo')
-      .send({ player1: 'GSECRETADDRESS', username: 'alice', gameId: 'game-123' });
+    await request(appWithLogging()).post('/echo').send({
+      player1: 'GSECRETADDRESS',
+      username: 'alice',
+      gameId: 'game-123',
+    });
 
     const logs = parsedLogs(lines);
     expect(logs.length).toBeGreaterThan(0);
@@ -106,23 +77,16 @@ describe('requestLogging middleware', () => {
     expect(summary.status).toBe(200);
   });
 
-  it('at DEBUG level, the body is logged but sensitive fields are redacted, not raw', async () => {
+  it('at DEBUG level, request bodies are never emitted', async () => {
     process.env.LOG_LEVEL = 'debug';
     const lines = captureConsoleLog();
-
-    await request(appWithLogging())
-      .post('/echo')
-      .send({ player1: 'GSECRETADDRESS', username: 'alice', gameId: 'game-123' });
-
-    const logs = parsedLogs(lines);
-    const bodyLog = logs.find((l) => l.message === 'http_request_body');
-    expect(bodyLog).toBeDefined();
-    expect(bodyLog.body.player1).toBe('[REDACTED]');
-    expect(bodyLog.body.username).toBe('[REDACTED]');
-    expect(bodyLog.body.gameId).toBe('game-123'); // non-sensitive, passes through
-
-    // The raw secret value must never appear anywhere in the emitted output.
-    expect(JSON.stringify(logs)).not.toContain('GSECRETADDRESS');
+    await request(appWithLogging()).post('/echo').send({
+      player1: 'GSECRETADDRESS',
+      username: 'alice',
+      gameId: 'game-123',
+    });
+    expect(parsedLogs(lines).find((l) => l.body)).toBeUndefined();
+    expect(lines.join('')).not.toMatch(/GSECRETADDRESS|alice|game-123/);
   });
 
   it('does not emit a body line at all when DEBUG is not enabled', async () => {
@@ -130,7 +94,9 @@ describe('requestLogging middleware', () => {
     delete process.env.LOG_LEVEL;
     const lines = captureConsoleLog();
 
-    await request(appWithLogging()).post('/echo').send({ player1: 'GSECRETADDRESS' });
+    await request(appWithLogging())
+      .post('/echo')
+      .send({ player1: 'GSECRETADDRESS' });
 
     const logs = parsedLogs(lines);
     expect(logs.find((l) => l.message === 'http_request_body')).toBeUndefined();

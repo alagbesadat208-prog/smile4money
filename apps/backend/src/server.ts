@@ -1,60 +1,96 @@
+import {
+  OracleContractTransport,
+  oracleNetworkPassphrase,
+} from './services/oracle-contract.js';
+import { sqliteSettings } from './store/sqlite-config.js';
+import { rpc } from '@stellar/stellar-sdk';
+import {
+  createManagedSignerProvider,
+  managedSubmissionHandler,
+} from './services/oracle-signer.js';
 import dotenv from 'dotenv';
 dotenv.config();
 
 import { app } from './app.js';
-import { initializeQueue, closeQueue, startRetryWorker, startDlqEvictionTask, listDlqEntries, writeToDlq, type DlqEntry } from './queue.js';
-import { initializeMatchStore, closeMatchStore, matchStore } from './store/index.js';
-import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/circuit-breaker.js';
-import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
+import {
+  initializeQueue,
+  closeQueue,
+  startRetryWorker,
+  startDlqEvictionTask,
+  listDlqEntries,
+  writeToDlq,
+  type DlqEntry,
+} from './queue.js';
+import { initializeMatchStore } from './store/index.js';
+import {
+  initializeCircuitBreaker,
+  closeCircuitBreakerStore,
+} from './services/circuit-breaker.js';
+import {
+  PollingJobStore,
+  PollingWorker,
+  parsePollingIntervalMs,
+} from './services/polling.js';
 import ChessPlatformPoller from './services/game-poller.js';
 import { getCurrentLedger } from './services/stellar.js';
-import { retryDlqSubmission, type OracleSubmission } from './services/oracle-submit.js';
+import { type OracleSubmission } from './services/oracle-submit.js';
 import { createShutdownHandler } from './shutdown.js';
-import { resolveNetworkConfig } from './config/network.js';
 import logger from './logger.js';
 
 const port = Number(process.env.PORT || 4000);
 
-/**
- * Placeholder for the actual Stellar contract submission handler.
- * This would be wired up with the Stellar SDK and oracle keypair.
- * For now, it throws to indicate this is not yet implemented.
- */
-async function submitOracleResultToContract(submission: OracleSubmission): Promise<void> {
-  // TODO: Implement actual Stellar contract submission
-  // This should:
-  // 1. Create a transaction builder
-  // 2. Add the oracle contract's submit_result operation
-  // 3. Sign with the oracle keypair
-  // 4. Submit to Soroban RPC
-  throw new Error('Oracle contract submission not yet implemented. Set up Stellar SDK and oracle keypair.');
-}
-
-/**
- * Placeholder for checking if a result already exists on-chain.
- * Used for idempotent submission (skip if already submitted).
- */
-async function checkResultExistsOnChain(matchId: number): Promise<boolean> {
-  // TODO: Implement existence check via Stellar RPC
-  // This should query the oracle contract to see if a result exists for this matchId
-  return false; // For now, assume it doesn't exist so retries will attempt submission
-}
+const signerRpc = new rpc.Server(
+  process.env.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org',
+  { timeout: 10000 },
+);
+const contractId = process.env.CONTRACT_ORACLE || '';
+const signerProvider = createManagedSignerProvider(signerRpc, contractId);
+const oracleTransport = new OracleContractTransport(
+  signerRpc,
+  contractId,
+  oracleNetworkPassphrase(),
+);
+const submitOracleResultToContract = managedSubmissionHandler(
+  signerProvider,
+  (submission, signer) => oracleTransport.submit(submission, signer),
+);
 
 /**
  * Oracle retry handler for reprocessing DLQ entries.
  *
- * One attempt per worker cycle via retryDlqSubmission (#122): a failure is
- * re-thrown so the entry stays in the DLQ with its attempt count incremented;
- * a result already on-chain resolves the entry without resubmitting.
+ * Reconstructs the original OracleSubmission from the DLQ entry payload and attempts
+ * to submit it to the blockchain with idempotence checks. If submission fails, the error
+ * is thrown so the entry remains in the DLQ for the next retry cycle.
  */
 async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
+  const submission = entry.payload as OracleSubmission;
+
+  if (
+    !submission ||
+    typeof submission !== 'object' ||
+    !('matchId' in submission)
+  ) {
+    throw new Error(
+      `Invalid DLQ entry payload: expected OracleSubmission, got ${typeof entry.payload}`,
+    );
+  }
+
+  logger.debug(
+    { dlqId: entry.id, matchId: submission.matchId, gameId: submission.gameId },
+    'oracle_dlq: retrying oracle submission',
+  );
+
   try {
-    await retryDlqSubmission(entry, submitOracleResultToContract, checkResultExistsOnChain);
+    if (!(await oracleTransport.hasResult(submission.matchId))) {
+      // The worker already owns the durable job: failure must leave it queued,
+      // rather than creating a second DLQ record or reporting success.
+      await submitOracleResultToContract(submission);
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.warn(
-      { dlqId: entry.id, attempt: entry.attempts, error: message },
-      'oracle_dlq: submission failed, entry will remain in DLQ'
+      { dlqId: entry.id, matchId: submission.matchId, error: message },
+      'oracle_dlq: submission failed, entry will remain in DLQ',
     );
     throw err; // Re-throw so the entry stays in the DLQ
   }
@@ -62,13 +98,9 @@ async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
 
 async function main() {
   try {
-    // #118 — fail fast on a network identity conflict (e.g. mainnet with the
-    // testnet RPC, or another network's contract id) before touching any store.
-    const network = resolveNetworkConfig(process.env);
-    logger.info(
-      { network: network.network, rpc_url_overridden: network.rpcUrlOverridden },
-      'stellar_network_resolved',
-    );
+    sqliteSettings();
+    // Refuse to process queued work with an absent or unauthorized key.
+    await signerProvider.getAuthorizedSigner();
 
     // Initialize the persistent queue store
     await initializeQueue();
@@ -88,7 +120,7 @@ async function main() {
     const pendingEntries = await listDlqEntries();
     logger.info(
       { count: pendingEntries.length },
-      `Loaded ${pendingEntries.length} pending oracle submissions from queue`
+      'oracle_pending_submissions_loaded',
     );
 
     // Start the retry worker
@@ -101,7 +133,9 @@ async function main() {
     const pollingStore = new PollingJobStore();
     const gamePoller = new ChessPlatformPoller();
     const pollingWorker = new PollingWorker(pollingStore, gamePoller, {
-      pollingIntervalMs: parsePollingIntervalMs(process.env.POLLING_INTERVAL_MS),
+      pollingIntervalMs: parsePollingIntervalMs(
+        process.env.POLLING_INTERVAL_MS,
+      ),
       maxPollingAttempts: Number(process.env.MAX_POLLING_ATTEMPTS ?? 1440),
       backoffMultiplier: Number(process.env.POLLING_BACKOFF_MULTIPLIER ?? 1.0),
       // #51 — lets the worker detect a match that has exceeded the escrow
@@ -109,7 +143,6 @@ async function main() {
       // instead of polling a match no payout can still reach.
       getCurrentLedger,
       onGameCompleted: async (job, result) => {
-        await matchStore.updateSettlementState(job.matchId, 'completed');
         logger.info(
           {
             match_id: job.matchId,
@@ -124,7 +157,6 @@ async function main() {
         // e.g. await submitToOracle({ matchId: job.matchId, gameId: job.gameId, result })
       },
       onMaxAttemptsExceeded: async (job, reason) => {
-        await matchStore.updateSettlementState(job.matchId, 'failed');
         logger.error(
           {
             match_id: job.matchId,
@@ -135,60 +167,14 @@ async function main() {
           },
           'polling_job_max_attempts_exceeded_writing_to_dlq',
         );
-        await writeToDlq(
-          { job },
-          reason ?? 'max polling attempts exceeded',
-        );
+        await writeToDlq({ job }, reason ?? 'max polling attempts exceeded');
       },
     });
-    const activeSettlementJobs = await matchStore.listActiveSettlementJobs();
-    for (const job of activeSettlementJobs) {
-      pollingStore.ensureJob(job.matchId, job.gameId, job.platform, job.username);
-    }
     const stopPollingWorker = pollingWorker.start();
-
-    // Deliver committed work at least once. The durable job table restores
-    // active work across restarts; ensureJob makes an interrupted replay safe.
-    let dispatching = false;
-    let dispatchPromise: Promise<void> | null = null;
-    const dispatchOutbox = async () => {
-      if (dispatching) return;
-      dispatching = true;
-      dispatchPromise = (async () => {
-        try {
-          await matchStore.dispatchOutbox(async (event) => {
-            const payload = event.payload as {
-              matchId: number;
-              gameId: string;
-              platform: 'lichess' | 'chessdotcom';
-              username?: string;
-            };
-            pollingStore.ensureJob(payload.matchId, payload.gameId, payload.platform, payload.username);
-            await matchStore.updateSettlementState(payload.matchId, 'processing');
-          });
-          await matchStore.cleanupTerminalWork();
-        } catch (error) {
-          logger.error({ error }, 'settlement_outbox_dispatch_failed');
-        } finally {
-          dispatching = false;
-        }
-      })();
-      try {
-        await dispatchPromise;
-      } finally {
-        dispatchPromise = null;
-      }
-    };
-    void dispatchOutbox();
-    const outboxTimer = setInterval(() => void dispatchOutbox(), 1000);
-    outboxTimer.unref?.();
 
     // Start the Express server
     const server = app.listen(port, () => {
-      logger.info(
-        { port },
-        `smile4money-backend listening on http://localhost:${port}`
-      );
+      logger.info({ port }, 'http_server_listening');
     });
 
     // Graceful shutdown (#1719) — see shutdown.ts for the full sequencing
@@ -197,14 +183,9 @@ async function main() {
     const shutdown = createShutdownHandler({
       server,
       stopPollingWorker,
-      stopOutboxDispatcher: async () => {
-        clearInterval(outboxTimer);
-        await dispatchPromise;
-      },
       stopRetryWorker,
       stopDlqEviction,
       closeQueue,
-      closeMatchStore,
       closeCircuitBreakerStore,
       logger,
       shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000),

@@ -1,3 +1,4 @@
+import { sqliteSettings, configureSqlite } from "./sqlite-config.js";
 /**
  * SQLite Persistent Queue Store
  *
@@ -24,7 +25,6 @@ import type {
   PersistentQueueStore,
 } from "./persistent-queue-store.js";
 import logger from "../logger.js";
-import { applySqliteMigrations } from "./sqlite-migrations.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -46,7 +46,10 @@ function getMaxRetries(): number {
 }
 
 function getRetryBaseDelayMs(): number {
-  return readPositiveInt(process.env.SQLITE_RETRY_BASE_DELAY_MS, DEFAULT_BASE_DELAY_MS);
+  return readPositiveInt(
+    process.env.SQLITE_RETRY_BASE_DELAY_MS,
+    DEFAULT_BASE_DELAY_MS,
+  );
 }
 
 export interface SqliteError extends Error {
@@ -135,6 +138,7 @@ export class SQLiteQueueStore implements PersistentQueueStore {
   }
 
   async initialize(): Promise<void> {
+    sqliteSettings();
     // Ensure the data directory exists
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
@@ -147,59 +151,34 @@ export class SQLiteQueueStore implements PersistentQueueStore {
         else resolve();
       });
     });
+    await configureSqlite(this.getDb());
 
-    await withRetry<void>("initialize:walMode", (cb) =>
-      this.getDb().run(`PRAGMA journal_mode=WAL`, (err: Error | null) => cb(err)),
+    await withRetry<void>("initialize:createTable", (cb) =>
+      this.getDb().run(
+        `
+        CREATE TABLE IF NOT EXISTS oracle_dlq (
+          id TEXT PRIMARY KEY NOT NULL,
+          payload TEXT NOT NULL,
+          failureReason TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          createdAt INTEGER NOT NULL,
+          lastAttemptAt INTEGER,
+          expireAt INTEGER NOT NULL,
+          CONSTRAINT expireAt_check CHECK (expireAt > 0)
+        )
+        `,
+        (err: Error | null) => cb(err),
+      ),
     );
-    await applySqliteMigrations(this.getDb(), [
-      {
-        version: 1,
-        name: "create-dlq",
-        statements: [
-          `CREATE TABLE IF NOT EXISTS oracle_dlq (id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL, failureReason TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL, lastAttemptAt INTEGER, expireAt INTEGER NOT NULL, CONSTRAINT expireAt_check CHECK (expireAt > 0))`,
-          `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_expireAt ON oracle_dlq(expireAt)`,
-        ],
-      },
-      {
-        version: 2,
-        name: "dlq-retention-audit",
-        statements: [
-          `CREATE TABLE IF NOT EXISTS oracle_dlq_audit (id TEXT PRIMARY KEY NOT NULL, createdAt INTEGER NOT NULL, archivedAt INTEGER NOT NULL, reason TEXT NOT NULL)`,
-          `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_audit_archivedAt ON oracle_dlq_audit(archivedAt)`,
-        ],
-      },
-    ]);
-    this.initialized = true;
-  }
 
-  private async cleanupTerminal(batchSize = 100): Promise<number> {
-    const now = Date.now();
-    let removed = 0;
-    for (;;) {
-      const rows = await withRetry<any[]>("cleanup:select", (cb) =>
-        this.getDb().all(
-          `SELECT id, createdAt FROM oracle_dlq WHERE expireAt < ? ORDER BY expireAt LIMIT ?`,
-          [now, batchSize],
-          (err: Error | null, result: any[]) => cb(err, result),
-        ),
-      );
-      if (!rows.length) return removed;
-      await withRetry<void>("cleanup:archive", (cb) =>
-        this.getDb().run(
-          `INSERT OR IGNORE INTO oracle_dlq_audit(id, createdAt, archivedAt, reason) SELECT id, createdAt, ?, 'retention-expired' FROM oracle_dlq WHERE id IN (${rows.map(() => "?").join(",")})`,
-          [now, ...rows.map((row) => row.id)],
-          (err: Error | null) => cb(err),
-        ),
-      );
-      await withRetry<void>("cleanup:delete", (cb) =>
-        this.getDb().run(
-          `DELETE FROM oracle_dlq WHERE id IN (${rows.map(() => "?").join(",")})`,
-          rows.map((row) => row.id),
-          (err: Error | null) => cb(err),
-        ),
-      );
-      removed += rows.length;
-    }
+    await withRetry<void>("initialize:createIndex", (cb) =>
+      this.getDb().run(
+        `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_expireAt ON oracle_dlq(expireAt)`,
+        (err: Error | null) => cb(err),
+      ),
+    );
+
+    this.initialized = true;
   }
 
   async add(entry: DlqEntry): Promise<void> {
@@ -222,44 +201,22 @@ export class SQLiteQueueStore implements PersistentQueueStore {
         (err: Error | null) => cb(err),
       ),
     );
-    await this.cleanupTerminal();
-    const maxEntries = readPositiveInt(process.env.DLQ_MAX_ENTRIES, 10000);
-    let excess = Math.max(0, (await this.count()) - maxEntries);
-    while (excess > 0) {
-      const victims = await withRetry<any[]>("add:capacitySelect", (cb) =>
-        this.getDb().all(
-          `SELECT id, createdAt FROM oracle_dlq ORDER BY createdAt LIMIT ?`,
-          [Math.min(excess, 100)],
-          (err: Error | null, rows: any[]) => cb(err, rows),
-        ),
-      );
-      if (!victims.length) throw new Error(`DLQ capacity cannot be enforced (${maxEntries} entries)`);
-      const now = Date.now();
-      await withRetry<void>("add:capacityArchive", (cb) =>
-        this.getDb().run(
-          `INSERT OR IGNORE INTO oracle_dlq_audit(id, createdAt, archivedAt, reason) SELECT id, createdAt, ?, 'capacity' FROM oracle_dlq WHERE id IN (${victims.map(() => "?").join(",")})`,
-          [now, ...victims.map((row) => row.id)],
-          (err: Error | null) => cb(err),
-        ),
-      );
-      await withRetry<void>("add:capacityDelete", (cb) =>
-        this.getDb().run(
-          `DELETE FROM oracle_dlq WHERE id IN (${victims.map(() => "?").join(",")})`,
-          victims.map((row) => row.id),
-          (err: Error | null) => cb(err),
-        ),
-      );
-      excess = Math.max(0, (await this.count()) - maxEntries);
-    }
   }
 
   async getAll(): Promise<DlqEntry[]> {
     // Delete expired entries first.
-    await this.cleanupTerminal();
+    await withRetry<void>("getAll:deleteExpired", (cb) =>
+      this.getDb().run(
+        `DELETE FROM oracle_dlq WHERE expireAt < ?`,
+        [Date.now()],
+        (err: Error | null) => cb(err),
+      ),
+    );
 
     const rows = await withRetry<any[]>("getAll:select", (cb) =>
-      this.getDb().all(`SELECT * FROM oracle_dlq WHERE expireAt >= ? ORDER BY createdAt ASC`, [Date.now()], (err: Error | null, result: any[]) =>
-        cb(err, result),
+      this.getDb().all(
+        `SELECT * FROM oracle_dlq ORDER BY createdAt ASC`,
+        (err: Error | null, result: any[]) => cb(err, result),
       ),
     );
 
@@ -274,16 +231,12 @@ export class SQLiteQueueStore implements PersistentQueueStore {
   }
 
   async remove(id: string): Promise<void> {
-    const now = Date.now();
-    await withRetry<void>("remove:archive", (cb) =>
+    await withRetry<void>("remove", (cb) =>
       this.getDb().run(
-        `INSERT OR IGNORE INTO oracle_dlq_audit(id, createdAt, archivedAt, reason) SELECT id, createdAt, ?, 'resolved-or-operator-removed' FROM oracle_dlq WHERE id = ?`,
-        [now, id],
+        `DELETE FROM oracle_dlq WHERE id = ?`,
+        [id],
         (err: Error | null) => cb(err),
       ),
-    );
-    await withRetry<void>("remove", (cb) =>
-      this.getDb().run(`DELETE FROM oracle_dlq WHERE id = ?`, [id], (err: Error | null) => cb(err)),
     );
   }
 
@@ -307,8 +260,10 @@ export class SQLiteQueueStore implements PersistentQueueStore {
     values.push(id);
 
     await withRetry<void>("update", (cb) =>
-      this.getDb().run(`UPDATE oracle_dlq SET ${setClauses.join(", ")} WHERE id = ?`, values, (err: Error | null) =>
-        cb(err),
+      this.getDb().run(
+        `UPDATE oracle_dlq SET ${setClauses.join(", ")} WHERE id = ?`,
+        values,
+        (err: Error | null) => cb(err),
       ),
     );
   }
@@ -326,7 +281,9 @@ export class SQLiteQueueStore implements PersistentQueueStore {
 
   async clear(): Promise<void> {
     await withRetry<void>("clear", (cb) =>
-      this.getDb().run(`DELETE FROM oracle_dlq`, (err: Error | null) => cb(err)),
+      this.getDb().run(`DELETE FROM oracle_dlq`, (err: Error | null) =>
+        cb(err),
+      ),
     );
   }
 

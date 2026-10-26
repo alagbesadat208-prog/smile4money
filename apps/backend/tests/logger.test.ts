@@ -11,25 +11,13 @@ import logger from '../src/logger.js';
  * 4. Standard fields (timestamp, level, message, service) are present
  */
 describe('Structured JSON Logger', () => {
-  let originalStdout: any;
-  let originalStderr: any;
   let logOutput: string[] = [];
 
   beforeEach(() => {
     logOutput = [];
 
-    // Capture stdout and stderr
-    originalStdout = process.stdout.write;
-    originalStderr = process.stderr.write;
-
-    process.stdout.write = vi.fn((str) => {
-      logOutput.push(str as string);
-      return true;
-    });
-
-    process.stderr.write = vi.fn((str) => {
-      logOutput.push(str as string);
-      return true;
+    vi.spyOn(console, 'log').mockImplementation((value) => {
+      logOutput.push(String(value) + '\n');
     });
 
     // Set to production mode for JSON output (not pretty-printing)
@@ -37,15 +25,13 @@ describe('Structured JSON Logger', () => {
   });
 
   afterEach(() => {
-    // Restore stdout/stderr
-    process.stdout.write = originalStdout;
-    process.stderr.write = originalStderr;
+    vi.restoreAllMocks();
     delete process.env.NODE_ENV;
   });
 
   it('logger.info emits valid JSON with context and message', () => {
-    const context = { match_id: 123, player: 'alice' };
-    const message = 'test_event';
+    const context = { count: 123, player: 'alice' };
+    const message = 'http_request';
 
     logger.info(context, message);
 
@@ -65,8 +51,8 @@ describe('Structured JSON Logger', () => {
     expect(json).toHaveProperty('service', 'smile4money-backend');
 
     // Verify context fields are included
-    expect(json).toHaveProperty('match_id', 123);
-    expect(json).toHaveProperty('player', 'alice');
+    expect(json).toHaveProperty('count', 123);
+    expect(json).not.toHaveProperty('player');
 
     // Verify timestamp is ISO format
     const timestamp = new Date(json.timestamp);
@@ -84,8 +70,8 @@ describe('Structured JSON Logger', () => {
     const json = JSON.parse(lines[0]);
 
     expect(json.level).toBe('warn');
-    expect(json.message).toBe(message);
-    expect(json.dlqId).toBe('dlq-123');
+    expect(json.message).toBe('log_event');
+    expect(json.dlqId).toBeUndefined();
     expect(json.attempt).toBe(2);
   });
 
@@ -100,9 +86,9 @@ describe('Structured JSON Logger', () => {
     const json = JSON.parse(lines[0]);
 
     expect(json.level).toBe('error');
-    expect(json.message).toBe(message);
-    expect(json.tx_hash).toBe('abc123');
-    expect(json.error_code).toBe('SUBMISSION_FAILED');
+    expect(json.message).toBe('log_event');
+    expect(json.tx_hash).toBeUndefined();
+    expect(json.error_code).toBeUndefined();
   });
 
   it('logger handles empty context correctly', () => {
@@ -113,7 +99,7 @@ describe('Structured JSON Logger', () => {
     const json = JSON.parse(lines[0]);
 
     expect(json.level).toBe('info');
-    expect(json.message).toBe('empty_context_test');
+    expect(json.message).toBe('log_event');
     expect(json.service).toBe('smile4money-backend');
   });
 
@@ -134,9 +120,8 @@ describe('Structured JSON Logger', () => {
     const lines = output.split('\n').filter((line) => line.trim());
     const json = JSON.parse(lines[0]);
 
-    expect(json.match_id).toBe(456);
-    expect(json.result.winner).toBe('Player1');
-    expect(json.result.score.white).toBe(1);
+    expect(json.match_id).toBeUndefined();
+    expect(json.result).toBeUndefined();
   });
 
   it('logger includes service field in all logs', () => {
