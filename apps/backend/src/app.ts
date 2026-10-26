@@ -3,11 +3,10 @@ import cors from 'cors';
 import healthRouter from './routes/health.js';
 import matchRouter from './routes/matches.js';
 import validateGameRouter from './routes/validate-game.js';
-import transactionsRouter from './routes/transactions.js';
+import reviewRouter from './routes/oracle-review.js';
 import oracleRouter from './routes/oracle.js';
 import { errorToHttpStatus } from './errors/errorToHttpStatus.js';
 import { requestLogging } from './middleware/request-logging.js';
-import { traceContext } from './middleware/trace-context.js';
 
 /**
  * Parse the ALLOWED_ORIGINS environment variable into an array of origin strings.
@@ -27,10 +26,6 @@ function getAllowedOrigins(): string[] {
 
 export const app = express();
 
-// #123 — first, so every later middleware and log line runs inside the
-// request's W3C trace context.
-app.use(traceContext());
-
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -43,8 +38,7 @@ app.use(
       }
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'traceparent', 'tracestate'],
-    exposedHeaders: ['traceparent'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
   })
 );
@@ -56,8 +50,8 @@ app.use(requestLogging());
 app.use('/health', healthRouter);
 app.use('/api/matches', matchRouter);
 app.use('/api/validate-game', validateGameRouter);
+app.use('/api/oracle/reviews', reviewRouter);
 app.use('/api/oracle', oracleRouter);
-app.use('/api/transactions', transactionsRouter);
 
 // Fallback for any error a route handler doesn't catch itself, so every
 // route ends up with the same JSON error shape and the same centralized

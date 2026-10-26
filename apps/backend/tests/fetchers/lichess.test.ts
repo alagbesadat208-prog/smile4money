@@ -8,8 +8,7 @@ const mockedAxios = vi.mocked(axios);
 
 const BASE_GAME = {
   id: 'abc123',
-  createdAt: 1700000000000,
-  lastMoveAt: 1700000060000,
+  lastMoveAt: 1700000000000,
   status: 'mate',
   players: {
     white: { user: { name: 'alice' } },

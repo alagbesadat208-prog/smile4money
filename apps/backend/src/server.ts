@@ -3,18 +3,11 @@ dotenv.config();
 
 import { app } from './app.js';
 import { initializeQueue, closeQueue, startRetryWorker, startDlqEvictionTask, listDlqEntries, writeToDlq, type DlqEntry } from './queue.js';
-import { initializeMatchStore } from './store/index.js';
+import { initializeMatchStore, matchStore, evidenceStore } from './store/index.js';
 import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/circuit-breaker.js';
 import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
 import ChessPlatformPoller from './services/game-poller.js';
 import { getCurrentLedger } from './services/stellar.js';
-import {
-  createSettlementAgeMonitorFromEnv,
-  getSettlementAgeMonitor,
-  getSettlementPublishIntervalMs,
-  trackExistence,
-  trackSubmission,
-} from './services/settlement-age-monitor.js';
 import { loadRetryConfig, submitWithIdempotence, type OracleSubmission } from './services/oracle-submit.js';
 import { createShutdownHandler } from './shutdown.js';
 import logger from './logger.js';
@@ -73,8 +66,8 @@ async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
     // If submission fails, the error is thrown and propagates to the caller
     await submitWithIdempotence(
       submission,
-      trackSubmission(getSettlementAgeMonitor(), submitOracleResultToContract),
-      trackExistence(getSettlementAgeMonitor(), checkResultExistsOnChain),
+      submitOracleResultToContract,
+      checkResultExistsOnChain,
       config
     );
   } catch (err) {
@@ -103,10 +96,6 @@ async function main() {
     await initializeCircuitBreaker();
     logger.info('Circuit breaker initialized');
 
-    // Settlement age monitor (#1968): stage timestamps, age percentiles and threshold alerts.
-    // It only records timestamps and publishes metrics; it never changes what is submitted or settled.
-    const settlementMonitor = createSettlementAgeMonitorFromEnv();
-
     // Load any pending jobs from the queue on startup
     const pendingEntries = await listDlqEntries();
     logger.info(
@@ -122,11 +111,7 @@ async function main() {
 
     // Set up the polling worker with DLQ wiring for max-attempts exceeded
     const pollingStore = new PollingJobStore();
-    settlementMonitor?.startPublisher({
-      intervalMs: getSettlementPublishIntervalMs(),
-      listActiveJobs: () => pollingStore.listPendingJobs(),
-    });
-    const gamePoller = new ChessPlatformPoller();
+    const gamePoller = new ChessPlatformPoller(matchStore, evidenceStore);
     const pollingWorker = new PollingWorker(pollingStore, gamePoller, {
       pollingIntervalMs: parsePollingIntervalMs(process.env.POLLING_INTERVAL_MS),
       maxPollingAttempts: Number(process.env.MAX_POLLING_ATTEMPTS ?? 1440),
@@ -135,22 +120,20 @@ async function main() {
       // contract's on-chain timeout_ledgers window and move it to DLQ
       // instead of polling a match no payout can still reach.
       getCurrentLedger,
-      onGameCompleted: async (job, result) => {
+      onGameCompleted: async (job, result, decisionId) => {
         logger.info(
           {
             match_id: job.matchId,
             game_id: job.gameId,
             platform: job.platform,
             result,
+            decisionId,
             attempts: job.pollingAttempt,
           },
           'polling_job_game_completed_submitting_to_oracle',
         );
         // TODO: invoke the oracle submission pipeline here
         // e.g. await submitToOracle({ matchId: job.matchId, gameId: job.gameId, result })
-        // Settlement age: the game result is in, so the chain submission clock starts next.
-        settlementMonitor?.recordStage(job.matchId, 'activated', job.createdAt);
-        settlementMonitor?.recordStage(job.matchId, 'provider_result');
       },
       onMaxAttemptsExceeded: async (job, reason) => {
         logger.error(
@@ -163,7 +146,6 @@ async function main() {
           },
           'polling_job_max_attempts_exceeded_writing_to_dlq',
         );
-        settlementMonitor?.abandon(job.matchId, reason ?? 'max_polling_attempts_exceeded');
         await writeToDlq(
           { job },
           reason ?? 'max polling attempts exceeded',
@@ -188,7 +170,9 @@ async function main() {
       stopPollingWorker,
       stopRetryWorker,
       stopDlqEviction,
-      closeQueue,
+      closeQueue: async () => {
+        await Promise.all([closeQueue(), evidenceStore.close()]);
+      },
       closeCircuitBreakerStore,
       logger,
       shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000),

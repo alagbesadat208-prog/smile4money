@@ -1,3 +1,4 @@
+import { providerMetadata } from '../helpers/provider-metadata.js';
 /**
  * Unit tests for match-service.ts
  *
@@ -39,16 +40,18 @@ const mockFetchLichess = vi.mocked(fetchLichessResult);
 const mockFetchChess = vi.mocked(fetchChessDotComResult);
 
 const LICHESS_GAME = {
+  ...providerMetadata(),
   gameId: 'game-abc',
-  status: 'mate',
+  status: 'finished' as const,
   whitePlayer: 'alice',
   blackPlayer: 'bob',
   result: 'Player1Wins' as const,
 };
 
 const CHESS_GAME = {
+  ...providerMetadata('chessdotcom'),
   gameId: 'game-xyz',
-  status: 'finished',
+  status: 'finished' as const,
   whitePlayer: 'alice',
   blackPlayer: 'bob',
   result: 'Player1Wins' as const,

@@ -29,6 +29,8 @@ export interface RetryConfig {
 
 /** Submission details sent to the retry handler. */
 export interface OracleSubmission {
+  /** Durable verification evidence reference, retained unchanged across retries/DLQ. */
+  decisionId?: number;
   /** Escrow match ID. */
   matchId: number;
   /** Chess platform game ID. */

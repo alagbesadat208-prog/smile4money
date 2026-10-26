@@ -22,6 +22,7 @@ const createApp = () => {
 const BASE_LICHESS_GAME = {
   id: 'lichess-game-abc123',
   status: 'mate',
+  lastMoveAt: 1700000000000,
   winner: 'white',
   players: {
     white: { user: { name: 'alice' } },

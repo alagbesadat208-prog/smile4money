@@ -15,14 +15,6 @@
  */
 
 import logger from '../logger.js';
-import {
-  currentTraceContext,
-  newTraceContext,
-  persistTraceContext,
-  resumeTraceContext,
-  runWithTraceContext,
-  type PersistedTraceContext,
-} from '../tracing/trace-context.js';
 import type { MatchResult, GameResult } from '../fetchers/lichess.js';
 
 /** Used when POLLING_INTERVAL_MS is unset. */
@@ -71,7 +63,6 @@ export interface PollJob {
   pollingAttempt: number;
   createdAt: number;
   lastPolledAt: number | null;
-  pendingResult?: MatchResult;
   /**
    * Ledger height when the match went Active on-chain. Together with
    * `timeoutLedgers`, this bounds how long the job may keep polling before
@@ -86,16 +77,11 @@ export interface PollJob {
    * `PollingConfig.defaultTimeoutLedgers` when not set.
    */
   timeoutLedgers?: number;
-  /**
-   * W3C trace context of the request that created the job (#123). Each poll
-   * runs as a child span of it, and a job moved to the DLQ carries it on.
-   */
-  traceContext?: PersistedTraceContext;
 }
 
 export interface PollJobStatus {
-  action?: 'retry' | 'stop' | 'review';
-  status: 'pending' | 'completed' | 'failed' | 'in_progress';
+  status: 'pending' | 'completed' | 'failed' | 'in_progress' | 'review_required';
+  decisionId?: number;
   result?: MatchResult;
   reason?: string;
 }
@@ -134,7 +120,7 @@ export interface PollingConfig {
    * @param job    - The polling job that completed
    * @param result - The game outcome reported by the chess platform
    */
-  onGameCompleted: (job: PollJob, result: MatchResult) => Promise<void>;
+  onGameCompleted: (job: PollJob, result: MatchResult, decisionId?: number) => Promise<void>;
 
   /**
    * Called when a polling job exceeds maxPollingAttempts.
@@ -214,7 +200,6 @@ export class PollingJobStore {
       lastPolledAt: null,
       createdAtLedger,
       timeoutLedgers,
-      traceContext: persistTraceContext(currentTraceContext() ?? newTraceContext()),
     };
 
     this.jobs.set(id, job);
@@ -230,18 +215,6 @@ export class PollingJobStore {
     );
 
     return job;
-  }
-
-  /** Idempotent insertion used by the durable outbox recovery path. */
-  ensureJob(
-    matchId: number,
-    gameId: string,
-    platform: 'lichess' | 'chessdotcom',
-    username?: string,
-  ): PollJob {
-    const existingId = this.matchGameKeyToJobId.get(PollingJobStore.matchGameKey(matchId, gameId));
-    if (existingId) return this.jobs.get(existingId)!;
-    return this.createJob(matchId, gameId, platform, username);
   }
 
   /**
@@ -463,8 +436,7 @@ export class PollingWorker {
 
     for (const job of jobs) {
       try {
-        // Each poll is a span in the trace that created the job (#123).
-        await runWithTraceContext(resumeTraceContext(job.traceContext), () => this.pollJob(job));
+        await this.pollJob(job);
       } catch (err) {
         logger.error(
           {
@@ -563,11 +535,6 @@ export class PollingWorker {
    * - If error: increment attempt, check max attempts
    */
   private async pollJob(job: PollJob): Promise<void> {
-    if (job.pendingResult) {
-      await this.config.onGameCompleted(job, job.pendingResult);
-      this.store.completeJob(job.id);
-      return;
-    }
     if (job.createdAtLedger !== undefined && this.config.getCurrentLedger) {
       const timedOut = await this.checkLedgerTimeout(job);
       if (timedOut) return;
@@ -577,6 +544,11 @@ export class PollingWorker {
 
     const status = await this.poller.poll(job);
 
+    if (status.status === 'review_required') {
+      this.store.removeJob(job.id);
+      logger.warn({ match_id: job.matchId, game_id: job.gameId }, 'polling_job_quarantined');
+      return;
+    }
     if (status.status === 'in_progress') {
       // Game still in progress — re-enqueue with backoff
       const nextDelay = calculateNextPollDelay(
@@ -628,11 +600,11 @@ export class PollingWorker {
         'polling_job_game_completed',
       );
 
-      job.pendingResult = status.result;
+      this.store.completeJob(job.id);
 
       try {
-        await this.config.onGameCompleted(job, status.result);
-        this.store.completeJob(job.id);
+        if (status.decisionId === undefined) await this.config.onGameCompleted(job, status.result);
+        else await this.config.onGameCompleted(job, status.result, status.decisionId);
       } catch (callbackErr) {
         logger.error(
           {
@@ -648,19 +620,6 @@ export class PollingWorker {
         );
       }
     } else if (status.status === 'failed') {
-      if (status.action === 'stop' || status.action === 'review') {
-        // Permanent missing games stop; quarantined evidence goes to the
-        // existing dead-letter/operator callback without another fetch.
-        this.store.removeJob(job.id);
-        if (status.action === 'review') {
-          try {
-            await this.config.onMaxAttemptsExceeded(job, status.reason);
-          } catch {
-            logger.error({ match_id: job.matchId }, 'provider_review_callback_failed');
-          }
-        }
-        return;
-      }
       // Polling failed — check if we should retry or move to DLQ
       if (job.pollingAttempt >= this.config.maxPollingAttempts) {
         logger.error(
@@ -739,224 +698,3 @@ export default {
   calculateNextPollDelay,
   parsePollingIntervalMs,
 };
-
-import type { MatchRecord } from "../store/match-store.js";
-import {
-  SettlementStore,
-  type SettlementRecord,
-} from "../store/settlement-store.js";
-import {
-  advanceSettlement,
-  assertChainBinding,
-  type SettlementClient,
-} from "./oracle-submit.js";
-import {
-  verifyGameResult,
-  type SubmitResultInput,
-  type SubmitResultSuccess,
-} from "./oracle-service.js";
-
-export interface ReconciliationSource {
-  listMatches(): Promise<MatchRecord[]>;
-  findByGameId(gameId: string): Promise<MatchRecord | null>;
-  count(): Promise<number>;
-}
-
-/** Reconcile persisted registrations against escrow each cycle. Only on-chain
- * Active matches become eligible. The outbox primary key makes discovery
- * idempotent, including after confirmation and across process restarts.
- * Run one worker per escrow/signing account: transaction sequence numbers and
- * HTTP submissions are serialized through the same lane. */
-export class DurableOracleWorker {
-  private lane: Promise<unknown> = Promise.resolve();
-  private stopped = false;
-  private timer?: NodeJS.Timeout;
-  constructor(
-    private source: ReconciliationSource,
-    private outbox: SettlementStore,
-    private client: SettlementClient,
-    private intervalMs = 30_000,
-    private verify = verifyGameResult,
-  ) {}
-
-  private exclusive<T>(work: () => Promise<T>): Promise<T> {
-    const result = this.lane.then(work);
-    this.lane = result.catch(() => {});
-    return result;
-  }
-
-  async cycle(): Promise<void> {
-    return this.exclusive(async () => {
-      // A failed read must not manufacture eligibility or prevent other matches
-      // and already-persisted settlements from progressing.
-      const registrations = await this.source.listMatches().catch((error) => {
-        logger.error(
-          { error: String(error) },
-          "oracle_registration_scan_failed",
-        );
-        return [];
-      });
-      for (const match of registrations) {
-        try {
-          const chain = await this.client.getMatch(match.matchId);
-          assertChainBinding(match, chain);
-          if (chain.state[0] === "Active")
-            await this.outbox.enqueue(match.matchId, match.gameId);
-        } catch (error) {
-          logger.warn(
-            { matchId: match.matchId, error: String(error) },
-            "oracle_reconciliation_failed",
-          );
-        }
-      }
-      const records = await this.outbox.list();
-      records.sort(
-        (a, b) =>
-          Number(b.state === "submitted") - Number(a.state === "submitted"),
-      );
-      for (const record of records) {
-        if (["confirmed", "quarantined"].includes(record.state)) continue;
-        if (record.nextAttemptAt > Date.now()) {
-          if (record.state === "submitted") break;
-          continue;
-        }
-        try {
-          if (record.state === "active") {
-            const match = await this.source.findByGameId(record.gameId);
-            if (!match || match.matchId !== record.matchId)
-              throw new Error("Persisted registration missing or changed");
-            const chain = await this.client.getMatch(match.matchId);
-            assertChainBinding(match, chain);
-            if (chain.state[0] !== "Active") {
-              record.state = "quarantined";
-              record.error = `Escrow is ${chain.state[0]}, expected Active`;
-              await this.outbox.save(record);
-              continue;
-            }
-            const verified = await this.verify(this.source, {
-              matchId: match.matchId,
-              gameId: match.gameId,
-              platform: match.platform,
-              username: match.player1Username,
-            });
-            if (!verified.ok) throw new Error(verified.error);
-            if (verified.result === null) continue;
-            await this.persistResult(record, match, verified);
-          }
-          await advanceSettlement(this.outbox, this.client, record);
-        } catch (error) {
-          record.attempts++;
-          record.error = error instanceof Error ? error.message : String(error);
-          record.nextAttemptAt =
-            Date.now() +
-            Math.min(
-              this.intervalMs * 2 ** Math.min(record.attempts, 10),
-              300_000,
-            );
-          // Unknown signed transactions remain reconcilable until expiry.
-          if (!record.transaction && record.attempts >= 1440)
-            record.state = "quarantined";
-          await this.outbox.save(record);
-          logger.warn(
-            { matchId: record.matchId, error: record.error },
-            "oracle_settlement_retry_pending",
-          );
-        }
-        // Do not allocate another sequence until this signed attempt resolves.
-        if (record.state === "submitted") break;
-      }
-    });
-  }
-
-  private async persistResult(
-    record: SettlementRecord,
-    match: MatchRecord,
-    verified: SubmitResultSuccess,
-  ): Promise<void> {
-    if (
-      verified.matchId !== match.matchId ||
-      verified.gameId !== match.gameId ||
-      !["Player1Wins", "Player2Wins", "Draw"].includes(verified.result ?? "")
-    ) {
-      throw new Error(
-        "Game is unfinished or verified result does not match registration",
-      );
-    }
-    let result = verified.result as MatchResult;
-    // Fetchers express Player1/Player2 as white/black. Escrow expresses them
-    // as the registered addresses, which may have played either color.
-    if (
-      verified.whitePlayer.trim().toLowerCase() !==
-      match.player1Username?.trim().toLowerCase()
-    ) {
-      if (result === "Player1Wins") result = "Player2Wins";
-      else if (result === "Player2Wins") result = "Player1Wins";
-    }
-    record.submission = {
-      matchId: match.matchId,
-      gameId: match.gameId,
-      result,
-    };
-    record.state = "pending";
-    // The durable write completes before any transaction preparation or send.
-    await this.outbox.save(record);
-  }
-
-  async submitVerified(
-    input: SubmitResultInput,
-    verified: SubmitResultSuccess,
-  ): Promise<SettlementRecord> {
-    return this.exclusive(async () => {
-      const match = await this.source.findByGameId(input.gameId);
-      if (!match || input.matchId !== match.matchId)
-        throw new Error("matchId does not match persisted game");
-      const chain = await this.client.getMatch(match.matchId);
-      assertChainBinding(match, chain);
-      const existing = (await this.outbox.list()).find(
-        (row) => row.matchId === match.matchId && row.gameId === match.gameId,
-      );
-      if (existing?.state === "confirmed" || existing?.state === "quarantined")
-        return existing;
-      if (!existing?.submission && chain.state[0] !== "Active")
-        throw new Error("Escrow match is not Active");
-      await this.outbox.enqueue(match.matchId, match.gameId);
-      const record =
-        existing ??
-        (await this.outbox.list()).find(
-          (row) => row.matchId === match.matchId && row.gameId === match.gameId,
-        )!;
-      if (!record.submission) await this.persistResult(record, match, verified);
-      // On failure leave the committed pending/submitted record for cycle().
-      const otherInFlight = (await this.outbox.list()).some(
-        (row) =>
-          row.state === "submitted" &&
-          (row.matchId !== record.matchId || row.gameId !== record.gameId),
-      );
-      if (otherInFlight) return record;
-      try {
-        await advanceSettlement(this.outbox, this.client, record);
-      } catch (error) {
-        record.error = error instanceof Error ? error.message : String(error);
-        await this.outbox.save(record);
-      }
-      return record;
-    });
-  }
-
-  start(): () => Promise<void> {
-    const tick = async () => {
-      try {
-        await this.cycle();
-      } catch (error) {
-        logger.error({ error: String(error) }, "oracle_worker_cycle_failed");
-      }
-      if (!this.stopped) this.timer = setTimeout(tick, this.intervalMs);
-    };
-    void tick();
-    return async () => {
-      this.stopped = true;
-      if (this.timer) clearTimeout(this.timer);
-      await this.lane;
-    };
-  }
-}

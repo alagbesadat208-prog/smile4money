@@ -1,3 +1,4 @@
+import { providerMetadata } from '../helpers/provider-metadata.js';
 /**
  * Issue #48 (#1727) — Full match lifecycle integration test (fully mocked)
  *
@@ -124,7 +125,8 @@ describe('integration: full match lifecycle (create → deposit×2 → game resu
     // validation and the oracle's later identity check see consistent data.
     mockFetchLichessResult.mockResolvedValue({
       gameId: GAME_ID,
-      status: 'started',
+      ...providerMetadata('lichess', null),
+      status: 'in_progress',
       whitePlayer: 'alice',
       blackPlayer: 'bob',
       result: null,
@@ -157,7 +159,8 @@ describe('integration: full match lifecycle (create → deposit×2 → game resu
     // --- 3. Game finishes; the oracle fetches and verifies the result ---
     mockFetchLichessResult.mockResolvedValue({
       gameId: GAME_ID,
-      status: 'mate',
+      ...providerMetadata(),
+      status: 'finished',
       whitePlayer: 'alice',
       blackPlayer: 'bob',
       result: 'Player1Wins',
@@ -187,7 +190,8 @@ describe('integration: full match lifecycle (create → deposit×2 → game resu
     const escrow = new SimulatedEscrow();
     mockFetchLichessResult.mockResolvedValue({
       gameId: 'draw-game',
-      status: 'started',
+      ...providerMetadata('lichess', null),
+      status: 'in_progress',
       whitePlayer: 'alice',
       blackPlayer: 'bob',
       result: null,
@@ -212,7 +216,8 @@ describe('integration: full match lifecycle (create → deposit×2 → game resu
 
     mockFetchLichessResult.mockResolvedValue({
       gameId: 'draw-game',
-      status: 'draw',
+      ...providerMetadata('lichess', 'Draw'),
+      status: 'finished',
       whitePlayer: 'alice',
       blackPlayer: 'bob',
       result: 'Draw',

@@ -1,6 +1,5 @@
-import type { DurableOracleWorker } from '../services/polling.js';
 import { Router } from 'express';
-import { matchStore } from '../store/index.js';
+import { matchStore, evidenceStore } from '../store/index.js';
 import { authenticate } from '../middleware/auth.js';
 import { validateSubmitResultInput, verifyGameResult } from '../services/oracle-service.js';
 import { errorToHttpStatus } from '../errors/errorToHttpStatus.js';
@@ -30,8 +29,10 @@ router.use(authenticate);
  * This endpoint:
  * 1. Fetches the game result from the chess platform API
  * 2. Verifies that the players in the API response match the registered players
- * 3. Durably records and submits the signed escrow invocation
- * 4. Returns its transaction hash and chain status (202 while unconfirmed).
+ * 3. Returns the verified result for the oracle to submit on-chain
+ *
+ * The oracle (a privileged service) must then sign the result and call the
+ * escrow contract's `submit_result` method on Stellar Soroban.
  */
 router.post('/submit-result', async (req, res) => {
   const payload = req.body;
@@ -46,12 +47,12 @@ router.post('/submit-result', async (req, res) => {
   }
 
   try {
-    const result = await verifyGameResult(req.app.locals.matchStore ?? store, {
+    const result = await verifyGameResult(store, {
       matchId: payload.matchId,
       gameId: payload.gameId,
       platform: payload.platform,
       username: typeof payload.username === 'string' ? payload.username : undefined,
-    });
+    }, evidenceStore);
 
     if (!result.ok) {
       const message = result.details ? `${result.error}: ${result.details}` : result.error;
@@ -59,15 +60,8 @@ router.post('/submit-result', async (req, res) => {
       return res.status(result.status).json(errorEnvelope(statusToErrorCode(result.status), message, extra));
     }
 
-    const worker = req.app.locals.oracleWorker as DurableOracleWorker | undefined;
-    if (!worker) {
-      return res.status(503).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Oracle settlement worker unavailable'));
-    }
-    const settlement = await worker.submitVerified(payload, result);
-    return res.status(settlement.state === 'confirmed' ? 200 : settlement.state === 'quarantined' ? 409 : 202).json({
-      transactionHash: settlement.transaction?.hash,
-      chainStatus: settlement.chainStatus,
-      settlementState: settlement.state,
+    return res.status(200).json({
+      decisionId: result.decisionId,
       verified: result.verified,
       matchId: result.matchId,
       gameId: result.gameId,
