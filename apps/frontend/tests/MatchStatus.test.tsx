@@ -76,6 +76,169 @@ describe('MatchStatus — state rendering with match data', () => {
     });
   });
 
+  describe('deposit status indicators (zero, one, two-deposit states)', () => {
+    it('shows ○ for both players in zero-deposit state when deposit flags are omitted', async () => {
+      const onFetchMatch = vi.fn().mockResolvedValue({
+        id: '123',
+        state: 'Pending',
+        player1: 'GPLAYER1ABC',
+        player2: 'GPLAYER2XYZ',
+        stakeAmount: '100',
+        token: 'xlm',
+        platform: 'lichess',
+        gameId: 'game-abc',
+      });
+
+      render(<MatchStatus matchId="123" onFetchMatch={onFetchMatch} />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('deposit-status')).toBeInTheDocument();
+      });
+
+      const rows = screen.getByTestId('deposit-status').querySelectorAll('.deposit-status-row');
+      expect(rows[0]).toHaveTextContent('Player 1: ○');
+      expect(rows[0]).not.toHaveTextContent('✓');
+      expect(rows[1]).toHaveTextContent('Player 2:');
+      expect(rows[1]).toHaveTextContent('○');
+      expect(rows[1]).not.toHaveTextContent('✓');
+    });
+
+    it('shows ○ for both players in zero-deposit state when flags are explicitly false', async () => {
+      const onFetchMatch = vi.fn().mockResolvedValue({
+        id: '123',
+        state: 'Pending',
+        player1: 'GPLAYER1ABC',
+        player2: 'GPLAYER2XYZ',
+        stakeAmount: '100',
+        token: 'xlm',
+        platform: 'lichess',
+        gameId: 'game-abc',
+        player1Deposited: false,
+        player2Deposited: false,
+      });
+
+      render(<MatchStatus matchId="123" onFetchMatch={onFetchMatch} />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('deposit-status')).toBeInTheDocument();
+      });
+
+      const rows = screen.getByTestId('deposit-status').querySelectorAll('.deposit-status-row');
+      expect(rows[0]).toHaveTextContent('Player 1: ○');
+      expect(rows[0]).not.toHaveTextContent('✓');
+      expect(rows[1]).toHaveTextContent('○');
+      expect(rows[1]).not.toHaveTextContent('✓');
+    });
+
+    it('shows ✓ for player1 and ○ for player2 in one-deposit state (player1 deposited)', async () => {
+      const onFetchMatch = vi.fn().mockResolvedValue({
+        id: '123',
+        state: 'Pending',
+        player1: 'GPLAYER1ABC',
+        player2: 'GPLAYER2XYZ',
+        stakeAmount: '100',
+        token: 'xlm',
+        platform: 'lichess',
+        gameId: 'game-abc',
+        player1Deposited: true,
+        player2Deposited: false,
+      });
+
+      render(<MatchStatus matchId="123" onFetchMatch={onFetchMatch} />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('deposit-status')).toBeInTheDocument();
+      });
+
+      const rows = screen.getByTestId('deposit-status').querySelectorAll('.deposit-status-row');
+      expect(rows[0]).toHaveTextContent('Player 1: ✓');
+      expect(rows[0]).not.toHaveTextContent('○');
+      expect(rows[1]).toHaveTextContent('○');
+      expect(rows[1]).not.toHaveTextContent('✓');
+    });
+
+    it('shows ○ for player1 and ✓ for player2 in one-deposit state (player2 deposited)', async () => {
+      const onFetchMatch = vi.fn().mockResolvedValue({
+        id: '123',
+        state: 'Pending',
+        player1: 'GPLAYER1ABC',
+        player2: 'GPLAYER2XYZ',
+        stakeAmount: '100',
+        token: 'xlm',
+        platform: 'lichess',
+        gameId: 'game-abc',
+        player1Deposited: false,
+        player2Deposited: true,
+      });
+
+      render(<MatchStatus matchId="123" onFetchMatch={onFetchMatch} />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('deposit-status')).toBeInTheDocument();
+      });
+
+      const rows = screen.getByTestId('deposit-status').querySelectorAll('.deposit-status-row');
+      expect(rows[0]).toHaveTextContent('Player 1: ○');
+      expect(rows[0]).not.toHaveTextContent('✓');
+      expect(rows[1]).toHaveTextContent('✓');
+      expect(rows[1]).not.toHaveTextContent('○');
+    });
+
+    it('shows ✓ for both players in two-deposit state', async () => {
+      const onFetchMatch = vi.fn().mockResolvedValue({
+        id: '123',
+        state: 'Pending',
+        player1: 'GPLAYER1ABC',
+        player2: 'GPLAYER2XYZ',
+        stakeAmount: '100',
+        token: 'xlm',
+        platform: 'lichess',
+        gameId: 'game-abc',
+        player1Deposited: true,
+        player2Deposited: true,
+      });
+
+      render(<MatchStatus matchId="123" onFetchMatch={onFetchMatch} />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('deposit-status')).toBeInTheDocument();
+      });
+
+      const rows = screen.getByTestId('deposit-status').querySelectorAll('.deposit-status-row');
+      expect(rows[0]).toHaveTextContent('Player 1: ✓');
+      expect(rows[0]).not.toHaveTextContent('○');
+      expect(rows[1]).toHaveTextContent('✓');
+      expect(rows[1]).not.toHaveTextContent('○');
+    });
+
+    it('reads explicit deposit flags when supplied as raw snake_case properties', async () => {
+      const onFetchMatch = vi.fn().mockResolvedValue({
+        id: '123',
+        state: 'Pending',
+        player1: 'GPLAYER1ABC',
+        player2: 'GPLAYER2XYZ',
+        stakeAmount: '100',
+        token: 'xlm',
+        platform: 'lichess',
+        gameId: 'game-abc',
+        player1_deposited: true,
+        player2_deposited: false,
+      });
+
+      render(<MatchStatus matchId="123" onFetchMatch={onFetchMatch} />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('deposit-status')).toBeInTheDocument();
+      });
+
+      const rows = screen.getByTestId('deposit-status').querySelectorAll('.deposit-status-row');
+      expect(rows[0]).toHaveTextContent('Player 1: ✓');
+      expect(rows[0]).not.toHaveTextContent('○');
+      expect(rows[1]).toHaveTextContent('○');
+      expect(rows[1]).not.toHaveTextContent('✓');
+    });
+  });
+
   it('renders active state when match data is available', async () => {
     const onFetchMatch = vi.fn().mockResolvedValue({
       id: '123',

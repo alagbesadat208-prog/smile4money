@@ -19,10 +19,14 @@ interface MatchData {
   cancelledBy?: string;
   /** How the match was cancelled: by a player or via the timeout mechanism. */
   cancellationReason?: CancellationReason;
-  /** Whether player1 had already deposited before cancellation. */
+  /** Whether player1 had already deposited. */
   player1Deposited?: boolean;
-  /** Whether player2 had already deposited before cancellation. */
+  /** Whether player2 had already deposited. */
   player2Deposited?: boolean;
+  /** Raw contract property alias for player1 deposit flag. */
+  player1_deposited?: boolean;
+  /** Raw contract property alias for player2 deposit flag. */
+  player2_deposited?: boolean;
   /**
    * The ledger sequence number at which `submit_result` was called.
    * Set when state is PendingResult; 0 when no result has been submitted.
@@ -130,10 +134,7 @@ export function MatchStatus({ matchId, onFetchMatch }: MatchStatusProps) {
     // The interval is intentionally NOT re-created when matchData changes — we
     // read the latest value through matchDataRef inside the callback instead.
     const interval = setInterval(() => {
-      if (
-        matchDataRef.current &&
-        TERMINAL_STATES.includes(matchDataRef.current.state)
-      ) {
+      if (matchDataRef.current && TERMINAL_STATES.includes(matchDataRef.current.state)) {
         clearInterval(interval);
         return;
       }
@@ -141,7 +142,7 @@ export function MatchStatus({ matchId, onFetchMatch }: MatchStatusProps) {
     }, 10_000);
 
     return () => clearInterval(interval);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [matchId, fetchMatch]);
 
   // Tick every second while in PendingResult to keep the countdown live.
@@ -167,7 +168,12 @@ export function MatchStatus({ matchId, onFetchMatch }: MatchStatusProps) {
   // Loading state — animate-pulse skeleton matching the loaded match card layout
   if (fetchStatus === 'loading' && !matchData) {
     return (
-      <div className="match-status animate-pulse" data-testid="match-status-skeleton" aria-busy="true" aria-label="Loading match status">
+      <div
+        className="match-status animate-pulse"
+        data-testid="match-status-skeleton"
+        aria-busy="true"
+        aria-label="Loading match status"
+      >
         {/* Title bar */}
         <div className="mb-3 h-6 w-32 rounded bg-slate-200 dark:bg-slate-700" />
         {/* Match ID line */}
@@ -215,8 +221,8 @@ export function MatchStatus({ matchId, onFetchMatch }: MatchStatusProps) {
   const renderStateContent = () => {
     switch (matchData.state) {
       case 'Pending':
-        const p1Deposited = matchData.player1 ? '✓' : '○';
-        const p2Deposited = matchData.player2 ? '✓' : '○';
+        const p1Deposited = (matchData.player1Deposited ?? matchData.player1_deposited) ? '✓' : '○';
+        const p2Deposited = (matchData.player2Deposited ?? matchData.player2_deposited) ? '✓' : '○';
         return (
           <div className="state-content pending" data-testid="state-pending">
             <h3 className="state-title">Pending</h3>
@@ -277,7 +283,9 @@ export function MatchStatus({ matchId, onFetchMatch }: MatchStatusProps) {
               aria-live="polite"
             >
               {isAvailable ? (
-                <>Payout available — <strong>finalize_result can be called now</strong></>
+                <>
+                  Payout available — <strong>finalize_result can be called now</strong>
+                </>
               ) : (
                 <>
                   Payout available in{' '}
