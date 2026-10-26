@@ -478,3 +478,7 @@ exhaustively, because this function decides how much real money is escrowed:
 `apps/backend/tests/elo.test.ts` (21 tests) covers the lookup: URL
 construction and encoding, the variant preference order, and the requirement
 that every failure mode degrades to `null` rather than throwing.
+
+See [Durable oracle settlement](oracle-settlement.md) for the runtime's active
+match reconciliation, persistent settlement outbox, signed transaction recovery,
+required signer configuration, and local-network integration test.

@@ -7,7 +7,7 @@
  */
 
 import request from 'supertest';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, beforeAll, afterAll, vi } from 'vitest';
 import express from 'express';
 import oracleRouter from '../src/routes/oracle.js';
 import { matchStore } from '../src/store/index.js';
@@ -15,7 +15,7 @@ import jwt from 'jsonwebtoken';
 
 vi.mock('axios');
 
-const secret = 'test-secret';
+const secret = process.env.JWT_SECRET ?? 'test-secret';
 const makeToken = (address = 'GORACLE1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA') =>
   jwt.sign({ address }, secret, { expiresIn: '1h' });
 
@@ -32,6 +32,8 @@ const VALID_BODY = {
   platform: 'lichess',
 };
 
+beforeAll(async () => { await matchStore.initialize(); });
+afterAll(async () => { await matchStore.close(); });
 beforeEach(() => {
   matchStore.clear();
   vi.restoreAllMocks();

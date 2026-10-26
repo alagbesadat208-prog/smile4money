@@ -226,3 +226,214 @@ export async function submitWithIdempotence(
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// The escrow contract's submit_result starts its dispute window. The separate
+// oracle registry does not transition escrow, so settlements target escrow directly.
+import {
+  Address,
+  BASE_FEE,
+  Contract,
+  Keypair,
+  TransactionBuilder,
+  nativeToScVal,
+  rpc,
+  scValToNative,
+  xdr,
+} from "@stellar/stellar-sdk";
+import type { MatchRecord } from "../store/match-store.js";
+import type {
+  SettlementRecord,
+  SettlementStore,
+} from "../store/settlement-store.js";
+
+export interface ChainMatch {
+  id: bigint;
+  game_id: string;
+  player1: string;
+  player2: string;
+  platform: string[];
+  state: string[];
+}
+
+export interface SettlementClient {
+  getMatch(matchId: number): Promise<ChainMatch>;
+  prepare(
+    submission: OracleSubmission,
+  ): Promise<NonNullable<SettlementRecord["transaction"]>>;
+  send(envelope: string): Promise<void>;
+  status(hash: string): Promise<"SUCCESS" | "FAILED" | "NOT_FOUND">;
+}
+
+export class SorobanSettlementClient implements SettlementClient {
+  readonly server: rpc.Server;
+  readonly signer: Keypair;
+  readonly contract: Contract;
+  constructor(
+    readonly config: {
+      rpcUrl: string;
+      networkPassphrase: string;
+      secretKey: string;
+      escrowContract: string;
+    },
+  ) {
+    this.signer = Keypair.fromSecret(config.secretKey);
+    this.contract = new Contract(config.escrowContract);
+    const url = new URL(config.rpcUrl);
+    const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if (url.protocol !== "https:" && !local)
+      throw new Error("Insecure RPC is only allowed on loopback");
+    this.server = new rpc.Server(config.rpcUrl, {
+      allowHttp: local,
+      timeout: 10_000,
+    });
+  }
+
+  static fromEnvironment(): SorobanSettlementClient {
+    const required = (name: string): string => {
+      const value = process.env[name];
+      if (!value) throw new Error(`${name} is required for oracle settlement`);
+      return value;
+    };
+    return new SorobanSettlementClient({
+      rpcUrl: required("STELLAR_RPC_URL"),
+      networkPassphrase: required("STELLAR_NETWORK_PASSPHRASE"),
+      secretKey: required("ORACLE_SECRET_KEY"),
+      escrowContract: required("CONTRACT_ESCROW"),
+    });
+  }
+
+  private async build(operation: xdr.Operation) {
+    const account = await this.server.getAccount(this.signer.publicKey());
+    return new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(120)
+      .build();
+  }
+
+  async getMatch(matchId: number): Promise<ChainMatch> {
+    const tx = await this.build(
+      this.contract.call(
+        "get_match",
+        nativeToScVal(BigInt(matchId), { type: "u64" }),
+      ),
+    );
+    const simulation = await this.server.simulateTransaction(tx);
+    if (!rpc.Api.isSimulationSuccess(simulation) || !simulation.result) {
+      throw new Error("Unable to read escrow match");
+    }
+    return scValToNative(simulation.result.retval) as ChainMatch;
+  }
+
+  async prepare(submission: OracleSubmission) {
+    const winner = {
+      Player1Wins: "Player1",
+      Player2Wins: "Player2",
+      Draw: "Draw",
+    }[submission.result];
+    const tx = await this.server.prepareTransaction(
+      await this.build(
+        this.contract.call(
+          "submit_result",
+          nativeToScVal(BigInt(submission.matchId), { type: "u64" }),
+          nativeToScVal(submission.gameId, { type: "string" }),
+          xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(winner)]),
+          new Address(this.signer.publicKey()).toScVal(),
+        ),
+      ),
+    );
+    tx.sign(this.signer);
+    return {
+      hash: tx.hash().toString("hex"),
+      envelope: tx.toXDR(),
+      expiresAt: Number(tx.timeBounds!.maxTime) * 1000,
+    };
+  }
+
+  async send(envelope: string): Promise<void> {
+    const response = await this.server.sendTransaction(
+      TransactionBuilder.fromXDR(envelope, this.config.networkPassphrase),
+    );
+    if (response.status === "ERROR")
+      throw new Error("Soroban rejected transaction; reconciliation required");
+  }
+
+  async status(hash: string) {
+    return (await this.server.getTransaction(hash)).status;
+  }
+}
+
+export function assertChainBinding(
+  match: MatchRecord,
+  chain: ChainMatch,
+): void {
+  const platform =
+    match.platform === "lichess"
+      ? "Lichess"
+      : match.platform === "chessdotcom"
+        ? "ChessDotCom"
+        : undefined;
+  if (
+    chain.id !== BigInt(match.matchId) ||
+    chain.game_id !== match.gameId ||
+    chain.player1 !== match.player1 ||
+    chain.player2 !== match.player2 ||
+    !platform ||
+    chain.platform[0] !== platform
+  ) {
+    throw new Error(
+      "Persisted match does not match escrow identity, game, or platform",
+    );
+  }
+}
+
+/** One step of the durable outbox. A hash and signed envelope are committed
+ * before broadcast. Unknown outcomes only rebroadcast identical bytes (same hash).
+ * Expired unknown transactions are retained for operator reconciliation, never
+ * replaced automatically with a fresh transaction that could settle twice. */
+export async function advanceSettlement(
+  store: SettlementStore,
+  client: SettlementClient,
+  record: SettlementRecord,
+): Promise<void> {
+  if (
+    record.state === "confirmed" ||
+    record.state === "quarantined" ||
+    !record.submission
+  )
+    return;
+  if (!record.transaction) {
+    record.transaction = await client.prepare(record.submission);
+    record.state = "submitted";
+    await store.save(record);
+  }
+  const status = await client.status(record.transaction.hash);
+  record.chainStatus = status;
+  if (status === "SUCCESS") {
+    record.state = "confirmed";
+    record.error = undefined;
+  } else if (status === "FAILED") {
+    record.state = "quarantined";
+    record.error = "Transaction failed on-chain; manual review required";
+  } else if (Date.now() >= record.transaction.expiresAt) {
+    record.state = "quarantined";
+    record.error =
+      "Expired transaction with uncertain outcome; reconcile hash and escrow before manual retry";
+  } else {
+    // Persist the status before a send that might time out after committing.
+    await store.save(record);
+    await client.send(record.transaction.envelope);
+    record.chainStatus = await client.status(record.transaction.hash);
+    if (record.chainStatus === "SUCCESS") {
+      record.state = "confirmed";
+      record.error = undefined;
+    }
+    if (record.chainStatus === "FAILED") {
+      record.state = "quarantined";
+      record.error = "Transaction failed on-chain; manual review required";
+    }
+  }
+  await store.save(record);
+}
