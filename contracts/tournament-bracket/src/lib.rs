@@ -4,7 +4,7 @@ mod errors;
 mod types;
 
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol};
 use types::{Bracket, DataKey, Node, NodeState, Slot};
 
 /// ~30 days at 5s/ledger. Used as both the TTL threshold and the extend-to value.
@@ -35,93 +35,119 @@ const MAX_BRACKET_SIZE: u32 = 256;
 /// A node whose recorded sides and recorded winner disagree is malformed and
 /// every operation on it fails with [`Error::MalformedNode`] instead of
 /// guessing what the state was meant to be.
+///
+/// ## Emergency Mode
+///
+/// The contract admin can place the contract into emergency mode via
+/// [`BracketContract::pause`] and lift it via [`BracketContract::unpause`]:
+///
+/// * **Blocked while paused** ([`Error::ContractPaused`]):
+///   - [`BracketContract::create_bracket`]
+///   - [`BracketContract::create_paid_bracket`]
+///   - [`BracketContract::register`]
+///   - [`BracketContract::lock_registration`]
+///   - [`BracketContract::submit_result`]
+///   - [`BracketContract::advance_bye`]
+/// * **Allowed while paused** (participant exits, cancellation, recovery, and reads):
+///   - [`BracketContract::withdraw`] — registered participants can exit any
+///     incomplete bracket and immediately receive their entry fee refund, even
+///     if the bracket was already locked before the incident.
+///   - [`BracketContract::cancel_bracket`] — admin can permanently cancel an
+///     incomplete bracket so participants remain able to withdraw even after
+///     emergency mode is lifted.
+///   - [`BracketContract::unpause`] — admin can lift emergency mode.
+///   - Read queries (`is_paused`, `get_bracket`, `get_node`, `get_node_state`,
+///     `get_champion`).
 #[contract]
 pub struct BracketContract;
 
 #[contractimpl]
 impl BracketContract {
-    /// Initialize the contract with the address allowed to create brackets.
+    /// Initialize the contract with the address allowed to manage brackets.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::BracketCount, &0u64);
         env.events()
             .publish((Symbol::new(&env, "bracket"), symbol_short!("init")), admin);
         Ok(())
     }
 
-    /// Create a bracket with `size` first round sides.
+    /// Activate emergency mode — admin only.
+    ///
+    /// Blocks all tournament creation and progression (`create_bracket`,
+    /// `create_paid_bracket`, `register`, `lock_registration`, `submit_result`,
+    /// `advance_bye`) while keeping `cancel_bracket`, `withdraw`, `unpause`,
+    /// and all read queries available.
+    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish(
+            (Symbol::new(&env, "bracket"), symbol_short!("paused")),
+            admin,
+        );
+        Ok(())
+    }
+
+    /// Lift emergency mode — admin only.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish(
+            (Symbol::new(&env, "bracket"), symbol_short!("unpaused")),
+            admin,
+        );
+        Ok(())
+    }
+
+    /// Return whether emergency pause mode is currently active.
+    pub fn is_paused(env: Env) -> bool {
+        Self::paused(&env)
+    }
+
+    /// Create a free bracket with `size` first round sides.
     ///
     /// `size` must be a power of two: every round halves the number of nodes
     /// and the last round holds the final.
     pub fn create_bracket(env: Env, size: u32) -> Result<u64, Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        admin.require_auth();
+        Self::create_bracket_internal(&env, size, None, 0)
+    }
 
-        if size < 2 || size > MAX_BRACKET_SIZE || !size.is_power_of_two() {
-            return Err(Error::InvalidSize);
+    /// Create a bracket with an escrowed `entry_fee` in `token` per participant.
+    ///
+    /// Participants transfer `entry_fee` on [`BracketContract::register`] and
+    /// receive a full refund on [`BracketContract::withdraw`].
+    pub fn create_paid_bracket(
+        env: Env,
+        size: u32,
+        token: Address,
+        entry_fee: i128,
+    ) -> Result<u64, Error> {
+        if entry_fee <= 0 {
+            return Err(Error::InvalidAmount);
         }
-
-        let id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::BracketCount)
-            .unwrap_or(0);
-        let rounds = size.trailing_zeros();
-        let bracket = Bracket {
-            id,
-            admin,
-            size,
-            rounds,
-            registered: 0,
-            locked: false,
-            champion: None,
-        };
-
-        // Nobody is seeded yet: every side of every node starts vacant.
-        for round in 0..rounds {
-            for index in 0..Self::nodes_in_round(size, round) {
-                let node = Node {
-                    bracket_id: id,
-                    node_id: Self::node_id(size, round, index),
-                    round,
-                    index,
-                    slot1: Slot::Vacant,
-                    slot2: Slot::Vacant,
-                    winner: None,
-                };
-                Self::save_node(&env, &node);
-            }
-        }
-
-        Self::save_bracket(&env, &bracket);
-        let next_id = id.checked_add(1).ok_or(Error::Overflow)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::BracketCount, &next_id);
-
-        env.events().publish(
-            (Symbol::new(&env, "bracket"), symbol_short!("created")),
-            (id, size),
-        );
-
-        Ok(id)
+        Self::create_bracket_internal(&env, size, Some(token), entry_fee)
     }
 
     /// Register `participant` in the next free side of the first round.
     ///
-    /// Sides are handed out in registration order. A participant can only take
-    /// one side of a bracket.
+    /// Sides are handed out in order of the first vacant slot. A participant
+    /// can only take one side of a bracket. Blocked while emergency mode is
+    /// active or if the bracket has been cancelled.
     pub fn register(env: Env, bracket_id: u64, participant: Address) -> Result<(), Error> {
         participant.require_auth();
 
+        if Self::paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+
         let mut bracket = Self::load_bracket(&env, bracket_id)?;
+        if bracket.cancelled {
+            return Err(Error::BracketCancelled);
+        }
         if bracket.locked {
             return Err(Error::RegistrationClosed);
         }
@@ -132,7 +158,7 @@ impl BracketContract {
             return Err(Error::AlreadyRegistered);
         }
 
-        let side = bracket.registered;
+        let side = Self::first_vacant_side(&env, &bracket)?.ok_or(Error::BracketFull)?;
         let node_id = Self::node_id(bracket.size, 0, side / 2);
         let mut node = Self::load_node(&env, bracket_id, node_id)?;
         let value = Slot::Filled(participant.clone());
@@ -141,8 +167,19 @@ impl BracketContract {
         } else {
             node.slot2 = value;
         }
-        Self::save_node(&env, &node);
 
+        if let Some(ref token_addr) = bracket.token {
+            if bracket.entry_fee > 0 {
+                let token_client = token::Client::new(&env, token_addr);
+                token_client.transfer(
+                    &participant,
+                    &env.current_contract_address(),
+                    &bracket.entry_fee,
+                );
+            }
+        }
+
+        Self::save_node(&env, &node);
         bracket.registered += 1;
         Self::save_bracket(&env, &bracket);
 
@@ -161,11 +198,18 @@ impl BracketContract {
     /// open": every side of the first round is either occupied or a bye. The
     /// byes advance on their own while the bracket is sealed.
     pub fn lock_registration(env: Env, bracket_id: u64, caller: Address) -> Result<(), Error> {
+        if Self::paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+
         let mut bracket = Self::load_bracket(&env, bracket_id)?;
         if caller != bracket.admin {
             return Err(Error::Unauthorized);
         }
         caller.require_auth();
+        if bracket.cancelled {
+            return Err(Error::BracketCancelled);
+        }
         if bracket.locked {
             return Err(Error::AlreadyLocked);
         }
@@ -207,11 +251,18 @@ impl BracketContract {
         winner: Address,
         caller: Address,
     ) -> Result<(), Error> {
+        if Self::paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+
         let mut bracket = Self::load_bracket(&env, bracket_id)?;
         if caller != bracket.admin {
             return Err(Error::Unauthorized);
         }
         caller.require_auth();
+        if bracket.cancelled {
+            return Err(Error::BracketCancelled);
+        }
 
         let mut node = Self::load_node(&env, bracket_id, node_id)?;
         match Self::node_state(&node, &bracket)? {
@@ -250,7 +301,14 @@ impl BracketContract {
     /// is submitted. This entry point only makes the rule explicit, it is
     /// idempotent and it rejects a node that is not a bye.
     pub fn advance_bye(env: Env, bracket_id: u64, node_id: u64) -> Result<(), Error> {
+        if Self::paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+
         let mut bracket = Self::load_bracket(&env, bracket_id)?;
+        if bracket.cancelled {
+            return Err(Error::BracketCancelled);
+        }
         let node = Self::load_node(&env, bracket_id, node_id)?;
 
         match Self::node_state(&node, &bracket)? {
@@ -267,6 +325,102 @@ impl BracketContract {
         env.events().publish(
             (Symbol::new(&env, "bracket"), symbol_short!("advance")),
             (bracket_id, node_id),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel an incomplete bracket — admin only.
+    ///
+    /// Available both during normal operation and while emergency mode is
+    /// active (`is_paused() == true`). Once cancelled, the bracket can never
+    /// resume progression, and all registered participants can call
+    /// [`BracketContract::withdraw`] to exit and claim their refund.
+    pub fn cancel_bracket(env: Env, bracket_id: u64, caller: Address) -> Result<(), Error> {
+        let mut bracket = Self::load_bracket(&env, bracket_id)?;
+        if caller != bracket.admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+
+        if bracket.champion.is_some() {
+            return Err(Error::AlreadyCompleted);
+        }
+        if bracket.cancelled {
+            return Err(Error::BracketCancelled);
+        }
+
+        bracket.cancelled = true;
+        Self::save_bracket(&env, &bracket);
+
+        env.events().publish(
+            (Symbol::new(&env, "bracket"), symbol_short!("cancel")),
+            bracket_id,
+        );
+
+        Ok(())
+    }
+
+    /// Exit a bracket and refund any escrowed entry fee to `participant`.
+    ///
+    /// Allowed when:
+    /// * Registration is still open (`!bracket.locked`), OR
+    /// * The bracket has been cancelled (`bracket.cancelled`), OR
+    /// * The contract is in emergency mode (`is_paused() == true`) and the
+    ///   bracket has not completed (`bracket.champion.is_none()`).
+    ///
+    /// If a participant withdraws from a locked bracket while emergency mode is
+    /// active, the bracket is also marked `cancelled` so that partial state
+    /// cannot resume if the contract is later unpaused.
+    pub fn withdraw(env: Env, bracket_id: u64, participant: Address) -> Result<(), Error> {
+        participant.require_auth();
+
+        let mut bracket = Self::load_bracket(&env, bracket_id)?;
+        if bracket.champion.is_some() {
+            return Err(Error::AlreadyCompleted);
+        }
+
+        let can_exit = !bracket.locked || bracket.cancelled || Self::paused(&env);
+        if !can_exit {
+            return Err(Error::RegistrationClosed);
+        }
+
+        let side =
+            Self::find_participant(&env, &bracket, &participant).ok_or(Error::NotRegistered)?;
+        let node_id = Self::node_id(bracket.size, 0, side / 2);
+        let mut node = Self::load_node(&env, bracket_id, node_id)?;
+
+        let replacement = if bracket.locked {
+            bracket.cancelled = true;
+            Slot::Bye
+        } else {
+            Slot::Vacant
+        };
+
+        if side % 2 == 0 {
+            node.slot1 = replacement;
+        } else {
+            node.slot2 = replacement;
+        }
+
+        if let Some(ref token_addr) = bracket.token {
+            if bracket.entry_fee > 0 {
+                let token_client = token::Client::new(&env, token_addr);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &participant,
+                    &bracket.entry_fee,
+                );
+            }
+        }
+
+        Self::save_node(&env, &node);
+        bracket.registered = bracket.registered.saturating_sub(1);
+        Self::save_bracket(&env, &bracket);
+
+        env.events().publish(
+            (Symbol::new(&env, "bracket"), symbol_short!("withdrew")),
+            (bracket_id, participant),
         );
 
         Ok(())
@@ -296,6 +450,96 @@ impl BracketContract {
     pub fn get_champion(env: Env, bracket_id: u64) -> Result<Address, Error> {
         let bracket = Self::load_bracket(&env, bracket_id)?;
         bracket.champion.ok_or(Error::NotFound)
+    }
+
+    fn paused(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    fn require_admin(env: &Env, caller: &Address) -> Result<Address, Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if *caller != admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        Ok(admin)
+    }
+
+    fn create_bracket_internal(
+        env: &Env,
+        size: u32,
+        token: Option<Address>,
+        entry_fee: i128,
+    ) -> Result<u64, Error> {
+        if Self::paused(env) {
+            return Err(Error::ContractPaused);
+        }
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+
+        if size < 2 || size > MAX_BRACKET_SIZE || !size.is_power_of_two() {
+            return Err(Error::InvalidSize);
+        }
+
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BracketCount)
+            .unwrap_or(0);
+        let rounds = size.trailing_zeros();
+        let bracket = Bracket {
+            id,
+            admin,
+            size,
+            rounds,
+            registered: 0,
+            locked: false,
+            cancelled: false,
+            token,
+            entry_fee,
+            champion: None,
+        };
+
+        // Nobody is seeded yet: every side of every node starts vacant.
+        for round in 0..rounds {
+            for index in 0..Self::nodes_in_round(size, round) {
+                let node = Node {
+                    bracket_id: id,
+                    node_id: Self::node_id(size, round, index),
+                    round,
+                    index,
+                    slot1: Slot::Vacant,
+                    slot2: Slot::Vacant,
+                    winner: None,
+                };
+                Self::save_node(env, &node);
+            }
+        }
+
+        Self::save_bracket(env, &bracket);
+        let next_id = id.checked_add(1).ok_or(Error::Overflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::BracketCount, &next_id);
+
+        env.events().publish(
+            (Symbol::new(env, "bracket"), symbol_short!("created")),
+            (id, size),
+        );
+
+        Ok(id)
     }
 
     /// Derive the state of a node from its sides.
@@ -372,6 +616,19 @@ impl BracketContract {
                 // Last round: the node decides the champion.
                 None => {
                     if let Slot::Filled(champion) = contribution {
+                        if bracket.champion.is_none() {
+                            if let Some(ref token_addr) = bracket.token {
+                                let prize = bracket.entry_fee * (bracket.registered as i128);
+                                if prize > 0 {
+                                    let token_client = token::Client::new(env, token_addr);
+                                    token_client.transfer(
+                                        &env.current_contract_address(),
+                                        &champion,
+                                        &prize,
+                                    );
+                                }
+                            }
+                        }
                         bracket.champion = Some(champion);
                         Self::save_bracket(env, bracket);
                     }
@@ -442,6 +699,21 @@ impl BracketContract {
         let parent_index = node.index / 2;
         let side = node.index % 2;
         Some((Self::node_id(size, parent_round, parent_index), side))
+    }
+
+    /// First vacant side in round `0`, if any.
+    fn first_vacant_side(env: &Env, bracket: &Bracket) -> Result<Option<u32>, Error> {
+        for index in 0..Self::nodes_in_round(bracket.size, 0) {
+            let node_id = Self::node_id(bracket.size, 0, index);
+            let node = Self::load_node(env, bracket.id, node_id)?;
+            if node.slot1 == Slot::Vacant {
+                return Ok(Some(index * 2));
+            }
+            if node.slot2 == Slot::Vacant {
+                return Ok(Some(index * 2 + 1));
+            }
+        }
+        Ok(None)
     }
 
     /// Side of the first round occupied by `participant`, if any.
