@@ -1,11 +1,10 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { BrowserRouter, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { App } from './App';
 import { NotFound } from './pages/NotFound';
 import { Leaderboard } from './pages/Leaderboard';
 import { ToastProvider } from './components/Toast';
-import { publicEnv } from './config/public-env';
 import './app/globals.css';
 // Layout + component styles for CreateMatch / DepositStake / MatchStatus.
 // Imported here because nothing else pulls it in — see the header of the file
@@ -28,7 +27,9 @@ import './styles/global-ui.css';
  * Empty when unset, which the page reports as "no contract configured" rather
  * than firing a request at a blank address.
  */
-const LEADERBOARD_CONTRACT_ID = publicEnv.leaderboardContractId;
+const LEADERBOARD_CONTRACT_ID =
+  (import.meta as { env?: { VITE_LEADERBOARD_CONTRACT_ID?: string } }).env
+    ?.VITE_LEADERBOARD_CONTRACT_ID ?? '';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

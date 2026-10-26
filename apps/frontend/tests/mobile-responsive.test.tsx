@@ -95,36 +95,10 @@ vi.mock('@stellar/stellar-sdk', () => ({
   },
   rpc: {
     Server: vi.fn().mockImplementation(() => ({
-      simulateTransaction: vi.fn().mockResolvedValue({ result: { retval: {} } }),
+      simulateTransaction: vi.fn(),
       sendTransaction: vi.fn(),
-      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 50000 }),
     })),
   },
-  Account: class Account {},
-  Operation: { invokeContractFunction: vi.fn() },
-  TransactionBuilder: class TransactionBuilder {
-    addOperation() {
-      return this;
-    }
-    setTimeout() {
-      return this;
-    }
-    build() {
-      return {};
-    }
-  },
-  nativeToScVal: vi.fn(),
-  scValToNative: vi.fn(() => ({
-    stake_amount: 10000000n,
-    token: 'NATIVE-XLM-TOKEN',
-    player1: 'GABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF123456',
-    player2: 'G1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890AB',
-    player1_deposited: false,
-    player2_deposited: false,
-    created_ledger: 40000n,
-    timeout_ledgers: 120960n,
-  })),
-  Asset: { native: () => ({ contractId: () => 'NATIVE-XLM-TOKEN' }) },
   token: { Client: vi.fn() },
 }));
 
@@ -217,9 +191,9 @@ describe('match-ui.css â€” long opaque values wrap instead of widening the 
   it('allows flex children to shrink below their content width', () => {
     // Flex children default to `min-width: auto`, which refuses to shrink and
     // is the other half of "why is there a horizontal scrollbar".
-    expect(css).toMatch(
-      /\.create-match,\s*\n\.deposit-stake,\s*\n\.match-status\s*\{[^}]*min-width:\s*0;/,
-    );
+    expect(
+      css,
+    ).toMatch(/\.create-match,\s*\n\.deposit-stake,\s*\n\.match-status\s*\{[^}]*min-width:\s*0;/);
     expect(css).toMatch(/\.form-group\s*\{[^}]*min-width:\s*0;/);
   });
 });
@@ -229,7 +203,9 @@ describe('match-ui.css â€” mobile-first structure', () => {
     // The `@media (min-width: 768px)` block must contain the two-column switch;
     // nothing may be hidden behind a max-width query, because that is how
     // content ends up invisible on a phone.
-    expect(css).not.toMatch(/@media[^{]*max-width:\s*\d+px\s*\)\s*\{\s*[^}]*display:\s*none/);
+    expect(css).not.toMatch(
+      /@media[^{]*max-width:\s*\d+px\s*\)\s*\{\s*[^}]*display:\s*none/,
+    );
     expect(css.lastIndexOf('@media (min-width: 768px)')).toBeGreaterThan(0);
   });
 
@@ -272,6 +248,7 @@ describe.each(VIEWPORTS)('at $width px ($label)', ({ width, height }) => {
       render(<CreateMatch contractId="test-contract" player1Address={validAddress} />);
       const controls = [
         screen.getByTestId('toggle-xlm'),
+        screen.getByTestId('toggle-usdc'),
         screen.getByTestId('platform-lichess'),
         screen.getByTestId('platform-chesscom'),
         screen.getByTestId('submit-match-btn'),
@@ -294,7 +271,7 @@ describe.each(VIEWPORTS)('at $width px ($label)', ({ width, height }) => {
       const offenders = [...container.querySelectorAll('*')].filter((el) => {
         // Read the inline style through the CSSOM rather than typing the element
         // as `HTMLElement`, which keeps this file free of DOM type references.
-        const inlineWidth = (el as { style: { width: string } }).style.width;
+        const inlineWidth = (el as HTMLElement).style?.width ?? '';
         return inlineWidth.endsWith('px') && Number.parseFloat(inlineWidth) > width;
       });
       expect(offenders).toHaveLength(0);
@@ -313,7 +290,7 @@ describe.each(VIEWPORTS)('at $width px ($label)', ({ width, height }) => {
       expect(screen.getByTestId('deposit-stake')).toBeInTheDocument();
     });
 
-    it('renders its primary action as a .btn so it inherits the 44px target', async () => {
+    it('renders its primary action as a .btn so it inherits the 44px target', () => {
       render(
         <DepositStake
           matchId="123"
@@ -322,7 +299,7 @@ describe.each(VIEWPORTS)('at $width px ($label)', ({ width, height }) => {
           networkPassphrase="Test SDF Network ; September 2015"
         />,
       );
-      expect((await screen.findByTestId('deposit-btn')).className).toMatch(/\bbtn\b/);
+      expect(screen.getByTestId('deposit-btn').className).toMatch(/\bbtn\b/);
     });
   });
 

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   Account,
   Asset,
+  Networks,
   Operation,
   TransactionBuilder,
   nativeToScVal,
@@ -10,8 +11,6 @@ import {
 } from '@stellar/stellar-sdk';
 import type { xdr } from '@stellar/stellar-sdk';
 import { TransactionStatus } from './TransactionStatus';
-import { APP_NETWORK_CONFIG } from '../config/network';
-import { EligibilityNotice } from './EligibilityNotice';
 
 type DepositStatus = 'idle' | 'loading' | 'pending' | 'success' | 'error' | 'approving';
 type AllowanceStatus = 'unknown' | 'checking' | 'sufficient' | 'insufficient';
@@ -153,8 +152,13 @@ async function deserializeMatch(
 
   // Fetch current ledger height from RPC
   const server = new rpc.Server(rpcUrl);
-  const ledgerResponse = await server.getLatestLedger();
-  const currentLedger = ledgerResponse.sequence;
+  let currentLedger = 0;
+  try {
+    const latestLedger = await server.getLatestLedger();
+    currentLedger = typeof latestLedger.sequence === 'number' ? latestLedger.sequence : parseInt(String(latestLedger.sequence), 10);
+  } catch {
+    currentLedger = 0;
+  }
 
   return {
     stakeAmount: String(raw.stake_amount),
@@ -175,7 +179,7 @@ interface DepositStakeProps {
   contractId: string;
   networkPassphrase?: string;
   rpcUrl?: string;
-  onDeposit?: (matchId: string) => Promise<{ hash: string; confirmed: true }>;
+  onDeposit?: (matchId: string) => Promise<void>;
   /** Called when the user clicks 'Approve Token'. Should submit an approve/allowance tx. */
   onApprove?: (matchId: string) => Promise<void>;
   /** Optional: externally supply allowance status to skip the internal check. */
@@ -188,8 +192,8 @@ export function DepositStake({
   matchId,
   playerAddress,
   contractId,
-  networkPassphrase = APP_NETWORK_CONFIG.networkPassphrase,
-  rpcUrl = APP_NETWORK_CONFIG.rpcUrl,
+  networkPassphrase = Networks.TESTNET,
+  rpcUrl = 'https://soroban-testnet.stellar.org',
   onDeposit,
   onApprove,
   allowanceSufficient = null,
@@ -315,11 +319,7 @@ export function DepositStake({
     setTxHash(null);
 
     try {
-      const receipt = await onDeposit?.(matchId);
-      if (!receipt || receipt.confirmed !== true || !receipt.hash) {
-        throw new Error('No confirmed deposit transaction was returned.');
-      }
-      setTxHash(receipt.hash);
+      await onDeposit?.(matchId);
       setStatus('success');
     } catch (err) {
       setStatus('error');
@@ -351,12 +351,7 @@ export function DepositStake({
   // insufficient, or timeout has expired. The isPending guard is the critical one — without it the user
   // can click twice and submit duplicate transactions.
   const isDisabled =
-    isLoading ||
-    isPending ||
-    hasDeposited(matchDetails) ||
-    isCheckingAllowance ||
-    needsApproval ||
-    isExpired;
+    isLoading || isPending || hasDeposited(matchDetails) || isCheckingAllowance || needsApproval || isExpired;
 
   // Loading state
   if (isLoading && !matchDetails) {
@@ -395,7 +390,6 @@ export function DepositStake({
   return (
     <div className="deposit-stake" data-testid="deposit-stake">
       <h3 className="deposit-title">Deposit Stake</h3>
-      <EligibilityNotice />
 
       {matchDetails && (
         <div className="match-info" data-testid="match-info">
@@ -430,9 +424,7 @@ export function DepositStake({
           {timeoutSecondsRemaining !== null && (
             <p className="timeout-countdown" data-testid="timeout-countdown">
               <span className="timeout-label">Time to deposit:</span>{' '}
-              <strong className={isExpired ? 'expired' : ''}>
-                {formatDuration(timeoutSecondsRemaining)}
-              </strong>
+              <strong className={isExpired ? 'expired' : ''}>{formatDuration(timeoutSecondsRemaining)}</strong>
             </p>
           )}
         </div>
@@ -477,7 +469,12 @@ export function DepositStake({
 
       {/* Match timeout expired */}
       {isExpired && (
-        <p className="feedback error" role="alert" data-testid="timeout-expired" aria-live="polite">
+        <p
+          className="feedback error"
+          role="alert"
+          data-testid="timeout-expired"
+          aria-live="polite"
+        >
           Match deposit window has expired. No further deposits are allowed.
         </p>
       )}
@@ -503,7 +500,7 @@ export function DepositStake({
 
       {/* Transaction status with aria-live announcements */}
       <TransactionStatus
-        status={status === 'loading' || status === 'approving' ? 'idle' : status}
+        status={status === 'loading' ? 'idle' : (status as any)}
         pendingMessage="Depositing stake…"
         successMessage="Deposit successful!"
         errorMessage={errorMsg}

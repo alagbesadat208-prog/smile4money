@@ -64,8 +64,6 @@ export function RegistrationForm({ onSubmit }: RegistrationFormProps) {
           value={fields.email}
           onChange={(e) => update('email', e.target.value)}
           onBlur={() => blur('email')}
-          aria-invalid={!!errors.email}
-          aria-describedby={errors.email ? 'email-error' : undefined}
           aria-required="true"
           aria-invalid={errors.email ? 'true' : 'false'}
           aria-describedby={errors.email ? 'reg-email-error' : undefined}
@@ -89,8 +87,6 @@ export function RegistrationForm({ onSubmit }: RegistrationFormProps) {
           value={fields.password}
           onChange={(e) => update('password', e.target.value)}
           onBlur={() => blur('password')}
-          aria-invalid={!!errors.password}
-          aria-describedby={errors.password ? 'password-error' : undefined}
           aria-required="true"
           aria-invalid={errors.password ? 'true' : 'false'}
           aria-describedby={
@@ -121,8 +117,6 @@ export function RegistrationForm({ onSubmit }: RegistrationFormProps) {
           value={fields.confirmPassword}
           onChange={(e) => update('confirmPassword', e.target.value)}
           onBlur={() => blur('confirmPassword')}
-          aria-invalid={!!errors.confirmPassword}
-          aria-describedby={errors.confirmPassword ? 'confirm-error' : undefined}
           aria-required="true"
           aria-invalid={errors.confirmPassword ? 'true' : 'false'}
           aria-describedby={errors.confirmPassword ? 'reg-confirm-error' : undefined}

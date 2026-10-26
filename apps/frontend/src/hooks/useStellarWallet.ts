@@ -1,11 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import type { WalletStatus, Network } from '../types';
-import { configForWallet } from '../config/network';
-
-const EXPECTED_NETWORK =
-  (typeof import.meta !== 'undefined' &&
-    (import.meta as { env?: { VITE_STELLAR_NETWORK?: string } }).env?.VITE_STELLAR_NETWORK) ||
-  'testnet';
+import { isNetworkMatch } from './useNetworkStatus';
+import { invalidateHistoryCache } from '../pages/history-cache';
 
 declare global {
   interface Window {
@@ -26,6 +22,12 @@ declare global {
   }
 }
 
+const HORIZON_URLS: Record<string, string> = {
+  testnet: 'https://horizon-testnet.stellar.org',
+  mainnet: 'https://horizon.stellar.org',
+  unknown: 'https://horizon-testnet.stellar.org',
+};
+
 interface StellarWallet {
   status: WalletStatus;
   address: string | null;
@@ -40,8 +42,8 @@ interface StellarWallet {
 
 function detectNetwork(networkPassphrase?: string): Network {
   if (!networkPassphrase) return 'unknown';
-  if (networkPassphrase.includes('testnet')) return 'testnet';
-  if (networkPassphrase.includes('pubnet')) return 'mainnet';
+  if (networkPassphrase.includes('testnet') || networkPassphrase.includes('Test SDF Network')) return 'testnet';
+  if (networkPassphrase.includes('pubnet') || networkPassphrase.includes('Public Global Stellar Network')) return 'mainnet';
   return 'unknown';
 }
 
@@ -50,7 +52,7 @@ async function fetchHorizonBalance(
   network: Network,
   signal?: AbortSignal,
 ): Promise<string> {
-  const horizon = configForWallet(network).horizonUrl;
+  const horizon = HORIZON_URLS[network] || HORIZON_URLS.unknown;
   const res = await fetch(`${horizon}/accounts/${address}`, { signal });
   if (!res.ok) throw new Error('Failed to fetch balance');
   const data = await res.json();
@@ -70,6 +72,7 @@ export function useStellarWallet(): StellarWallet {
 
   // Ref to abort in-flight balance fetches on unmount or re-fetch.
   const balanceAbortRef = useRef<AbortController | null>(null);
+  const prevAddressRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -84,14 +87,13 @@ export function useStellarWallet(): StellarWallet {
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
-    // Freighter dispatches a custom DOM event named "freighter:accountChanged" when
-    // the user changes accounts, and "freighter:networkChanged" when the network changes.
-    // Both cases should trigger a re-check: if the wallet is no longer connected we
-    // transition to disconnected; if the account changed we reload the address.
     const handleWalletChange = async () => {
       const api = window.freighterApi;
       if (!api) {
         // Extension was removed
+        const oldAddr = prevAddressRef.current;
+        if (oldAddr) invalidateHistoryCache(oldAddr);
+        prevAddressRef.current = null;
         setAddress(null);
         setBalance(null);
         setNetwork('unknown');
@@ -103,6 +105,9 @@ export function useStellarWallet(): StellarWallet {
         const { isConnected } = await api.isConnected();
         if (!isConnected) {
           // User disconnected from the extension
+          const oldAddr = prevAddressRef.current;
+          if (oldAddr) invalidateHistoryCache(oldAddr);
+          prevAddressRef.current = null;
           setAddress(null);
           setBalance(null);
           setNetwork('unknown');
@@ -112,16 +117,31 @@ export function useStellarWallet(): StellarWallet {
 
         // Account or network may have changed — refresh all state
         const publicKey = await api.getPublicKey();
+        const oldAddr = prevAddressRef.current;
+
+        // Invalidate cached reads for previous account when active account changes
+        if (oldAddr && oldAddr !== publicKey) {
+          invalidateHistoryCache(oldAddr);
+        }
+        prevAddressRef.current = publicKey;
         setAddress(publicKey);
 
         let detectedNetwork: Network = 'unknown';
+        let rawPassphrase = '';
         if (api.getNetwork) {
           const net = await api.getNetwork();
-          detectedNetwork = detectNetwork(net.networkPassphrase);
+          rawPassphrase = net.networkPassphrase;
+          detectedNetwork = detectNetwork(rawPassphrase);
           setNetwork(detectedNetwork);
         }
 
-        if (detectedNetwork !== 'unknown' && detectedNetwork !== EXPECTED_NETWORK) {
+        const isMatch = isNetworkMatch(
+          rawPassphrase
+            ? { network: detectedNetwork, networkPassphrase: rawPassphrase }
+            : detectedNetwork,
+        );
+
+        if (detectedNetwork !== 'unknown' && !isMatch) {
           setStatus('wrongNetwork');
         } else {
           setStatus('connected');
@@ -135,6 +155,9 @@ export function useStellarWallet(): StellarWallet {
           .then((bal) => setBalance(bal))
           .catch(() => setBalance(null));
       } catch {
+        const oldAddr = prevAddressRef.current;
+        if (oldAddr) invalidateHistoryCache(oldAddr);
+        prevAddressRef.current = null;
         setAddress(null);
         setBalance(null);
         setNetwork('unknown');
@@ -145,9 +168,19 @@ export function useStellarWallet(): StellarWallet {
     window.addEventListener('freighter:accountChanged', handleWalletChange);
     window.addEventListener('freighter:networkChanged', handleWalletChange);
 
+    // Also register on window.freighter adapter emitter if available
+    if (window.freighter?.on) {
+      window.freighter.on('accountChanged', handleWalletChange);
+      window.freighter.on('networkChanged', handleWalletChange);
+    }
+
     return () => {
       window.removeEventListener('freighter:accountChanged', handleWalletChange);
       window.removeEventListener('freighter:networkChanged', handleWalletChange);
+      if (window.freighter?.off) {
+        window.freighter.off('accountChanged', handleWalletChange);
+        window.freighter.off('networkChanged', handleWalletChange);
+      }
       balanceAbortRef.current?.abort();
     };
   }, []);
@@ -182,16 +215,29 @@ export function useStellarWallet(): StellarWallet {
       }
 
       const publicKey = await freighter.getPublicKey();
+      const oldAddr = prevAddressRef.current;
+      if (oldAddr && oldAddr !== publicKey) {
+        invalidateHistoryCache(oldAddr);
+      }
+      prevAddressRef.current = publicKey;
       setAddress(publicKey);
 
       let detectedNetwork: Network = 'unknown';
+      let rawPassphrase = '';
       if (freighter.getNetwork) {
         const net = await freighter.getNetwork();
-        detectedNetwork = detectNetwork(net.networkPassphrase);
+        rawPassphrase = net.networkPassphrase;
+        detectedNetwork = detectNetwork(rawPassphrase);
         setNetwork(detectedNetwork);
       }
 
-      if (detectedNetwork !== 'unknown' && detectedNetwork !== EXPECTED_NETWORK) {
+      const isMatch = isNetworkMatch(
+        rawPassphrase
+          ? { network: detectedNetwork, networkPassphrase: rawPassphrase }
+          : detectedNetwork,
+      );
+
+      if (detectedNetwork !== 'unknown' && !isMatch) {
         setStatus('wrongNetwork');
       } else {
         setStatus('connected');
@@ -211,12 +257,18 @@ export function useStellarWallet(): StellarWallet {
   }, [freighter]);
 
   const disconnect = useCallback(() => {
+    const oldAddr = prevAddressRef.current || address;
+    if (oldAddr) {
+      invalidateHistoryCache(oldAddr);
+    }
+    prevAddressRef.current = null;
+    balanceAbortRef.current?.abort();
     setAddress(null);
     setBalance(null);
     setStatus(freighter ? 'disconnected' : 'notInstalled');
     setError(null);
     setNetwork('unknown');
-  }, [freighter]);
+  }, [address, freighter]);
 
   return {
     status,

@@ -86,6 +86,24 @@ export function ClaimBurn({
     }
   }, [status]);
 
+  // Synchronize account changes: reset pending/confirming actions if account changes
+  const prevPublicKeyRef = useRef<string | null | undefined>(publicKey);
+  useEffect(() => {
+    if (
+      prevPublicKeyRef.current !== undefined &&
+      prevPublicKeyRef.current !== null &&
+      prevPublicKeyRef.current !== publicKey
+    ) {
+      if (status === 'confirm' || status === 'simulating' || status === 'pending') {
+        setStatus('error');
+        setConfirmAmount('');
+        setEstimatedFee(null);
+        setErrorMsg('Active wallet account changed. Please re-confirm transaction with the new account.');
+      }
+    }
+    prevPublicKeyRef.current = publicKey;
+  }, [publicKey, status]);
+
   function resetFeedback() {
     setStatus('idle');
     setTxHash(null);
@@ -467,6 +485,14 @@ export function ClaimBurn({
             >
               Estimated fee: <strong>{estimatedFee} stroops</strong> (
               <strong>{formatStroopsAsXlm(estimatedFee)} XLM</strong>)
+            </p>
+          )}
+          {publicKey && (
+            <p
+              className="mb-4 text-xs text-slate-500 dark:text-slate-400 font-mono"
+              data-testid="confirm-active-account"
+            >
+              Active account: {publicKey.slice(0, 6)}...{publicKey.slice(-6)}
             </p>
           )}
           <div className="grid grid-cols-2 gap-3">
