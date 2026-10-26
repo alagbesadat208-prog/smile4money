@@ -19,9 +19,23 @@ export interface MatchRecord {
    * match was created without both usernames captured (nothing to bind yet).
    */
   identityHash?: string;
+  evidence?: CanonicalSettlementEvidence;
 }
 
-interface CreateMatchPayload {
+export interface CanonicalSettlementEvidence {
+  parserVersion: string;
+  evaluatedAt: string;
+  matchId: number;
+  gameId: string;
+  platform: string;
+  whitePlayer: string;
+  blackPlayer: string;
+  result: string | null;
+  status: string;
+  decision: 'verified' | 'player_identity_mismatch' | 'identity_hash_mismatch';
+}
+
+export interface CreateMatchPayload {
   player1: string;
   player2: string;
   player1Username?: string;
@@ -32,10 +46,36 @@ interface CreateMatchPayload {
   platform: string;
 }
 
+export interface MatchStorePort {
+  createMatch(payload: CreateMatchPayload): Promise<MatchRecord>;
+  findByGameId(gameId: string): Promise<MatchRecord | null>;
+  count(): Promise<number>;
+  saveSettlementEvidence(evidence: CanonicalSettlementEvidence): Promise<void>;
+  getSettlementEvidence(matchId: number): Promise<CanonicalSettlementEvidence | null>;
+  getSettlementEvidenceHistory(matchId: number): Promise<CanonicalSettlementEvidence[]>;
+}
+
 export class MatchStore {
   private matches = new Map<number, MatchRecord>();
   private gameIds = new Set<string>();
   private nextId = 0;
+  private evidenceByMatch = new Map<number, CanonicalSettlementEvidence[]>();
+
+  async saveSettlementEvidence(evidence: CanonicalSettlementEvidence): Promise<void> {
+    const records = this.evidenceByMatch.get(evidence.matchId) ?? [];
+    records.push({ ...evidence });
+    this.evidenceByMatch.set(evidence.matchId, records);
+  }
+
+  async getSettlementEvidence(matchId: number): Promise<CanonicalSettlementEvidence | null> {
+    const records = this.evidenceByMatch.get(matchId);
+    const evidence = records?.[records.length - 1];
+    return evidence ? { ...evidence } : null;
+  }
+
+  async getSettlementEvidenceHistory(matchId: number): Promise<CanonicalSettlementEvidence[]> {
+    return (this.evidenceByMatch.get(matchId) ?? []).map((record) => ({ ...record }));
+  }
 
   async createMatch(payload: CreateMatchPayload): Promise<MatchRecord> {
     if (!Number.isSafeInteger(this.nextId) || this.nextId < 0) {
@@ -112,5 +152,6 @@ export class MatchStore {
     this.matches.clear();
     this.gameIds.clear();
     this.nextId = 0;
+    this.evidenceByMatch.clear();
   }
 }

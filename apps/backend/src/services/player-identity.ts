@@ -39,8 +39,81 @@
  */
 
 import { createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
+import { Keypair } from '@stellar/stellar-sdk';
+import axios from 'axios';
 import type { GameResult } from '../fetchers/lichess.js';
 import type { MatchRecord } from '../store/match-store.js';
+
+const LINK_NONCE_TTL_MS = 5 * 60 * 1000;
+const pendingLinks = new Map<string, { address: string; platform: string; username: string; expiresAt: number }>();
+const verifiedLinks = new Map<string, { address: string; platform: string; username: string; linkedAt: string }>();
+const MAX_PENDING_LINKS = 4096;
+
+export interface IdentityLinkChallenge { nonce: string; message: string; profileProof: string; expiresAt: string }
+
+export function createIdentityLinkChallenge(address: string, platform: string, username: string): IdentityLinkChallenge {
+  if (!/^G[A-Z2-7]{55}$/.test(address) || !['lichess', 'chessdotcom'].includes(platform) || !username.trim()) {
+    throw new Error('A valid Stellar address, platform, and username are required');
+  }
+  for (const [key, pending] of pendingLinks) {
+    if (pending.expiresAt <= Date.now()) pendingLinks.delete(key);
+  }
+  if (pendingLinks.size >= MAX_PENDING_LINKS) {
+    const oldestNonce = pendingLinks.keys().next().value;
+    if (oldestNonce) pendingLinks.delete(oldestNonce);
+  }
+  const nonce = randomBytes(32).toString('hex');
+  const expiresAt = Date.now() + LINK_NONCE_TTL_MS;
+  pendingLinks.set(nonce, { address, platform, username: username.trim(), expiresAt });
+  const message = `smile4money identity link\nwallet:${address}\nplatform:${platform}\nusername:${username.trim()}\nnonce:${nonce}`;
+  return {
+    nonce,
+    message,
+    profileProof: `smile4money:${nonce}`,
+    expiresAt: new Date(expiresAt).toISOString(),
+  };
+}
+
+async function verifyChessProfile(platform: string, username: string, profileProof: string): Promise<boolean> {
+  const url = platform === 'lichess'
+    ? `https://lichess.org/api/user/${encodeURIComponent(username)}`
+    : `https://api.chess.com/pub/player/${encodeURIComponent(username)}`;
+  const response = await axios.get(url, { timeout: 10_000, headers: { Accept: 'application/json' } });
+  const account = response.data as { username?: string; id?: string; profile?: { bio?: string }; location?: string };
+  const returnedUsername = account.username ?? account.id;
+  if (!returnedUsername || returnedUsername.toLowerCase() !== username.toLowerCase()) return false;
+  const profileText = platform === 'lichess' ? account.profile?.bio : account.location;
+  return typeof profileText === 'string' && profileText.includes(profileProof);
+}
+
+export async function confirmIdentityLink(
+  nonce: string,
+  address: string,
+  signatureHex: string,
+  verifyProfile: typeof verifyChessProfile = verifyChessProfile,
+): Promise<boolean> {
+  const pending = pendingLinks.get(nonce);
+  if (!pending || pending.expiresAt <= Date.now() || pending.address !== address || !/^[0-9a-f]{128}$/i.test(signatureHex)) {
+    if (pending && pending.expiresAt <= Date.now()) pendingLinks.delete(nonce);
+    return false;
+  }
+  const message = `smile4money identity link\nwallet:${pending.address}\nplatform:${pending.platform}\nusername:${pending.username}\nnonce:${nonce}`;
+  const digest = createHash('sha256').update(message).digest();
+  let valid = false;
+  try { valid = Keypair.fromPublicKey(address).verify(digest, Buffer.from(signatureHex, 'hex')); } catch { valid = false; }
+  if (!valid) return false;
+  let profileVerified = false;
+  try { profileVerified = await verifyProfile(pending.platform, pending.username, `smile4money:${nonce}`); } catch { return false; }
+  if (!profileVerified) return false;
+  pendingLinks.delete(nonce);
+  verifiedLinks.set(`${pending.platform}:${pending.username.toLowerCase()}`, { address, platform: pending.platform, username: pending.username, linkedAt: new Date().toISOString() });
+  return true;
+}
+
+export function getLinkedWallet(platform: string, username: string): string | null {
+  return verifiedLinks.get(`${platform}:${username.trim().toLowerCase()}`)?.address ?? null;
+}
 
 /**
  * Represents the mapping of Stellar addresses to chess platform usernames.

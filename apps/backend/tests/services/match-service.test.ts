@@ -83,25 +83,25 @@ describe('validateCreateMatchInput', () => {
   it('returns error when stakeAmount is not a number', () => {
     expect(validateCreateMatchInput(PLAYER1, {
       player2: PLAYER2, stakeAmount: 'bad' as any, token: 'XLM', gameId: 'g', platform: 'lichess',
-    })).toBe('stakeAmount must be a whole number of stroops');
+    })).toBe('stakeAmount must be a whole number of token base units');
   });
 
   it('returns error when stakeAmount is a float', () => {
     expect(validateCreateMatchInput(PLAYER1, {
       player2: PLAYER2, stakeAmount: 1.5, token: 'XLM', gameId: 'g', platform: 'lichess',
-    })).toBe('stakeAmount must be a whole number of stroops');
+    })).toBe('stakeAmount must be a whole number of token base units');
   });
 
   it('returns error when stakeAmount is zero', () => {
     expect(validateCreateMatchInput(PLAYER1, {
       player2: PLAYER2, stakeAmount: 0, token: 'XLM', gameId: 'g', platform: 'lichess',
-    })).toBe('stakeAmount must be a valid, positive amount');
+    })).toContain('between 1 and 10000000000000');
   });
 
   it('returns error when stakeAmount is negative', () => {
     expect(validateCreateMatchInput(PLAYER1, {
       player2: PLAYER2, stakeAmount: -5, token: 'XLM', gameId: 'g', platform: 'lichess',
-    })).toBe('stakeAmount must be a valid, positive amount');
+    })).toContain('between 1 and 10000000000000');
   });
 
   it('returns error when token is missing', () => {
@@ -116,10 +116,24 @@ describe('validateCreateMatchInput', () => {
     })).toBe('gameId is required');
   });
 
-  it('returns error when gameId is too long', () => {
+  it('rejects game IDs beyond the contract byte limit', () => {
     expect(validateCreateMatchInput(PLAYER1, {
       player2: PLAYER2, stakeAmount: 100, token: 'XLM', gameId: 'a'.repeat(512), platform: 'lichess',
-    })).toBe('gameId is too long');
+    })).toContain('1-64 ASCII characters');
+  });
+
+  it('matches contract game ID boundary and character rules', () => {
+    const input = { player2: PLAYER2, stakeAmount: 100, token: 'XLM', gameId: 'a'.repeat(64), platform: 'lichess' };
+    expect(validateCreateMatchInput(PLAYER1, input)).toBeNull();
+    expect(validateCreateMatchInput(PLAYER1, { ...input, gameId: 'a'.repeat(65) })).toContain('1-64 ASCII');
+    expect(validateCreateMatchInput(PLAYER1, { ...input, gameId: 'a.b' })).toContain('1-64 ASCII');
+    expect(validateCreateMatchInput(PLAYER1, { ...input, gameId: 'é' })).toContain('1-64 ASCII');
+  });
+
+  it('matches contract stake bounds in integer token units', () => {
+    const input = { player2: PLAYER2, stakeAmount: 10_000_000_000_000, token: 'XLM', gameId: 'g', platform: 'lichess' };
+    expect(validateCreateMatchInput(PLAYER1, input)).toBeNull();
+    expect(validateCreateMatchInput(PLAYER1, { ...input, stakeAmount: 10_000_000_000_001 })).toContain('between 1 and 10000000000000');
   });
 
   it('returns error when platform is invalid', () => {

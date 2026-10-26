@@ -42,6 +42,10 @@ router.post('/', async (req, res) => {
       );
   }
 
+  if (!req.address) {
+    return res.status(401).json(errorEnvelope(ErrorCode.UNAUTHORIZED, 'Authenticated wallet address is required'));
+  }
+
   // Validate input fields before calling the service
   const validationError = validateCreateMatchInput(player1, payload);
   if (validationError) {
