@@ -1,747 +1,916 @@
+extern crate std;
+
+use std::format;
+
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Ledger as _,
+    },
     token::{Client as TokenClient, StellarAssetClient},
     vec, Address, Env, String, Vec,
 };
 
-fn setup() -> (Env, Address, BracketContractClient<'static>, Address) {
-    let env = Env::default();
-    env.mock_all_auths();
+/// Entry fee used throughout: large enough to be visible in balance assertions.
+const FEE: i128 = 100;
 
-    let admin = Address::generate(&env);
-    let contract_id = env.register(BracketContract, ());
-    let client = BracketContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
+/// Balances before any fees are paid, so expected deltas are easy to read.
+const STARTING_BALANCE: i128 = 10_000;
 
-    (env, contract_id, client, admin)
+fn test_env() -> Env {
+    // Assertions inspect values directly; snapshot files are not used.
+    Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    })
 }
 
-fn advance_ledger(env: &Env, delta: u32) {
-    env.ledger().with_mut(|li| {
-        li.sequence_number += delta;
-    });
+/// A deployed bracket plus the addresses and token needed to drive it.
+struct Fixture<'a> {
+    env: Env,
+    client: TournamentBracketClient<'a>,
+    admin: Address,
+    oracle: Address,
+    token: Address,
+    /// `players[i]` is seed `i`, i.e. the strongest seed is index 0.
+    players: Vec<Address>,
+    contract: Address,
 }
 
-#[test]
-fn test_vacant_slots_are_not_byes_before_lock() {
-    let (env, _contract_id, client, admin) = setup();
-    let p1 = Address::generate(&env);
-
-    let bracket_id = client.create_bracket(&4);
-    client.register(&bracket_id, &p1);
-
-    // Node 0 has one participant and one vacant slot — NOT a bye.
-    let node0 = client.get_node(&bracket_id, &0);
-    assert_eq!(node0.slot1, Slot::Filled(p1.clone()));
-    assert_eq!(node0.slot2, Slot::Vacant);
-    assert_eq!(
-        client.get_node_state(&bracket_id, &0),
-        NodeState::AwaitingParticipants
-    );
-
-    // Node 1 has two vacant slots — NOT void or bye.
-    let node1 = client.get_node(&bracket_id, &1);
-    assert_eq!(node1.slot1, Slot::Vacant);
-    assert_eq!(node1.slot2, Slot::Vacant);
-    assert_eq!(
-        client.get_node_state(&bracket_id, &1),
-        NodeState::AwaitingParticipants
-    );
-
-    // Cannot advance an unfilled node as a bye or submit a result on it.
-    assert_eq!(
-        client.try_advance_bye(&bracket_id, &0),
-        Err(Ok(Error::SlotVacant))
-    );
-    assert_eq!(
-        client.try_submit_result(&bracket_id, &0, &p1, &admin),
-        Err(Ok(Error::SlotVacant))
-    );
-}
-
-#[test]
-fn test_lock_converts_vacant_to_explicit_bye_and_advances() {
-    let (env, _contract_id, client, admin) = setup();
-    let p1 = Address::generate(&env);
-    let p2 = Address::generate(&env);
-    let p3 = Address::generate(&env);
-
-    // 4-slot bracket with 3 participants -> 1 explicit bye in round 0 node 1.
-    let bracket_id = client.create_bracket(&4);
-    client.register(&bracket_id, &p1);
-    client.register(&bracket_id, &p2);
-    client.register(&bracket_id, &p3);
-
-    client.lock_registration(&bracket_id, &admin);
-
-    // Node 0: p1 vs p2 -> Ready
-    assert_eq!(client.get_node_state(&bracket_id, &0), NodeState::Ready);
-
-    // Node 1: p3 vs explicit Bye -> ByeAdvance(p3)
-    let node1 = client.get_node(&bracket_id, &1);
-    assert_eq!(node1.slot1, Slot::Filled(p3.clone()));
-    assert_eq!(node1.slot2, Slot::Bye);
-    assert_eq!(
-        client.get_node_state(&bracket_id, &1),
-        NodeState::ByeAdvance(p3.clone())
-    );
-
-    // Final node (node 2) already received p3 in slot2 from the bye advance,
-    // while slot1 is still Vacant awaiting node 0.
-    let final_node = client.get_node(&bracket_id, &2);
-    assert_eq!(final_node.slot1, Slot::Vacant);
-    assert_eq!(final_node.slot2, Slot::Filled(p3.clone()));
-    assert_eq!(
-        client.get_node_state(&bracket_id, &2),
-        NodeState::AwaitingParticipants
-    );
-
-    // A bye node cannot be played as a normal match.
-    assert_eq!(
-        client.try_submit_result(&bracket_id, &1, &p3, &admin),
-        Err(Ok(Error::NotPlayable))
-    );
-
-    // Explicit advance_bye is idempotent on a bye node and rejected on Ready node.
-    client.advance_bye(&bracket_id, &1);
-    assert_eq!(
-        client.try_advance_bye(&bracket_id, &0),
-        Err(Ok(Error::NotABye))
-    );
-
-    // Report and finalize node 0 and final after their review windows.
-    client.submit_result(&bracket_id, &0, &p1, &admin);
-    advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
-    client.finalize_result(&bracket_id, &0);
-    assert_eq!(client.get_node_state(&bracket_id, &2), NodeState::Ready);
-
-    client.submit_result(&bracket_id, &2, &p3, &admin);
-    advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
-    client.finalize_result(&bracket_id, &2);
-    assert_eq!(client.get_champion(&bracket_id), p3);
-}
-
-#[test]
-fn test_double_bye_void_node_propagates_bye_to_next_round() {
-    let (env, _contract_id, client, admin) = setup();
-    let p1 = Address::generate(&env);
-    let p2 = Address::generate(&env);
-
-    // 4-slot bracket with only 2 participants in node 0; node 1 gets two byes (Void).
-    let bracket_id = client.create_bracket(&4);
-    client.register(&bracket_id, &p1);
-    client.register(&bracket_id, &p2);
-    client.lock_registration(&bracket_id, &admin);
-
-    assert_eq!(client.get_node_state(&bracket_id, &1), NodeState::Void);
-
-    // Final node slot2 is now an explicit Bye.
-    let final_node = client.get_node(&bracket_id, &2);
-    assert_eq!(final_node.slot1, Slot::Vacant);
-    assert_eq!(final_node.slot2, Slot::Bye);
-
-    // When p1 wins node 0 and the review window is finalized, p1 advances into
-    // final slot1 and automatically wins via bye!
-    client.submit_result(&bracket_id, &0, &p1, &admin);
-    advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
-    client.finalize_result(&bracket_id, &0);
-    assert_eq!(
-        client.get_node_state(&bracket_id, &2),
-        NodeState::ByeAdvance(p1.clone())
-    );
-    assert_eq!(client.get_champion(&bracket_id), p1);
-}
-
-#[test]
-fn test_malformed_nodes_detected_and_rejected() {
-    let (env, contract_id, client, admin) = setup();
-    let p1 = Address::generate(&env);
-    let p2 = Address::generate(&env);
-    let outsider = Address::generate(&env);
-
-    let bracket_id = client.create_bracket(&4);
-    client.register(&bracket_id, &p1);
-    client.register(&bracket_id, &p2);
-    client.lock_registration(&bracket_id, &admin);
-
-    // 1. Corrupt a locked round-0 node to have a Vacant slot -> MalformedNode.
-    env.as_contract(&contract_id, || {
-        let mut node = BracketContract::load_node(&env, bracket_id, 1).unwrap();
-        node.slot1 = Slot::Vacant;
-        BracketContract::save_node(&env, &node);
-    });
-    assert_eq!(
-        client.try_get_node_state(&bracket_id, &1),
-        Err(Ok(Error::MalformedNode))
-    );
-
-    // 2. Corrupt a Bye node to also carry a winner -> MalformedNode.
-    env.as_contract(&contract_id, || {
-        let mut node = BracketContract::load_node(&env, bracket_id, 1).unwrap();
-        node.slot1 = Slot::Filled(p1.clone());
-        node.slot2 = Slot::Bye;
-        node.winner = Some(p1.clone());
-        BracketContract::save_node(&env, &node);
-    });
-    assert_eq!(
-        client.try_get_node_state(&bracket_id, &1),
-        Err(Ok(Error::MalformedNode))
-    );
-    assert_eq!(
-        client.try_advance_bye(&bracket_id, &1),
-        Err(Ok(Error::MalformedNode))
-    );
-
-    // 3. Corrupt a node so a participant plays against themselves -> MalformedNode.
-    env.as_contract(&contract_id, || {
-        let mut node = BracketContract::load_node(&env, bracket_id, 0).unwrap();
-        node.slot1 = Slot::Filled(p1.clone());
-        node.slot2 = Slot::Filled(p1.clone());
-        BracketContract::save_node(&env, &node);
-    });
-    assert_eq!(
-        client.try_get_node_state(&bracket_id, &0),
-        Err(Ok(Error::MalformedNode))
-    );
-
-    // 4. Corrupt a node with a winner that is neither slot -> MalformedNode.
-    env.as_contract(&contract_id, || {
-        let mut node = BracketContract::load_node(&env, bracket_id, 0).unwrap();
-        node.slot1 = Slot::Filled(p1.clone());
-        node.slot2 = Slot::Filled(p2.clone());
-        node.winner = Some(outsider);
-        BracketContract::save_node(&env, &node);
-    });
-    assert_eq!(
-        client.try_get_node_state(&bracket_id, &0),
-        Err(Ok(Error::MalformedNode))
-    );
-}
-
-#[test]
-fn test_review_window_blocks_advancement_and_allows_authorized_amendment() {
-    let (env, _contract_id, client, admin) = setup();
-    let reviewer = Address::generate(&env);
-    let stranger = Address::generate(&env);
-    let p1 = Address::generate(&env);
-    let p2 = Address::generate(&env);
-    let p3 = Address::generate(&env);
-    let p4 = Address::generate(&env);
-
-    let bracket_id = client.create_bracket(&4);
-
-    // Configure a custom 50-ledger review window and dedicated reviewer.
-    assert_eq!(
-        client.try_set_review_config(&bracket_id, &reviewer, &0, &admin),
-        Err(Ok(Error::InvalidReviewWindow))
-    );
-    assert_eq!(
-        client.try_set_review_config(&bracket_id, &reviewer, &50, &stranger),
-        Err(Ok(Error::Unauthorized))
-    );
-    client.set_review_config(&bracket_id, &reviewer, &50, &admin);
-
-    client.register(&bracket_id, &p1);
-    client.register(&bracket_id, &p2);
-    client.register(&bracket_id, &p3);
-    client.register(&bracket_id, &p4);
-    client.lock_registration(&bracket_id, &admin);
-
-    let start_ledger = env.ledger().sequence();
-    let expected_deadline = start_ledger + 50;
-
-    // Report p1 as provisional winner of node 0.
-    client.submit_result(&bracket_id, &0, &p1, &admin);
-    assert_eq!(
-        client.get_node_state(&bracket_id, &0),
-        NodeState::UnderReview(p1.clone(), expected_deadline)
-    );
-
-    // Advancement is blocked while under review: parent (final node 2) slot1 is still Vacant.
-    let final_node = client.get_node(&bracket_id, &2);
-    assert_eq!(final_node.slot1, Slot::Vacant);
-    assert_eq!(
-        client.get_node_state(&bracket_id, &2),
-        NodeState::AwaitingParticipants
-    );
-
-    // Finalizing before the deadline is rejected.
-    advance_ledger(&env, 25);
-    assert_eq!(
-        client.try_finalize_result(&bracket_id, &0),
-        Err(Ok(Error::ReviewWindowOpen))
-    );
-
-    // Non-reviewer (including admin if reviewer was rotated) cannot amend the result.
-    assert_eq!(
-        client.try_amend_result(&bracket_id, &0, &p2, &stranger),
-        Err(Ok(Error::Unauthorized))
-    );
-    assert_eq!(
-        client.try_amend_result(&bracket_id, &0, &p2, &admin),
-        Err(Ok(Error::Unauthorized))
-    );
-
-    // Reviewer cannot amend to a non-participant of node 0.
-    assert_eq!(
-        client.try_amend_result(&bracket_id, &0, &p3, &reviewer),
-        Err(Ok(Error::InvalidWinner))
-    );
-
-    // Authorized reviewer amends the contested result from p1 to p2 within the window.
-    client.amend_result(&bracket_id, &0, &p2, &reviewer);
-    assert_eq!(
-        client.get_node_state(&bracket_id, &0),
-        NodeState::UnderReview(p2.clone(), expected_deadline)
-    );
-    assert_eq!(client.get_node(&bracket_id, &2).slot1, Slot::Vacant);
-
-    // Advance ledger to reach the review deadline.
-    advance_ledger(&env, 25);
-
-    // Amending after the deadline has expired is rejected.
-    assert_eq!(
-        client.try_amend_result(&bracket_id, &0, &p1, &reviewer),
-        Err(Ok(Error::ReviewWindowExpired))
-    );
-
-    // Finalize the result: node 0 becomes Resolved(p2) and p2 advances to final node 2 slot1.
-    client.finalize_result(&bracket_id, &0);
-    assert_eq!(
-        client.get_node_state(&bracket_id, &0),
-        NodeState::Resolved(p2.clone())
-    );
-    assert_eq!(
-        client.get_node(&bracket_id, &2).slot1,
-        Slot::Filled(p2.clone())
-    );
-
-    // Finalizing or amending an already finalized node is rejected.
-    assert_eq!(
-        client.try_finalize_result(&bracket_id, &0),
-        Err(Ok(Error::AlreadyResolved))
-    );
-    assert_eq!(
-        client.try_amend_result(&bracket_id, &0, &p1, &reviewer),
-        Err(Ok(Error::AlreadyResolved))
-    );
-}
-
-#[test]
-fn test_emergency_pause_authorization_and_blocked_progression() {
-    let (env, _contract_id, client, admin) = setup();
-    let stranger = Address::generate(&env);
-    let p1 = Address::generate(&env);
-    let p2 = Address::generate(&env);
-    let p3 = Address::generate(&env);
-
-    // Non-admin cannot pause or unpause.
-    assert_eq!(client.try_pause(&stranger), Err(Ok(Error::Unauthorized)));
-    assert_eq!(client.try_unpause(&stranger), Err(Ok(Error::Unauthorized)));
-
-    let open_bracket = client.create_bracket(&4);
-    client.register(&open_bracket, &p1);
-
-    let locked_bracket = client.create_bracket(&4);
-    client.register(&locked_bracket, &p1);
-    client.register(&locked_bracket, &p2);
-    client.register(&locked_bracket, &p3);
-    client.lock_registration(&locked_bracket, &admin);
-
-    // Activate emergency mode.
-    assert!(!client.is_paused());
-    client.pause(&admin);
-    assert!(client.is_paused());
-
-    // Every progression entrypoint is blocked while paused.
-    assert_eq!(
-        client.try_create_bracket(&4),
-        Err(Ok(Error::ContractPaused))
-    );
-    assert_eq!(
-        client.try_register(&open_bracket, &p2),
-        Err(Ok(Error::ContractPaused))
-    );
-    assert_eq!(
-        client.try_lock_registration(&open_bracket, &admin),
-        Err(Ok(Error::ContractPaused))
-    );
-    assert_eq!(
-        client.try_submit_result(&locked_bracket, &0, &p1, &admin),
-        Err(Ok(Error::ContractPaused))
-    );
-    assert_eq!(
-        client.try_amend_result(&locked_bracket, &0, &p2, &admin),
-        Err(Ok(Error::ContractPaused))
-    );
-    assert_eq!(
-        client.try_finalize_result(&locked_bracket, &0),
-        Err(Ok(Error::ContractPaused))
-    );
-    assert_eq!(
-        client.try_advance_bye(&locked_bracket, &1),
-        Err(Ok(Error::ContractPaused))
-    );
-
-    // Read queries remain available while paused.
-    assert_eq!(client.get_bracket(&locked_bracket).registered, 3);
-    assert_eq!(client.get_node_state(&locked_bracket, &0), NodeState::Ready);
-}
-
-#[test]
-fn test_emergency_mode_preserves_participant_exits_and_refunds() {
-    let (env, _contract_id, client, admin) = setup();
-    let p1 = Address::generate(&env);
-    let p2 = Address::generate(&env);
-    let p3 = Address::generate(&env);
-
-    let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
-    let token_addr = token_contract.address();
-    let asset_client = StellarAssetClient::new(&env, &token_addr);
-    let token_client = TokenClient::new(&env, &token_addr);
-
-    asset_client.mint(&p1, &1000);
-    asset_client.mint(&p2, &1000);
-    asset_client.mint(&p3, &1000);
-
-    let bracket_id = client.create_paid_bracket(&4, &token_addr, &250);
-    client.register(&bracket_id, &p1);
-    client.register(&bracket_id, &p2);
-    client.register(&bracket_id, &p3);
-    assert_eq!(token_client.balance(&p1), 750);
-    assert_eq!(token_client.balance(&p2), 750);
-    assert_eq!(token_client.balance(&p3), 750);
-
-    // Lock the bracket. During normal play (not paused, not cancelled), a locked
-    // bracket rejects arbitrary withdrawal.
-    client.lock_registration(&bracket_id, &admin);
-    assert_eq!(
-        client.try_withdraw(&bracket_id, &p1),
-        Err(Ok(Error::RegistrationClosed))
-    );
-
-    // Operator triggers emergency pause due to an incident.
-    client.pause(&admin);
-
-    // Participant p1 can immediately exit and recover their 250 entry fee while paused,
-    // even before the operator explicitly cancels the bracket.
-    client.withdraw(&bracket_id, &p1);
-    assert_eq!(token_client.balance(&p1), 1000);
-    assert!(client.get_bracket(&bracket_id).cancelled);
-
-    // Double withdrawal by p1 is rejected.
-    assert_eq!(
-        client.try_withdraw(&bracket_id, &p1),
-        Err(Ok(Error::NotRegistered))
-    );
-
-    // Participant p2 also exits while paused.
-    client.withdraw(&bracket_id, &p2);
-    assert_eq!(token_client.balance(&p2), 1000);
-
-    // Even after emergency mode is lifted, the affected bracket remains cancelled so
-    // remaining participant p3 can still withdraw and match progression stays blocked.
-    client.unpause(&admin);
-    assert_eq!(
-        client.try_submit_result(&bracket_id, &0, &p2, &admin),
-        Err(Ok(Error::BracketCancelled))
-    );
-    client.withdraw(&bracket_id, &p3);
-    assert_eq!(token_client.balance(&p3), 1000);
-    assert_eq!(client.get_bracket(&bracket_id).registered, 0);
-}
-
-#[test]
-fn test_cancel_bracket_while_paused_allows_exits() {
-    let (env, _contract_id, client, admin) = setup();
-    let p1 = Address::generate(&env);
-    let p2 = Address::generate(&env);
-    let stranger = Address::generate(&env);
-
-    let bracket_id = client.create_bracket(&4);
-    client.register(&bracket_id, &p1);
-    client.register(&bracket_id, &p2);
-    client.lock_registration(&bracket_id, &admin);
-
-    client.pause(&admin);
-
-    // Non-admin cannot cancel.
-    assert_eq!(
-        client.try_cancel_bracket(&bracket_id, &stranger),
-        Err(Ok(Error::Unauthorized))
-    );
-
-    // Admin can cancel while paused.
-    client.cancel_bracket(&bracket_id, &admin);
-    assert!(client.get_bracket(&bracket_id).cancelled);
-
-    // Second cancel is rejected.
-    assert_eq!(
-        client.try_cancel_bracket(&bracket_id, &admin),
-        Err(Ok(Error::BracketCancelled))
-    );
-
-    // Both participants can exit while paused or after unpausing.
-    client.withdraw(&bracket_id, &p1);
-    client.unpause(&admin);
-    client.withdraw(&bracket_id, &p2);
-    assert_eq!(client.get_bracket(&bracket_id).registered, 0);
-}
-
-#[test]
-fn test_construction_and_advancement_reject_identical_participants_in_both_slots() {
-    let (env, contract_id, client, admin) = setup();
-    let p1 = Address::generate(&env);
-    let p2 = Address::generate(&env);
-    let p3 = Address::generate(&env);
-
-    // 1. Seeded bracket construction rejects identical participants in the same match.
-    assert_eq!(
-        client.try_create_seeded_bracket(&2, &vec![&env, p1.clone(), p1.clone()]),
-        Err(Ok(Error::DuplicateParticipant))
-    );
-
-    // 2. Seeded bracket construction rejects duplicate participants across matches.
-    assert_eq!(
-        client.try_create_seeded_bracket(&4, &vec![&env, p1.clone(), p2.clone(), p1.clone()]),
-        Err(Ok(Error::DuplicateParticipant))
-    );
-
-    // 3. Incremental registration rejects duplicate participant in the second slot.
-    let bracket_id = client.create_bracket(&4);
-    client.register(&bracket_id, &p1);
-    assert_eq!(
-        client.try_register(&bracket_id, &p1),
-        Err(Ok(Error::AlreadyRegistered))
-    );
-
-    // 4. Advancement rejects placing a participant into a parent node whose opposite
-    //    slot already holds the same participant.
-    client.register(&bracket_id, &p2);
-    client.register(&bracket_id, &p3);
-    client.lock_registration(&bracket_id, &admin);
-
-    // Parent node 2 currently has slot2 = Filled(p3) (via bye from node 1) and slot1 = Vacant.
-    // If node 0 is corrupted to carry p3 vs p2 and p3 is finalized, advancing p3 into
-    // parent node 2 slot1 would place p3 on both sides of node 2 and must fail with
-    // Error::DuplicateParticipant.
-    env.as_contract(&contract_id, || {
-        let mut node0 = BracketContract::load_node(&env, bracket_id, 0).unwrap();
-        node0.slot1 = Slot::Filled(p3.clone());
-        node0.slot2 = Slot::Filled(p2.clone());
-        BracketContract::save_node(&env, &node0);
-    });
-
-    client.submit_result(&bracket_id, &0, &p3, &admin);
-    advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
-    assert_eq!(
-        client.try_finalize_result(&bracket_id, &0),
-        Err(Ok(Error::DuplicateParticipant))
-    );
-
-    // Verify parent node 2 was never mutated to hold p3 on both sides.
-    let final_node = client.get_node(&bracket_id, &2);
-    assert_eq!(final_node.slot1, Slot::Vacant);
-    assert_eq!(final_node.slot2, Slot::Filled(p3));
-}
-
-#[test]
-fn prop_distinct_participants_across_all_supported_bracket_sizes_and_byes() {
-    let (env, _contract_id, client, admin) = setup();
-    let sizes: [u32; 8] = [2, 4, 8, 16, 32, 64, 128, 256];
-
-    for size in sizes {
-        // Exercise multiple bye distributions for each supported power-of-two size:
-        // single entrant (all byes), sparse/odd entrant count (mixed byes and void nodes),
-        // and three-quarters full.
-        let entrant_counts: [u32; 3] = [1, (size / 2) + 1, size - 1];
-
-        for count in entrant_counts {
-            let mut participants: Vec<Address> = Vec::new(&env);
-            for _ in 0..count {
-                participants.push_back(Address::generate(&env));
-            }
-
-            let bracket_id = client.create_seeded_bracket(&size, &participants);
-            client.lock_registration(&bracket_id, &admin);
-
-            let bracket = client.get_bracket(&bracket_id);
-            for round in 0..bracket.rounds {
-                let nodes_in_round = size >> (round + 1);
-                let round_offset = size - (size >> round);
-                let mut seen_in_round: Vec<Address> = Vec::new(&env);
-
-                for index in 0..nodes_in_round {
-                    let node_id = (round_offset + index) as u64;
-                    let node = client.get_node(&bracket_id, &node_id);
-
-                    // Invariant 1: No node ever holds the same participant in slot1 and slot2.
-                    if let (Slot::Filled(a), Slot::Filled(b)) = (&node.slot1, &node.slot2) {
-                        assert_ne!(a, b, "duplicate participant in node {}", node_id);
-                    }
-
-                    // Invariant 2: No participant appears more than once in the same round.
-                    for slot in [&node.slot1, &node.slot2] {
-                        if let Slot::Filled(addr) = slot {
-                            for i in 0..seen_in_round.len() {
-                                assert_ne!(
-                                    seen_in_round.get(i).unwrap(),
-                                    *addr,
-                                    "participant duplicated in round {}",
-                                    round
-                                );
-                            }
-                            seen_in_round.push_back(addr.clone());
-                        }
-                    }
-
-                    // Resolve any playable match so winners advance into the next round.
-                    if client.get_node_state(&bracket_id, &node_id) == NodeState::Ready {
-                        let winner = match (&node.slot1, &node.slot2) {
-                            (Slot::Filled(p1), Slot::Filled(p2)) => {
-                                if (index + round) % 2 == 0 {
-                                    p1.clone()
-                                } else {
-                                    p2.clone()
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-                        client.submit_result(&bracket_id, &node_id, &winner, &admin);
-                        advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
-                        client.finalize_result(&bracket_id, &node_id);
-                    }
-                }
-            }
-
-            // A champion must be crowned from the registered participants.
-            let champion = client.get_champion(&bracket_id);
-            let mut found = false;
-            for i in 0..participants.len() {
-                if participants.get(i).unwrap() == champion {
-                    found = true;
-                    break;
-                }
-            }
-            assert!(found);
+impl<'a> Fixture<'a> {
+    fn with_field(player_count: usize) -> Self {
+        let env = test_env();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = token_id.address();
+        // Time-travel tests need the external token instance to stay live too.
+        env.as_contract(&token, || {
+            env.storage()
+                .instance()
+                .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        });
+
+        let contract = env.register(TournamentBracket, ());
+        let client = TournamentBracketClient::new(&env, &contract);
+        client.initialize(&admin, &oracle, &token);
+
+        // The reserve buffer is funded by the admin so the contract always keeps
+        // enough back to satisfy the minimum-account-balance rule on payout.
+        asset(&env, &token).mint(&contract, &ESCROW_RESERVE_BUFFER_STROOPS);
+
+        // `players[i]` is seed `i` (index 0 being the strongest seed). Each entrant
+        // must approve this contract before it can pull their entry fee — the
+        // SEP-41 transfer checks the spender's allowance.
+        let expiration = env.ledger().sequence() + 1_000_000;
+        let token_client = TokenClient::new(&env, &token);
+        let mut players: Vec<Address> = Vec::new(&env);
+        for _ in 0..player_count {
+            let p = Address::generate(&env);
+            asset(&env, &token).mint(&p, &STARTING_BALANCE);
+            token_client.approve(&p, &contract, &STARTING_BALANCE, &expiration);
+            players.push_back(p);
         }
+
+        Fixture {
+            env,
+            client,
+            admin,
+            oracle,
+            token,
+            players,
+            contract,
+        }
+    }
+
+    /// A 4-player field: seeds 0..3, two semifinals and a final.
+    fn four_players() -> Self {
+        Self::with_field(4)
+    }
+
+    fn balance(&self, who: &Address) -> i128 {
+        TokenClient::new(&self.env, &self.token).balance(who)
+    }
+
+    fn seed(&self, i: u32) -> Address {
+        self.players.get(i).unwrap()
+    }
+
+    /// Create a tournament and have every entrant pay their fee.
+    fn create_and_fund_all(&self) -> u64 {
+        let id = self.client.create_tournament(&FEE, &self.players);
+        for i in 0..self.players.len() {
+            self.client.deposit(&id, &self.seed(i));
+        }
+        id
+    }
+}
+
+fn asset<'a>(env: &'a Env, token: &Address) -> StellarAssetClient<'a> {
+    StellarAssetClient::new(env, token)
+}
+
+// Retention changes rent metadata, never the permanent settlement records.
+fn assert_retention_preserves_settlement(f: &Fixture, id: u64) {
+    let tournament = f.client.get_tournament(&id);
+    let before = f.env.as_contract(&f.contract, || {
+        (
+            f.env.storage().persistent().all(),
+            f.env.storage().instance().all(),
+        )
+    });
+    let balances: std::vec::Vec<_> = f.players.iter().map(|p| f.balance(&p)).collect();
+    let reserve = f.balance(&f.contract);
+    f.env
+        .ledger()
+        .set_sequence_number(f.env.ledger().sequence() + 100);
+    // No mock authorization: any transaction payer can maintain the records.
+    f.env.mock_auths(&[]);
+    for _ in 0..2 {
+        f.client.extend_record_ttl(&id);
+        assert!(f.env.auths().is_empty());
+        assert_eq!(f.client.get_tournament(&id), tournament);
+        f.env.as_contract(&f.contract, || {
+            assert_eq!(f.env.storage().persistent().all(), before.0);
+            assert_eq!(f.env.storage().instance().all(), before.1);
+            assert!(f.env.storage().instance().get_ttl() >= MATCH_TTL_LEDGERS);
+            assert!(
+                f.env
+                    .storage()
+                    .persistent()
+                    .get_ttl(&DataKey::Tournament(id))
+                    >= MATCH_TTL_LEDGERS
+            );
+            for round in 0..tournament.rounds {
+                for index in 0..(tournament.player_count >> (round + 1)) {
+                    assert!(
+                        f.env
+                            .storage()
+                            .persistent()
+                            .get_ttl(&DataKey::Node(id, round, index))
+                            >= MATCH_TTL_LEDGERS
+                    );
+                }
+            }
+        });
+        assert_eq!(f.balance(&f.contract), reserve);
+        assert_eq!(
+            f.players
+                .iter()
+                .map(|p| f.balance(&p))
+                .collect::<std::vec::Vec<_>>(),
+            balances
+        );
     }
 }
 
 #[test]
-fn test_persist_unique_game_id_and_reject_duplicates_or_finalized_replacement() {
-    let (env, _contract_id, client, admin) = setup();
-    let p1 = Address::generate(&env);
-    let p2 = Address::generate(&env);
-    let p3 = Address::generate(&env);
-    let p4 = Address::generate(&env);
+fn retention_preserves_champion_payout_and_all_match_facts() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    f.client
+        .submit_match_result(&id, &0, &1, &game_id(&f.env, 2), &f.seed(1));
+    f.client
+        .submit_match_result(&id, &1, &0, &game_id(&f.env, 3), &f.seed(0));
+    let tournament = f.client.get_tournament(&id);
+    assert_retention_preserves_settlement(&f, id);
+    // Renewed records remain queryable beyond their original live-until ledger.
+    f.env
+        .ledger()
+        .set_sequence_number(tournament.completed_ledger.unwrap() + MATCH_TTL_LEDGERS + 1);
+    assert_eq!(f.client.get_tournament(&id), tournament);
+    assert_eq!(f.client.get_champion(&id), f.seed(0));
+    assert_eq!(f.client.get_node(&id, &0, &0).winner, Some(f.seed(0)));
+    assert_eq!(f.client.get_node(&id, &1, &0).winner, Some(f.seed(0)));
+    f.env.mock_all_auths();
+    assert_eq!(
+        f.client.try_claim_timeout(&id, &f.seed(0)),
+        Err(Ok(Error::TournamentFinished))
+    );
+    assert_eq!(
+        f.client
+            .try_submit_match_result(&id, &1, &0, &game_id(&f.env, 4), &f.seed(1)),
+        Err(Ok(Error::TournamentFinished))
+    );
+}
 
-    // 4-slot bracket with 3 participants: node 0 is Ready (p1 vs p2), node 1 is a Bye (p3).
-    let bracket_id = client.create_bracket(&4);
-    client.register(&bracket_id, &p1);
-    client.register(&bracket_id, &p2);
-    client.register(&bracket_id, &p3);
+#[test]
+fn retention_preserves_partial_refund_and_other_tournaments() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.deposit(&id, &f.seed(0));
+    f.client.cancel_tournament(&id);
+    let other = f.client.create_tournament(&FEE, &f.players);
+    let other_ttl = f.env.as_contract(&f.contract, || {
+        f.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Tournament(other))
+    });
+    assert_retention_preserves_settlement(&f, id);
+    assert_eq!(f.balance(&f.seed(0)), STARTING_BALANCE);
+    assert_eq!(f.client.get_tournament(&id).funded_count, 0);
+    f.env.as_contract(&f.contract, || {
+        assert_eq!(
+            f.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Tournament(other)),
+            other_ttl - 100
+        );
+    });
+}
 
-    let g1 = String::from_str(&env, "lichess-match-001");
-    let g1_updated = String::from_str(&env, "lichess-match-001-rematch");
-    let g2 = String::from_str(&env, "lichess-match-002");
-    let empty_id = String::from_str(&env, "");
-    let oversized_id = String::from_str(
+#[test]
+fn retention_preserves_timeout_refunds() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    f.env.ledger().set_sequence_number(TIMEOUT_LEDGERS + 1);
+    f.client.claim_timeout(&id, &f.seed(0));
+    assert_retention_preserves_settlement(&f, id);
+}
+
+#[test]
+fn retention_rejects_unknown_and_unsettled_records() {
+    let f = Fixture::with_field(2);
+    assert_eq!(
+        f.client.try_extend_record_ttl(&0),
+        Err(Ok(Error::TournamentNotFound))
+    );
+    let id = f.client.create_tournament(&FEE, &f.players);
+    assert_eq!(
+        f.client.try_extend_record_ttl(&id),
+        Err(Ok(Error::InvalidState))
+    );
+    for player in f.players.iter() {
+        f.client.deposit(&id, &player);
+    }
+    assert_eq!(
+        f.client.try_extend_record_ttl(&id),
+        Err(Ok(Error::InvalidState))
+    );
+}
+
+#[test]
+fn retention_covers_all_63_nodes_of_the_largest_bracket() {
+    let f = Fixture::with_field(MAX_PLAYERS as usize);
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.cancel_tournament(&id);
+    assert_retention_preserves_settlement(&f, id);
+}
+
+#[test]
+fn retention_never_recreates_missing_records() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.cancel_tournament(&id);
+    f.env.as_contract(&f.contract, || {
+        f.env
+            .storage()
+            .persistent()
+            .remove(&DataKey::Node(id, 0, 0))
+    });
+    let before = f
+        .env
+        .as_contract(&f.contract, || f.env.storage().persistent().all());
+    assert_eq!(
+        f.client.try_extend_record_ttl(&id),
+        Err(Ok(Error::NodeNotFound))
+    );
+    f.env.as_contract(&f.contract, || {
+        assert_eq!(f.env.storage().persistent().all(), before)
+    });
+}
+
+fn game_id(env: &Env, n: u32) -> String {
+    String::from_str(env, &format!("game-{}", n))
+}
+
+// ----------------------- full bracket progression -----------------------
+
+/// The acceptance criterion: a 4-player tournament runs start to finish.
+#[test]
+fn four_player_tournament_progresses_to_a_paid_champion() {
+    let f = Fixture::four_players();
+    let s0 = f.seed(0);
+    let s1 = f.seed(1);
+    let s2 = f.seed(2);
+    let s3 = f.seed(3);
+
+    // Bracket is built before anyone pays.
+    let id = f.client.create_tournament(&FEE, &f.players);
+    let t = f.client.get_tournament(&id);
+    assert_eq!(t.player_count, 4);
+    assert_eq!(t.rounds, 2);
+    assert_eq!(t.state, TournamentState::Registration);
+    assert_eq!(t.funded_count, 0);
+    assert_eq!(f.client.get_prize_pool(&id), FEE * 4);
+
+    // Snake seeding: [s0 s3] [s1 s2].
+    let semi_a = f.client.get_node(&id, &0, &0);
+    let semi_b = f.client.get_node(&id, &0, &1);
+    assert_eq!(semi_a.player1, Some(s0.clone()));
+    assert_eq!(semi_a.player2, Some(s3.clone()));
+    assert_eq!(semi_b.player1, Some(s1.clone()));
+    assert_eq!(semi_b.player2, Some(s2.clone()));
+
+    // The final exists but has no entrants yet.
+    let final_node = f.client.get_node(&id, &1, &0);
+    assert_eq!(final_node.player1, None);
+    assert_eq!(final_node.player2, None);
+    assert_eq!(final_node.status, NodeStatus::AwaitingFunding);
+
+    // -- Round 0: all four pay. -----------------------------------------
+    f.client.deposit(&id, &s0);
+    // One payer is not enough to arm a semifinal.
+    assert_eq!(
+        f.client.get_node(&id, &0, &0).status,
+        NodeStatus::AwaitingFunding
+    );
+
+    f.client.deposit(&id, &s3);
+    assert_eq!(
+        f.client.get_node(&id, &0, &0).status,
+        NodeStatus::AwaitingResult
+    );
+    f.client.deposit(&id, &s1);
+    f.client.deposit(&id, &s2);
+    assert_eq!(
+        f.client.get_node(&id, &0, &1).status,
+        NodeStatus::AwaitingResult
+    );
+
+    // Field is full: the tournament is live and the pot is 4 x FEE.
+    assert_eq!(f.client.get_funded_count(&id), 4);
+    assert_eq!(
+        f.client.get_tournament(&id).state,
+        TournamentState::InProgress
+    );
+    assert_eq!(
+        f.balance(&f.contract),
+        ESCROW_RESERVE_BUFFER_STROOPS + FEE * 4
+    );
+
+    // -- Round 0 results. s0 and s1 win their semifinals. ---------------
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &s0);
+    assert_eq!(f.client.get_node(&id, &0, &0).winner, Some(s0.clone()));
+
+    // The winner has landed in the final, but the other semifinal is unplayed
+    // so the final cannot start yet.
+    assert_eq!(f.client.get_node(&id, &1, &0).player1, Some(s0.clone()));
+    assert_eq!(f.client.get_node(&id, &1, &0).player2, None);
+    assert_eq!(
+        f.client.get_node(&id, &1, &0).status,
+        NodeStatus::AwaitingFunding
+    );
+
+    f.client
+        .submit_match_result(&id, &0, &1, &game_id(&f.env, 2), &s1);
+
+    // Both finalists are in place: the final is armed.
+    let final_node = f.client.get_node(&id, &1, &0);
+    assert_eq!(final_node.player1, Some(s0.clone()));
+    assert_eq!(final_node.player2, Some(s1.clone()));
+    assert_eq!(final_node.status, NodeStatus::AwaitingResult);
+
+    // -- Nothing has been paid out yet. ---------------------------------
+    // s0 already won a match but has still only lost their own fee.
+    assert_eq!(f.balance(&s0), STARTING_BALANCE - FEE);
+    assert_eq!(f.balance(&s1), STARTING_BALANCE - FEE);
+    assert_eq!(f.balance(&s2), STARTING_BALANCE - FEE);
+    assert_eq!(f.balance(&s3), STARTING_BALANCE - FEE);
+
+    // -- The final. s0 wins the tournament. ------------------------------
+    f.client
+        .submit_match_result(&id, &1, &0, &game_id(&f.env, 3), &s0);
+
+    // Champion takes the whole 4 x FEE pot.
+    assert_eq!(f.balance(&s0), STARTING_BALANCE - FEE + FEE * 4);
+    assert_eq!(f.balance(&s1), STARTING_BALANCE - FEE);
+    assert_eq!(f.balance(&s2), STARTING_BALANCE - FEE);
+    assert_eq!(f.balance(&s3), STARTING_BALANCE - FEE);
+
+    // The contract keeps only the reserve.
+    assert_eq!(f.balance(&f.contract), ESCROW_RESERVE_BUFFER_STROOPS);
+
+    assert_eq!(f.client.get_champion(&id), s0);
+    let t = f.client.get_tournament(&id);
+    assert_eq!(t.state, TournamentState::Completed);
+    assert_eq!(t.champion, Some(s0));
+    assert!(t.completed_ledger.is_some());
+}
+
+/// A 2-player tournament is a bracket with a single match, and the loser of that
+/// match is the final loser.
+#[test]
+fn two_player_tournament_is_a_single_match() {
+    let f = Fixture::with_field(2);
+    let a = f.seed(0);
+    let b = f.seed(1);
+    let id = f.create_and_fund_all();
+
+    assert_eq!(f.client.get_tournament(&id).rounds, 1);
+    let node = f.client.get_node(&id, &0, &0);
+    assert_eq!(node.player1, Some(a.clone()));
+    assert_eq!(node.player2, Some(b.clone()));
+
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &b);
+
+    assert_eq!(f.client.get_champion(&id), b);
+    assert_eq!(f.balance(&b), STARTING_BALANCE - FEE + FEE * 2);
+    assert_eq!(f.balance(&a), STARTING_BALANCE - FEE);
+    assert_eq!(f.balance(&f.contract), ESCROW_RESERVE_BUFFER_STROOPS);
+}
+
+/// The stronger seed is kept away from the weaker seeds for as long as possible:
+/// seeds 0 and 1 of a 4-player field can only meet in the final.
+#[test]
+fn top_two_seeds_can_only_meet_in_the_final() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+
+    // If seeds 0 and 1 both win their semifinals they are the two finalists.
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    f.client
+        .submit_match_result(&id, &0, &1, &game_id(&f.env, 2), &f.seed(1));
+
+    let final_node = f.client.get_node(&id, &1, &0);
+    assert_eq!(final_node.player1, Some(f.seed(0)));
+    assert_eq!(final_node.player2, Some(f.seed(1)));
+
+    // Conversely, the bottom two seeds meet in the first round, never the final.
+    let semi = f.client.get_node(&id, &0, &1);
+    assert!(semi.player1.as_ref().unwrap() == &f.seed(1));
+    assert!(semi.player2.as_ref().unwrap() == &f.seed(2));
+}
+
+/// A full 8-player field produces 7 nodes over 3 rounds, and the seeding spreads
+/// each seed so it only meets seeds well away from it.
+#[test]
+fn eight_player_field_has_seven_nodes_and_three_rounds() {
+    let f = Fixture::with_field(8);
+    let id = f.client.create_tournament(&FEE, &f.players);
+    assert_eq!(f.client.get_tournament(&id).rounds, 3);
+
+    // Round 0: 4 nodes, round 1: 2 nodes, round 2: 1 node = 7 total.
+    for i in 0..4u32 {
+        let node = f.client.get_node(&id, &0, &i);
+        assert_eq!(node.round, 0);
+        assert_eq!(node.index, i);
+    }
+    for i in 0..2u32 {
+        f.client.get_node(&id, &1, &i);
+    }
+    f.client.get_node(&id, &2, &0);
+
+    // Round 0 is seeded [s0 s7] [s1 s6] [s2 s5] [s3 s4].
+    assert_eq!(f.client.get_node(&id, &0, &0).player1, Some(f.seed(0)));
+    assert_eq!(f.client.get_node(&id, &0, &0).player2, Some(f.seed(7)));
+    assert_eq!(f.client.get_node(&id, &0, &1).player1, Some(f.seed(1)));
+    assert_eq!(f.client.get_node(&id, &0, &1).player2, Some(f.seed(6)));
+    assert_eq!(f.client.get_node(&id, &0, &2).player1, Some(f.seed(2)));
+    assert_eq!(f.client.get_node(&id, &0, &2).player2, Some(f.seed(5)));
+    assert_eq!(f.client.get_node(&id, &0, &3).player1, Some(f.seed(3)));
+    assert_eq!(f.client.get_node(&id, &0, &3).player2, Some(f.seed(4)));
+
+    // There is no fourth round, and no fifth node in the first round.
+    assert_eq!(
+        f.client.try_get_node(&id, &3, &0),
+        Err(Ok(Error::NodeNotFound))
+    );
+    assert_eq!(
+        f.client.try_get_node(&id, &0, &4),
+        Err(Ok(Error::NodeNotFound))
+    );
+}
+
+/// A full 64-player field is the documented maximum, and 128 is rejected.
+#[test]
+fn field_size_bounds_are_enforced() {
+    let f = Fixture::with_field(64);
+    let id = f.client.create_tournament(&FEE, &f.players);
+    assert_eq!(f.client.get_tournament(&id).rounds, 6);
+    assert_eq!(f.client.get_prize_pool(&id), FEE * 64);
+    // 6 rounds of 32/16/8/4/2/1 nodes, so round 0 stops at index 31 and there is
+    // no seventh round.
+    assert_eq!(
+        f.client.try_get_node(&id, &0, &32),
+        Err(Ok(Error::NodeNotFound))
+    );
+    assert_eq!(
+        f.client.try_get_node(&id, &6, &0),
+        Err(Ok(Error::NodeNotFound))
+    );
+    f.client.get_node(&id, &0, &31);
+
+    let env = test_env();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+    let contract = env.register(TournamentBracket, ());
+    let client = TournamentBracketClient::new(&env, &contract);
+    client.initialize(&admin, &admin, &token_id.address());
+
+    let mut many: Vec<Address> = Vec::new(&env);
+    for _ in 0..128 {
+        many.push_back(Address::generate(&env));
+    }
+    assert_eq!(
+        client.try_create_tournament(&FEE, &many),
+        Err(Ok(Error::InvalidPlayerCount))
+    );
+}
+
+// ------------------------------ rejections ------------------------------
+
+#[test]
+fn non_power_of_two_field_is_rejected() {
+    let f = Fixture::with_field(3);
+    assert_eq!(
+        f.client.try_create_tournament(&FEE, &f.players),
+        Err(Ok(Error::InvalidPlayerCount))
+    );
+}
+
+#[test]
+fn single_player_field_is_rejected() {
+    let f = Fixture::with_field(1);
+    assert_eq!(
+        f.client.try_create_tournament(&FEE, &f.players),
+        Err(Ok(Error::InvalidPlayerCount))
+    );
+}
+
+#[test]
+fn duplicate_entrants_are_rejected() {
+    let env = test_env();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+    let contract = env.register(TournamentBracket, ());
+    let client = TournamentBracketClient::new(&env, &contract);
+    client.initialize(&admin, &admin, &token_id.address());
+
+    let dup = Address::generate(&env);
+    let players = vec![
         &env,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefX",
+        dup.clone(),
+        dup.clone(),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    assert_eq!(
+        client.try_create_tournament(&FEE, &players),
+        Err(Ok(Error::DuplicatePlayer))
+    );
+}
+
+#[test]
+fn zero_address_entrant_is_rejected() {
+    let env = test_env();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+    let contract = env.register(TournamentBracket, ());
+    let client = TournamentBracketClient::new(&env, &contract);
+    client.initialize(&admin, &admin, &token_id.address());
+
+    // The all-zeros Stellar account key: the canonical burn address.
+    let zero = Address::from_string(&String::from_str(
+        &env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    let players = vec![
+        &env,
+        zero,
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    assert_eq!(
+        client.try_create_tournament(&FEE, &players),
+        Err(Ok(Error::InvalidAddress))
+    );
+}
+
+#[test]
+fn entry_fee_bounds_are_enforced() {
+    let f = Fixture::four_players();
+    assert_eq!(
+        f.client.try_create_tournament(&0i128, &f.players),
+        Err(Ok(Error::StakeTooLow))
+    );
+    // 4 x (MAX_PRIZE_POOL) overshoots the pool cap.
+    assert_eq!(
+        f.client
+            .try_create_tournament(&(MAX_PRIZE_POOL / 2 + 1), &f.players),
+        Err(Ok(Error::StakeTooHigh))
+    );
+}
+
+#[test]
+fn non_entrant_cannot_fund() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    let outsider = Address::generate(&f.env);
+    assert_eq!(
+        f.client.try_deposit(&id, &outsider),
+        Err(Ok(Error::PlayerNotRegistered))
+    );
+}
+
+#[test]
+fn entrant_cannot_fund_twice() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.deposit(&id, &f.seed(0));
+    assert_eq!(
+        f.client.try_deposit(&id, &f.seed(0)),
+        Err(Ok(Error::AlreadyFunded))
+    );
+    // The rejected second attempt must not have moved any tokens.
+    assert_eq!(f.balance(&f.seed(0)), STARTING_BALANCE - FEE);
+}
+
+#[test]
+fn result_for_a_node_that_is_not_armed_is_rejected() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+
+    // Nobody has paid, so no node can accept a result.
+    assert_eq!(
+        f.client
+            .try_submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0)),
+        Err(Ok(Error::InvalidNodeStatus))
     );
 
-    // Unfilled node (node 1 before lock has a Vacant slot) rejects setting a game ID.
+    // Only one of the two has paid: still not armed.
+    f.client.deposit(&id, &f.seed(0));
     assert_eq!(
-        client.try_set_node_game_id(&bracket_id, &1, &g1, &admin),
-        Err(Ok(Error::SlotVacant))
+        f.client
+            .try_submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0)),
+        Err(Ok(Error::InvalidNodeStatus))
     );
+}
 
-    client.lock_registration(&bracket_id, &admin);
-
-    // Bye node (node 1 after lock) is not playable and rejects setting a game ID.
+#[test]
+fn result_for_an_unknown_node_is_rejected() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
     assert_eq!(
-        client.try_set_node_game_id(&bracket_id, &1, &g1, &admin),
-        Err(Ok(Error::NotPlayable))
+        f.client
+            .try_submit_match_result(&id, &9, &0, &game_id(&f.env, 1), &f.seed(0)),
+        Err(Ok(Error::NodeNotFound))
     );
-
-    // Invalid (empty or >64 byte) game IDs are rejected.
     assert_eq!(
-        client.try_set_node_game_id(&bracket_id, &0, &empty_id, &admin),
+        f.client
+            .try_submit_match_result(&id, &0, &7, &game_id(&f.env, 1), &f.seed(0)),
+        Err(Ok(Error::NodeNotFound))
+    );
+}
+
+#[test]
+fn a_winner_outside_the_match_is_rejected() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    // Seed 2 is in the other semifinal.
+    let stranger = f.seed(2);
+    assert_eq!(
+        f.client
+            .try_submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &stranger),
+        Err(Ok(Error::WinnerNotInMatch))
+    );
+    // Nothing was recorded, so the node is still open.
+    assert_eq!(
+        f.client.get_node(&id, &0, &0).status,
+        NodeStatus::AwaitingResult
+    );
+}
+
+#[test]
+fn a_result_cannot_be_resubmitted_for_the_same_node() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    assert_eq!(
+        f.client
+            .try_submit_match_result(&id, &0, &0, &game_id(&f.env, 2), &f.seed(3)),
+        Err(Ok(Error::InvalidNodeStatus))
+    );
+}
+
+#[test]
+fn malformed_game_id_is_rejected() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    let empty = String::from_str(&f.env, "");
+    assert_eq!(
+        f.client
+            .try_submit_match_result(&id, &0, &0, &empty, &f.seed(0)),
         Err(Ok(Error::InvalidGameId))
     );
+    // A space is outside [A-Za-z0-9_-].
+    let spaced = String::from_str(&f.env, "game 1");
     assert_eq!(
-        client.try_set_node_game_id(&bracket_id, &0, &oversized_id, &admin),
+        f.client
+            .try_submit_match_result(&id, &0, &0, &spaced, &f.seed(0)),
         Err(Ok(Error::InvalidGameId))
     );
-
-    // Bind g1 to playable node 0 and verify persistence and lookup.
-    client.set_node_game_id(&bracket_id, &0, &g1, &admin);
-    assert_eq!(client.get_node(&bracket_id, &0).game_id, Some(g1.clone()));
-    assert_eq!(client.get_node_by_game_id(&bracket_id, &g1).node_id, 0);
-
-    // Duplicate assignment of the same game ID in the same bracket is rejected.
+    // 65 bytes is one over the cap.
+    let too_long = String::from_str(&f.env, &"g".repeat(65));
     assert_eq!(
-        client.try_set_node_game_id(&bracket_id, &0, &g1, &admin),
-        Err(Ok(Error::DuplicateGameId))
+        f.client
+            .try_submit_match_result(&id, &0, &0, &too_long, &f.seed(0)),
+        Err(Ok(Error::InvalidGameId))
     );
+}
 
-    // Before finalization, replacing node 0's game ID with a new unique ID is allowed
-    // and frees the previous game ID.
-    client.set_node_game_id(&bracket_id, &0, &g1_updated, &admin);
+#[test]
+fn unknown_tournament_is_rejected() {
+    let f = Fixture::four_players();
     assert_eq!(
-        client.get_node(&bracket_id, &0).game_id,
-        Some(g1_updated.clone())
+        f.client.try_get_tournament(&7),
+        Err(Ok(Error::TournamentNotFound))
     );
     assert_eq!(
-        client.try_get_node_by_game_id(&bracket_id, &g1),
-        Err(Ok(Error::NotFound))
+        f.client.try_get_prize_pool(&7),
+        Err(Ok(Error::TournamentNotFound))
+    );
+}
+
+#[test]
+fn initialize_is_not_repeatable() {
+    let f = Fixture::four_players();
+    assert_eq!(
+        f.client.try_initialize(&f.admin, &f.oracle, &f.token),
+        Err(Ok(Error::AlreadyInitialized))
+    );
+}
+
+// -------------------- cancellation and timeouts --------------------
+
+#[test]
+fn admin_cancels_an_unstarted_tournament_and_refunds_everyone() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.deposit(&id, &f.seed(0));
+    f.client.deposit(&id, &f.seed(3));
+
+    f.client.cancel_tournament(&id);
+
+    assert_eq!(
+        f.client.get_tournament(&id).state,
+        TournamentState::Cancelled
+    );
+    // Both payers are made whole; the two who never paid are untouched.
+    for i in 0..4u32 {
+        assert_eq!(f.balance(&f.seed(i)), STARTING_BALANCE, "seed {}", i);
+    }
+    assert_eq!(f.balance(&f.contract), ESCROW_RESERVE_BUFFER_STROOPS);
+    assert_eq!(f.client.get_funded_count(&id), 0);
+}
+
+#[test]
+fn a_cancelled_tournament_rejects_further_entries() {
+    let f = Fixture::four_players();
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.deposit(&id, &f.seed(0));
+
+    f.client.cancel_tournament(&id);
+
+    assert_eq!(f.balance(&f.seed(0)), STARTING_BALANCE);
+    assert_eq!(
+        f.client.try_deposit(&id, &f.seed(1)),
+        Err(Ok(Error::TournamentFinished))
+    );
+}
+
+#[test]
+fn admin_cannot_cancel_a_tournament_in_progress() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    assert_eq!(
+        f.client.try_cancel_tournament(&id),
+        Err(Ok(Error::TournamentInProgress))
+    );
+}
+
+#[test]
+fn claim_timeout_is_rejected_before_the_window_elapses() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    let caller = f.seed(0);
+    assert_eq!(
+        f.client.try_claim_timeout(&id, &caller),
+        Err(Ok(Error::TimeoutNotReached))
     );
 
-    // Submitting a result with a mismatched game ID is rejected.
+    // One ledger before the deadline is still too early.
+    f.env
+        .ledger()
+        .set_sequence_number(f.client.get_tournament(&id).created_ledger + TIMEOUT_LEDGERS);
     assert_eq!(
-        client.try_submit_result_with_game_id(&bracket_id, &0, &g2, &p1, &admin),
-        Err(Ok(Error::GameIdMismatch))
+        f.client.try_claim_timeout(&id, &caller),
+        Err(Ok(Error::TimeoutNotReached))
     );
+}
 
-    // Submitting a result with the matching stored game ID succeeds.
-    client.submit_result_with_game_id(&bracket_id, &0, &g1_updated, &p1, &admin);
-    advance_ledger(&env, DEFAULT_REVIEW_WINDOW_LEDGERS);
-    client.finalize_result(&bracket_id, &0);
+#[test]
+fn claim_timeout_refunds_everyone_after_the_window() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
 
-    // Once node 0 is finalized (Resolved), replacing its game ID is rejected with AlreadyResolved.
+    // A stranger can trigger it: the backstop must not depend on a participant.
+    let stranger = Address::generate(&f.env);
+    f.env
+        .ledger()
+        .set_sequence_number(f.client.get_tournament(&id).created_ledger + TIMEOUT_LEDGERS + 1);
+    f.client.claim_timeout(&id, &stranger);
+
     assert_eq!(
-        client.try_set_node_game_id(&bracket_id, &0, &g2, &admin),
-        Err(Ok(Error::AlreadyResolved))
+        f.client.get_tournament(&id).state,
+        TournamentState::Cancelled
+    );
+    for i in 0..4u32 {
+        assert_eq!(f.balance(&f.seed(i)), STARTING_BALANCE, "seed {}", i);
+    }
+    assert_eq!(f.balance(&f.contract), ESCROW_RESERVE_BUFFER_STROOPS);
+}
+
+#[test]
+fn a_finished_tournament_cannot_be_timed_out() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    f.client
+        .submit_match_result(&id, &0, &1, &game_id(&f.env, 2), &f.seed(1));
+    f.client
+        .submit_match_result(&id, &1, &0, &game_id(&f.env, 3), &f.seed(0));
+    let caller = f.seed(3);
+    f.env
+        .ledger()
+        .set_sequence_number(f.client.get_tournament(&id).created_ledger + TIMEOUT_LEDGERS + 1);
+    assert_eq!(
+        f.client.try_claim_timeout(&id, &caller),
+        Err(Ok(Error::TournamentFinished))
+    );
+}
+
+#[test]
+fn a_completed_tournament_rejects_further_entries_and_results() {
+    let f = Fixture::four_players();
+    let id = f.create_and_fund_all();
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    f.client
+        .submit_match_result(&id, &0, &1, &game_id(&f.env, 2), &f.seed(1));
+    f.client
+        .submit_match_result(&id, &1, &0, &game_id(&f.env, 3), &f.seed(0));
+
+    assert_eq!(
+        f.client.try_deposit(&id, &f.seed(0)),
+        Err(Ok(Error::TournamentFinished))
     );
     assert_eq!(
-        client.get_node(&bracket_id, &0).game_id,
-        Some(g1_updated.clone())
-    );
-
-    // Final node (node 2) is now Ready (p1 vs p3). Attempting to reuse node 0's
-    // game ID (`g1_updated`) on node 2 in the same tournament is rejected with DuplicateGameId.
-    assert_eq!(
-        client.try_set_node_game_id(&bracket_id, &2, &g1_updated, &admin),
-        Err(Ok(Error::DuplicateGameId))
+        f.client
+            .try_submit_match_result(&id, &0, &0, &game_id(&f.env, 4), &f.seed(3)),
+        Err(Ok(Error::TournamentFinished))
     );
     assert_eq!(
-        client.try_submit_result_with_game_id(&bracket_id, &2, &g1_updated, &p1, &admin),
-        Err(Ok(Error::DuplicateGameId))
+        f.client.try_cancel_tournament(&id),
+        Err(Ok(Error::TournamentInProgress))
     );
+}
 
-    // Submitting node 2's result with a fresh unique game ID (`g2`) persists `g2` on node 2.
-    client.submit_result_with_game_id(&bracket_id, &2, &g2, &p1, &admin);
-    assert_eq!(client.get_node(&bracket_id, &2).game_id, Some(g2.clone()));
-    assert_eq!(client.get_node_by_game_id(&bracket_id, &g2).node_id, 2);
+// --------------------- multiple tournaments ---------------------
 
-    // A separate tournament bracket can independently use `g1_updated`.
-    let other_bracket = client.create_seeded_bracket(&2, &vec![&env, p3.clone(), p4.clone()]);
-    client.lock_registration(&other_bracket, &admin);
-    client.set_node_game_id(&other_bracket, &0, &g1_updated, &admin);
+#[test]
+fn tournaments_are_isolated_from_one_another() {
+    let f = Fixture::with_field(4);
+    let first = f.create_and_fund_all();
+    let second = f.create_and_fund_all();
+    assert_ne!(first, second);
+    assert_eq!(f.client.tournament_count(), 2);
+
+    // Deciding the second tournament's semifinal must not touch the first.
+    f.client
+        .submit_match_result(&second, &0, &0, &game_id(&f.env, 1), &f.seed(0));
+    assert_eq!(f.client.get_node(&first, &0, &0).winner, None);
     assert_eq!(
-        client.get_node(&other_bracket, &0).game_id,
-        Some(g1_updated)
+        f.client.get_tournament(&first).state,
+        TournamentState::InProgress
     );
 }
