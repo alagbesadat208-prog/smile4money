@@ -458,6 +458,7 @@ impl TournamentBracket {
     ///   characters outside `[A-Za-z0-9_-]`.
     /// * [`Error::InvalidNodeStatus`] — the node is not `AwaitingResult`.
     /// * [`Error::WinnerNotInMatch`] — `winner` is not one of the node's entrants.
+    /// * [`Error::TransferFailed`] — the champion transfer failed; the match result and payout are rolled back.
     /// * [`Error::TournamentFinished`] — the tournament is completed or cancelled.
     pub fn submit_match_result(
         env: Env,
@@ -560,6 +561,7 @@ impl TournamentBracket {
     ///
     /// * [`Error::Unauthorized`] — caller is not the admin.
     /// * [`Error::TournamentInProgress`] — at least one match has been decided.
+    /// * [`Error::TransferFailed`] — a refund transfer failed; the cancellation and all earlier refunds are rolled back.
     pub fn cancel_tournament(env: Env, tournament_id: u64) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -602,6 +604,7 @@ impl TournamentBracket {
     /// # Errors
     ///
     /// * [`Error::TimeoutNotReached`] — the window has not elapsed yet.
+    /// * [`Error::TransferFailed`] — a refund transfer failed; cancellation and all earlier refunds are rolled back.
     /// * [`Error::TournamentFinished`] — already completed or cancelled.
     pub fn claim_timeout(env: Env, tournament_id: u64, caller: Address) -> Result<(), Error> {
         caller.require_auth();
