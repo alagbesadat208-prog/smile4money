@@ -42,9 +42,7 @@ mod types;
 pub use constants::*;
 
 use errors::Error;
-use soroban_sdk::{
-    contract, contractimpl, symbol_short, token, Address, Env, String, Symbol, TryFromVal, Vec,
-};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, String, Symbol, Vec};
 use types::{DataKey, MatchNode, NodeStatus, Tournament, TournamentState};
 
 /// Return `true` if `addr` is the all-zeros Stellar account key.
@@ -52,12 +50,10 @@ use types::{DataKey, MatchNode, NodeStatus, Tournament, TournamentState};
 /// A zero address is the canonical burn address and is never a valid participant.
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
     // The all-zeros Stellar account key encodes to this strkey.
-    // We construct the Address via the ScAddress XDR path since
-    // TryFromVal<Env, String> is not implemented for Address.
-    use soroban_sdk::xdr::{AccountId, PublicKey, ScAddress, Uint256};
-    let zero_key = Uint256([0u8; 32]);
-    let sc_addr = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(zero_key)));
-    let zero_address = Address::try_from_val(env, &sc_addr).expect("invalid zero address");
+    let zero_address = Address::from_string(&String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
     addr == &zero_address
 }
 
