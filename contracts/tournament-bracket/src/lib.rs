@@ -528,12 +528,18 @@ impl TournamentBracket {
         t.champion = Some(winner.clone());
         t.state = TournamentState::Completed;
         t.completed_ledger = Some(env.ledger().sequence());
-        Self::save_tournament(&env, &t);
-
         let payout = t.entry_fee * t.player_count as i128;
         Self::ensure_reserve_for_payout(&env, &t.token, payout)?;
         let client = token::Client::new(&env, &t.token);
-        client.transfer(&env.current_contract_address(), &winner, &payout);
+        client
+            .try_transfer(&env.current_contract_address(), &winner, &payout)
+            .map_err(|_| Error::TransferFailed)?
+            .map_err(|_| Error::TransferFailed)?;
+
+        // Persist the terminal state only after the token transfer succeeds. Any
+        // later storage failure still aborts the Soroban invocation and rolls the
+        // transfer back with the rest of the transaction.
+        Self::save_tournament(&env, &t);
 
         Self::bump_instance_ttl(&env);
         env.events().publish(
@@ -730,13 +736,19 @@ impl TournamentBracket {
             let mut node = Self::load_node(env, t.id, 0, i)?;
             if node.funded1 {
                 if let Some(p) = node.player1.clone() {
-                    client.transfer(&contract, &p, &t.entry_fee);
+                    client
+                        .try_transfer(&contract, &p, &t.entry_fee)
+                        .map_err(|_| Error::TransferFailed)?
+                        .map_err(|_| Error::TransferFailed)?;
                 }
                 node.funded1 = false;
             }
             if node.funded2 {
                 if let Some(p) = node.player2.clone() {
-                    client.transfer(&contract, &p, &t.entry_fee);
+                    client
+                        .try_transfer(&contract, &p, &t.entry_fee)
+                        .map_err(|_| Error::TransferFailed)?
+                        .map_err(|_| Error::TransferFailed)?;
                 }
                 node.funded2 = false;
             }

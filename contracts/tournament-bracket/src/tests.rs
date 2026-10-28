@@ -2,6 +2,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype,
     testutils::{Address as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
     vec, Address, Env, String, Vec,
@@ -96,6 +97,137 @@ fn asset<'a>(env: &'a Env, token: &'a Address) -> StellarAssetClient<'a> {
 
 fn game_id(env: &Env, n: u32) -> String {
     String::from_str(env, &std::format!("game-{}", n))
+}
+
+/// Minimal token contract that can fail an outbound transfer to a selected
+/// recipient, exercising rollback after previous transfers have succeeded.
+#[contract]
+pub struct FaultInjectingToken;
+
+#[contracttype]
+#[derive(Clone)]
+enum FaultTokenKey {
+    Balance(Address),
+    FailingRecipient,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FaultTokenError {
+    InjectedTransferFailure = 1,
+    InsufficientBalance = 2,
+}
+
+#[contractimpl]
+impl FaultInjectingToken {
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+
+    pub fn balance(env: Env, account: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&FaultTokenKey::Balance(account))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), FaultTokenError> {
+        let failing: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&FaultTokenKey::FailingRecipient)
+            .unwrap_or(None);
+        if failing.as_ref() == Some(&to) {
+            return Err(FaultTokenError::InjectedTransferFailure);
+        }
+
+        let from_balance = Self::balance(env.clone(), from.clone());
+        let to_balance = Self::balance(env.clone(), to.clone());
+        let new_from = from_balance
+            .checked_sub(amount)
+            .ok_or(FaultTokenError::InsufficientBalance)?;
+        let new_to = to_balance
+            .checked_add(amount)
+            .ok_or(FaultTokenError::InsufficientBalance)?;
+        env.storage()
+            .persistent()
+            .set(&FaultTokenKey::Balance(from), &new_from);
+        env.storage()
+            .persistent()
+            .set(&FaultTokenKey::Balance(to), &new_to);
+        Ok(())
+    }
+
+    pub fn set_balance(env: Env, account: Address, amount: i128) {
+        env.storage()
+            .persistent()
+            .set(&FaultTokenKey::Balance(account), &amount);
+    }
+
+    pub fn set_failing_recipient(env: Env, recipient: Option<Address>) {
+        env.storage()
+            .instance()
+            .set(&FaultTokenKey::FailingRecipient, &recipient);
+    }
+}
+
+struct AtomicityFixture<'a> {
+    env: Env,
+    client: TournamentBracketClient<'a>,
+    token_client: FaultInjectingTokenClient<'a>,
+    players: Vec<Address>,
+    contract: Address,
+}
+
+impl<'a> AtomicityFixture<'a> {
+    fn new(player_count: usize) -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let token = env.register(FaultInjectingToken, ());
+        let token_client = FaultInjectingTokenClient::new(&env, &token);
+        let contract = env.register(TournamentBracket, ());
+        let client = TournamentBracketClient::new(&env, &contract);
+        client.initialize(&admin, &oracle, &token);
+
+        token_client.set_balance(&contract, &ESCROW_RESERVE_BUFFER_STROOPS);
+        let mut players = Vec::new(&env);
+        for _ in 0..player_count {
+            let player = Address::generate(&env);
+            token_client.set_balance(&player, &STARTING_BALANCE);
+            players.push_back(player);
+        }
+
+        Self {
+            env,
+            client,
+            token_client,
+            players,
+            contract,
+        }
+    }
+
+    fn player(&self, index: u32) -> Address {
+        self.players.get(index).unwrap()
+    }
+
+    fn balance(&self, account: &Address) -> i128 {
+        self.token_client.balance(account)
+    }
+
+    fn create_and_fund_all(&self) -> u64 {
+        let id = self.client.create_tournament(&FEE, &self.players);
+        for i in 0..self.players.len() {
+            self.client.deposit(&id, &self.player(i));
+        }
+        id
+    }
 }
 
 // ----------------------- full bracket progression -----------------------
@@ -336,6 +468,99 @@ fn field_size_bounds_are_enforced() {
     );
 }
 
+#[test]
+fn failed_champion_transfer_rolls_back_final_result_and_can_be_retried_once() {
+    let f = AtomicityFixture::new(2);
+    let winner = f.player(0);
+    let id = f.create_and_fund_all();
+
+    f.token_client.set_failing_recipient(&Some(winner.clone()));
+    assert_eq!(
+        f.client
+            .try_submit_match_result(&id, &0, &0, &game_id(&f.env, 1), &winner),
+        Err(Ok(Error::TransferFailed))
+    );
+
+    let tournament = f.client.get_tournament(&id);
+    assert_eq!(tournament.state, TournamentState::InProgress);
+    assert_eq!(tournament.champion, None);
+    assert_eq!(tournament.completed_ledger, None);
+    assert_eq!(
+        f.client.get_node(&id, &0, &0).status,
+        NodeStatus::AwaitingResult
+    );
+    assert_eq!(f.client.get_node(&id, &0, &0).winner, None);
+    assert_eq!(f.balance(&winner), STARTING_BALANCE - FEE);
+    assert_eq!(f.balance(&f.player(1)), STARTING_BALANCE - FEE);
+    assert_eq!(
+        f.balance(&f.contract),
+        ESCROW_RESERVE_BUFFER_STROOPS + FEE * 2
+    );
+
+    f.token_client.set_failing_recipient(&None);
+    f.client
+        .submit_match_result(&id, &0, &0, &game_id(&f.env, 2), &winner);
+    assert_eq!(f.client.get_champion(&id), winner);
+    assert_eq!(f.balance(&winner), STARTING_BALANCE - FEE + FEE * 2);
+    assert_eq!(f.balance(&f.contract), ESCROW_RESERVE_BUFFER_STROOPS);
+    assert_eq!(
+        f.client
+            .try_submit_match_result(&id, &0, &0, &game_id(&f.env, 3), &winner),
+        Err(Ok(Error::TournamentFinished))
+    );
+    assert_eq!(f.balance(&winner), STARTING_BALANCE - FEE + FEE * 2);
+}
+
+#[test]
+fn failed_later_refund_rolls_back_earlier_transfers_and_can_be_retried_once() {
+    let f = AtomicityFixture::new(4);
+    let first_refund = f.player(0);
+    let failing_refund = f.player(3);
+    let id = f.client.create_tournament(&FEE, &f.players);
+    f.client.deposit(&id, &first_refund);
+    f.client.deposit(&id, &failing_refund);
+
+    // The first transfer is allowed; the second transfer aborts the batch.
+    f.token_client
+        .set_failing_recipient(&Some(failing_refund.clone()));
+    assert_eq!(
+        f.client.try_cancel_tournament(&id),
+        Err(Ok(Error::TransferFailed))
+    );
+
+    let tournament = f.client.get_tournament(&id);
+    assert_eq!(tournament.state, TournamentState::Registration);
+    assert_eq!(tournament.funded_count, 2);
+    assert_eq!(tournament.completed_ledger, None);
+    assert!(f.client.get_node(&id, &0, &0).funded1);
+    assert!(f.client.get_node(&id, &0, &0).funded2);
+    assert_eq!(f.balance(&first_refund), STARTING_BALANCE - FEE);
+    assert_eq!(f.balance(&failing_refund), STARTING_BALANCE - FEE);
+    assert_eq!(
+        f.balance(&f.contract),
+        ESCROW_RESERVE_BUFFER_STROOPS + FEE * 2
+    );
+
+    f.token_client.set_failing_recipient(&None);
+    f.client.cancel_tournament(&id);
+    assert_eq!(
+        f.client.get_tournament(&id).state,
+        TournamentState::Cancelled
+    );
+    assert_eq!(f.client.get_funded_count(&id), 0);
+    for index in 0..4 {
+        assert_eq!(f.balance(&f.player(index)), STARTING_BALANCE);
+    }
+    assert_eq!(f.balance(&f.contract), ESCROW_RESERVE_BUFFER_STROOPS);
+    assert_eq!(
+        f.client.try_cancel_tournament(&id),
+        Err(Ok(Error::TournamentInProgress))
+    );
+    for index in 0..4 {
+        assert_eq!(f.balance(&f.player(index)), STARTING_BALANCE);
+    }
+}
+
 // ------------------------------ rejections ------------------------------
 
 #[test]
@@ -367,7 +592,7 @@ fn duplicate_entrants_are_rejected() {
     client.initialize(&admin, &admin, &token_id.address());
 
     let dup = Address::generate(&env);
-    let players = vec![&env, dup.clone(), dup.clone(), Address::generate(&env)];
+    let players = vec![&env, dup.clone(), dup.clone(), dup.clone(), dup.clone()];
     assert_eq!(
         client.try_create_tournament(&FEE, &players),
         Err(Ok(Error::DuplicatePlayer))
@@ -634,6 +859,18 @@ fn claim_timeout_refunds_everyone_after_the_window() {
 
     // A stranger can trigger it: the backstop must not depend on a participant.
     let stranger = Address::generate(&f.env);
+    f.env.as_contract(&f.contract, || {
+        f.env
+            .storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    });
+    f.env.as_contract(&f.token, || {
+        f.env
+            .storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    });
     f.env
         .ledger()
         .set_sequence_number(f.client.get_tournament(&id).created_ledger + TIMEOUT_LEDGERS + 1);
